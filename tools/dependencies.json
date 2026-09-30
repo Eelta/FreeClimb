@@ -1,0 +1,93 @@
+{
+  "schema": 1,
+  "dependencies": [
+    {
+      "name": "CommonLibNG",
+      "directory": "external/CommonLibNG",
+      "repository": "https://github.com/alandtse/CommonLibSSE-NG.git",
+      "commit": "736dc64094e59232abfbcdf796cd0a063e136ec6"
+    },
+    {
+      "name": "spdlog",
+      "directory": "external/spdlog",
+      "repository": "https://github.com/gabime/spdlog.git",
+      "commit": "7e635fca68d014934b4af8a1cf874f63989352b7"
+    },
+    {
+      "name": "rapidcsv",
+      "directory": "external/rapidcsv",
+      "repository": "https://github.com/d99kris/rapidcsv.git",
+      "commit": "a98b85e663114b8fdc9c0dc03abf22c296f38241"
+    },
+    {
+      "name": "DirectXTK",
+      "directory": "external/DirectXTK",
+      "repository": "https://github.com/microsoft/DirectXTK.git",
+      "commit": "273e95b4ac48478f8af1698db9f17cd525f0ede8"
+    },
+    {
+      "name": "MinHook",
+      "directory": "external/MinHook",
+      "repository": "https://github.com/TsudaKageyu/minhook.git",
+      "commit": "c3fcafdc10146beb5919319d0683e44e3c30d537"
+    }
+  ],
+  "runtime_baseline": {
+    "FreeClimb.esp": "41b0e707ea7dd5de2f5315f7c5b2d9693800c81af872d37f3c7903d008018d4e",
+    "Sound/fx/FreeClimb/grip01.wav": "c5a8826d9f99e6b801c369df4a8c529f4bddb781dd6a0182ce006bb04f9de4dd",
+    "Sound/fx/FreeClimb/grip02.wav": "00b275c176566962518b50e7718a68fd1ce89a5b772b3222835c978cc9c7472e",
+    "Sound/fx/FreeClimb/grip03.wav": "2dcecf5485144a8abbb80ed32801a499180d6dabe63ace1cbfd0e1a6249a6907",
+    "Sound/fx/FreeClimb/push01.wav": "bc3c8079b6e6bbc60eeb3c6695669d3315530123b97914c6679c7328d25133c8",
+    "Sound/fx/FreeClimb/push02.wav": "d9d9ecd6185a8db94236e98dd49ecf60ac8c3beab1131116a22af4a702d7d05e",
+    "Sound/fx/FreeClimb/step01.wav": "6e77a4a3ac7b42344224417bbafbf889cc55b0fef3ec0b836bd7cf80a3d4b5c1",
+    "Sound/fx/FreeClimb/step02.wav": "bdffe9d82a87c46e51b81cf839fd5838a207f3f71da8f8383c8fffb44f92c257",
+    "Sound/fx/FreeClimb/step03.wav": "8839c477d560a1c35b0daf5c3882513dedbff3bceaea6da6f78ee12f7c8a3809",
+    "Sound/fx/FreeClimb/step04.wav": "43e585ee25aa1fa0567116248fcd8317bc27a1d581ff328bfd9ecf588e5c08ed",
+    "Sound/fx/FreeClimb/top01.wav": "0dfee7c05f06e94ac96ad08f5fd827c5197d8929f2aac0ad964f8c092efa5588",
+    "Sound/fx/FreeClimb/top02.wav": "064ff5f1ebbb903dca0285cb2c83bbaebe0808030f06b123f37e19f3288abd4e",
+    "Sound/fx/FreeClimb/top03.wav": "3ae115412a201750e73ca7a87bea0f8195df093978a33d8f66b09770d7cc5231",
+    "licenses/SKSEMenuFramework-LGPL-2.1.txt": "20c17d8b8c48a600800dfd14f95d5cb9ff47066a9641ddeab48dc54aec96e331",
+    "licenses/nlohmann-json-MIT.txt": "86b998c792894ccb911a1cb7994f7a9652894e7a094c0b5e45be2f553f45cf14"
+  },
+  "retired_runtime_files": {
+    "FreeClimb_Docs/authored-motion-qa.png": "07d5d743e1f215d04144422a4f8aa6b2f8c653b0f07a452ff7b8ab5342e77561",
+    "FreeClimb_Docs/motion-metrics.json": "ad12bb933465343c0e976841617bc99f81ce987be6efee621d0c1369088312e2",
+    "FreeClimb_Docs/motion-preview.mp4": "380501309d104b0314f456dbd760506f061f20c1fc8b855c918cd424e07e5366",
+    "SKSE/Plugins/FreeClimb.motion": "3d2e50cb632d2bf19ce6e1a835d2742e88af13cde262cc0fb51fdb3633888a7b"
+  },
+  "supported_runtimes": [
+    "1.5.97.0",
+    "1.6.317.0",
+    "1.6.318.0",
+    "1.6.323.0",
+    "1.6.342.0",
+    "1.6.353.0",
+    "1.6.629.0",
+    "1.6.640.0",
+    "1.6.659.0",
+    "1.6.1130.0",
+    "1.6.1170.0",
+    "1.6.1179.0",
+    "1.7.99.0"
+  ],
+  "header_dependencies": [
+    {
+      "version": "v3.11.3",
+      "files": {
+        "external/nlohmann/LICENSE.MIT": "86b998c792894ccb911a1cb7994f7a9652894e7a094c0b5e45be2f553f45cf14",
+        "external/nlohmann/json.hpp": "9bea4c8066ef4a1c206b2be5a36302f8926f7fdc6087af5d20b417d0cf103ea6"
+      },
+      "repository": "https://github.com/nlohmann/json",
+      "name": "nlohmann_json"
+    },
+    {
+      "files": {
+        "src/vendor/SKSEMenuFramework/LICENSE": "20c17d8b8c48a600800dfd14f95d5cb9ff47066a9641ddeab48dc54aec96e331",
+        "src/vendor/SKSEMenuFramework/SKSEMenuFramework.h": "48416e8220ca777e2fffc2ef2baf21f699ab2e6c409d437f44eec5e311c3524c"
+      },
+      "commit": "1dcb70179076aae4ab626f43c5baab2735ca5877",
+      "repository": "https://github.com/QTR-Modding/SKSE-Menu-Framework-3-API",
+      "name": "SKSEMenuFramework_API"
+    }
+  ]
+}

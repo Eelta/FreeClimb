@@ -1,0 +1,8 @@
+SKSE Menu Framework 3 API
+Upstream: https://github.com/QTR-Modding/SKSE-Menu-Framework-3-API
+Commit: 1dcb70179076aae4ab626f43c5baab2735ca5877
+Retrieved: 2026-09-29
+Files SKSEMenuFramework.h and LICENSE are unmodified upstream files.
+License: GNU Lesser General Public License version 2.1; see LICENSE.
+FreeClimb dynamically calls the separately installed SKSEMenuFramework.dll.
+The framework DLL and its fonts are not bundled in FreeClimb.

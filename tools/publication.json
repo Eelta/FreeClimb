@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "runtime_archive": "FreeClimb-Nexus.zip",
+  "source_archive": "FreeClimb-source.zip",
+  "excluded_runtime_files": [
+    "THIRD-PARTY-NOTICES.txt",
+    "licenses/SKSEMenuFramework-LGPL-2.1.txt",
+    "licenses/nlohmann-json-MIT.txt"
+  ],
+  "protected_files": {
+    "LICENSE": "72d2f09334f8b87dded94a833ba7da05e5280e77a037ca23b251f96eae4cf719",
+    "THIRD-PARTY-NOTICES.txt": "3b2850cb8c8d1c499741feb56aa00031d0eae9b4d925e019c9157cfa4b00f345",
+    "docs/AUDIO-LICENSE.md": "e7ddf661ff609013d184bbabba73bff5ccc355c8cecc189a48066000f8456d3d",
+    "docs/MIXAMO-LICENSE.md": "73f52a60adb0dc03b5e71822494ea48b6cf0f704aa285c835145319e92e63e56",
+    "docs/THREEPEAT-LICENSE.md": "257e6b97a5a99a6d69f0a352ffcc59fdccc66c6ac87e244e7efcd94997eac901",
+    "src/vendor/SKSEMenuFramework/LICENSE": "20c17d8b8c48a600800dfd14f95d5cb9ff47066a9641ddeab48dc54aec96e331",
+    "external/nlohmann/LICENSE.MIT": "86b998c792894ccb911a1cb7994f7a9652894e7a094c0b5e45be2f553f45cf14"
+  },
+  "excluded_source_files": [
+    "docs/TRANSLATION-GUIDE.md"
+  ],
+  "removed_runtime_files": {
+    "meshes/actors/character/animations/FreeClimb/configs/dropCatch.json": "145578e25ee2dd7b473e31b25906056bccf990d528d9f1b8bedb5a5d11722ae0",
+    "meshes/actors/character/animations/FreeClimb/configs/freeHang.json": "434ce397689377e87fbe2cd4df1eca8ee0e67a5d2991de69a82fb7fcb65b38fc",
+    "meshes/actors/character/animations/FreeClimb/configs/runDown.json": "b463655c062a2c1657b88570e666b0fe30c0898b6aa71282b7eaed78783cf121",
+    "meshes/actors/character/animations/FreeClimb/configs/toBraced.json": "c91101c39f2d051eb231252ddd791911ad4c270dc0afc77ad43cdff083c577cb",
+    "meshes/actors/character/animations/FreeClimb/configs/toFree.json": "58ea659d0cf5ca90d1ecc6696b1c287b97b15a75db5b07b17f2d968d16e2a209",
+    "meshes/actors/character/animations/FreeClimb/dropCatch.hkx": "577175935ba83e4b431be529e92405b7300fc479fdba7cd7dcfba3d737a8ceea",
+    "meshes/actors/character/animations/FreeClimb/freeHang.hkx": "687f36109c43255438638b1081bdf2d8d00a6795901e235e0cb1a3f3f51fb501",
+    "meshes/actors/character/animations/FreeClimb/runDown.hkx": "69b889967227aa73130580ceffd11e51bcf4b57816be9eed019f6ea810918dd0",
+    "meshes/actors/character/animations/FreeClimb/toBraced.hkx": "2157a511b7b4c445a0bde484b15bcd2c68d60ec29071d5756d4d37823ddff5b8",
+    "meshes/actors/character/animations/FreeClimb/toFree.hkx": "2a91a74780fcbcaad3372a777f3adb78739663f0817c86ba29ecd0264083d814",
+    "meshes/actors/character/animations/FreeClimb/mantle.hkx": "8e1c3a941cc404bca262fd7c1f558c7e53e355125e873a4561ece589b0556a5d",
+    "meshes/actors/character/animations/FreeClimb/configs/mantle.json": "d44153dc1f3ed50a88052f2eed31bcc1dc30643ecd54b65e6957b1ce83b7888b",
+    "meshes/actors/character/animations/FreeClimb/step.hkx": "30b81c19e7e4ca822a9ca77cedf03e9a3fadd7789a00bbb45082b98bcf56417d",
+    "meshes/actors/character/animations/FreeClimb/configs/step.json": "f3194c6f366813f711f0650613f38892183b7de5e5fafc901d2f7c4b8a9f2876",
+    "meshes/actors/character/animations/FreeClimb/configs/contextRegrab.json": "d12b8ec8d7937c2957e04ac15745914e4fecdfdd993b3a0f54f8564bfd91d24a",
+    "meshes/actors/character/animations/FreeClimb/contextRegrab.hkx": "71eeec5a672a63625f2e1ac62a68f65fef73426ce00842ec49d6d57e7afa5124"
+  }
+}
