@@ -19,6 +19,11 @@ Includes support for these game versions:
 | SE | 1.5.97.0 |
 | AE | 1.6.317.0, 1.6.318.0, 1.6.323.0, 1.6.342.0, 1.6.353.0 |
 | AE | 1.6.629.0, 1.6.640.0, 1.6.659.0, 1.6.1130.0, 1.6.1170.0, 1.6.1179.0 |
+| AE | 1.7.99.0, 1.7.104.0 |
+
+Skyrim 1.7.104 requires SKSE64 2.3.1 and the matching Address Library database.
+
+GOG 1.6.1179 requires the GOG build of SKSE64 2.2.6 and the Anniversary Edition Address Library containing `Data/SKSE/Plugins/versionlib-1-6-1179-0.bin`.
 
 Versions outside the loading whitelist are rejected. VR, Game Pass and Epic releases are not supported.
 
@@ -40,11 +45,29 @@ When stamina consumption is enabled, wall running costs **twice** as much stamin
 
 ### Rebinding controls
 
-The Keys page provides Forward, Backward, Left, Right, Wall entry, Wall run modifier and Hop bindings. Each accepts one key or a combination of up to four keys, such as `Ctrl+E`.
+The Keys page provides Forward, Backward, Left, Right, Wall entry, Wall run modifier and Hop bindings. Click a binding button, release all controls, hold the desired 1–4 keys together, then release them all to record the combination. Left and right modifier keys are kept distinct.
+
+Esc or gamepad Back cancels either keyboard or controller recording. Only combinations held together are recorded, up to four keys/buttons; invalid input keeps the previous binding. Recording edits the draft; choose **Save settings** to apply and save it.
 
 Wall entry uses its complete configured binding; no additional Forward key is required. Entry always starts climbing. Press the wall run modifier after grabbing to switch to wall running; if it was already held during entry, release and press it again. Backward + Hop pushes away from the wall, and Left + Backward + Right + Hop lets go in place.
 
 Wall entry may share keys with movement, Hop or the wall run modifier. Conflicting movement and action bindings are reported when saving. Rebinding affects FreeClimb only; native game input remains active outside climbing. Release and press the entry combination again before reattaching.
+
+### Controller support (experimental)
+
+Enable the controller in Skyrim, then use an XInput-compatible controller or a device mapped to XInput through Steam Input. XInput describes the input interface. PlayStation, Switch and other devices supported by Steam Input can use its Xbox gamepad emulation. Native PlayStation input is not supported by this implementation.
+
+| Default input | Action |
+| --- | --- |
+| **LB+Y** | Immediately request climbing near a valid wall |
+| **Left stick** | Move in eight directions; center it to rest |
+| **LB** after grabbing | Hold to wall run; release and press again if held during entry |
+| **Left stick+Y** | Directional leap catch while climbing |
+| **Left stick down+Y** | Push away from the wall |
+| **B** | Let go in place |
+| **Right stick** | Native camera control |
+
+The Keys page has separate controller bindings, a stick deadzone and a trigger threshold. `[Gamepad]` in `FreeClimb.ini` provides the same settings. Click a controller binding button, release all controls, hold 1–4 buttons together, then release them all to record. B is bindable; Start and Back remain reserved. Keyboard bindings are unchanged. The device used to grab controls that climb. After a menu, focus loss or reconnection, release all buttons and triggers before grabbing again; the left stick can stay tilted. Disconnecting an active controller releases the wall safely.
 
 ## Settings
 
@@ -57,7 +80,7 @@ The interface defaults to **English** and includes **Simplified Chinese**. Menu 
 | Automatic actions | Contextual sideways leaps, automatic wall run obstacle jumps, contextual mantling, attempt intervals, left/right opportunity rates |
 | Stamina | Stamina consumption toggle, climbing and resting costs, stamina required to grab |
 | Audio | Sound toggle and volume |
-| Keys | Keys and key combinations |
+| Keys | Keyboard and controller bindings, controller toggle and thresholds |
 | Animations and diagnostics | Safe animation pack reload, file validation results, action statistics, detailed diagnostic toggle |
 
 The bottom buttons are **Save settings** and **Restore default settings**. Both write `Data/SKSE/Plugins/FreeClimb.ini` and apply the settings; movement and binding changes wait until a safe detached state. Restore default settings resets and saves only the controls on the current tab. Other tabs, the interface language and INI-only options are retained; unsaved edits on other tabs remain in the editor. Audio changes preview on subsequent traversal sounds.

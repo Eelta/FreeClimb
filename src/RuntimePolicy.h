@@ -10,7 +10,22 @@ constexpr std::uint32_t pack(unsigned major,unsigned minor,unsigned patch,unsign
 inline constexpr std::array supportedVersions{
     pack(1,5,97),pack(1,6,317),pack(1,6,318),pack(1,6,323),pack(1,6,342),
     pack(1,6,353),pack(1,6,629),pack(1,6,640),pack(1,6,659),pack(1,6,1130),
-    pack(1,6,1170),pack(1,6,1179),pack(1,7,99)};
+    pack(1,6,1170),pack(1,6,1179),pack(1,7,99),pack(1,7,104)};
+constexpr std::uint32_t skseVersion(std::uint32_t version) {
+    return version==pack(1,6,659)||version==pack(1,6,1179)?version|1u:version;
+}
+constexpr std::uint32_t gameVersionFromSKSE(std::uint32_t version) {
+    return version==pack(1,6,659,1)||version==pack(1,6,1179,1)?version&~15u:version;
+}
+inline constexpr auto supportedSKSEVersions=[] {
+    auto versions=supportedVersions;
+    for(auto& version:versions)version=skseVersion(version);
+    return versions;
+}();
+constexpr bool supportedSKSE(std::uint32_t version) {
+    for(const auto candidate:supportedSKSEVersions)if(version==candidate)return true;
+    return false;
+}
 enum class Family {unsupported,se,ae,ae629,ae17};
 constexpr bool supported(std::uint32_t version) {
     for(const auto candidate:supportedVersions)if(version==candidate)return true;
@@ -25,6 +40,7 @@ constexpr Family family(std::uint32_t version) {
 inline constexpr std::size_t actorUpdateSlot=0xAD;
 inline constexpr std::size_t inputFilterSlot=1;
 inline constexpr std::size_t keyboardProcessSlot=2;
+inline constexpr std::size_t gamepadPollSlot=2;
 constexpr unsigned addressFormat(std::uint32_t version) {
     const auto kind=family(version);
     return kind==Family::se?1:kind==Family::ae17?5:kind==Family::unsupported?0:2;

@@ -133,7 +133,7 @@ int main() {
             require(mock::positionId==mock::nextId&&mock::position==std::array<float,3>{15,24,48},"AE spatial payload changed");
             ae.stop();
         }
-        mock::runtimeVersion=fc::runtime::pack(1,7,104);fc::TraversalAudioRuntime unsupported;
+        mock::runtimeVersion=fc::runtime::pack(1,7,105);fc::TraversalAudioRuntime unsupported;
         require(!unsupported.install(),"unknown runtime audio accepted");
         std::cout<<"PASS: real runtime queue-vs-native-state separation, six-poll deadlines, duration-only/unknown/cancelled states, all failure stages, first-eight/every-32 sampling and disabled playback\n";
         return 0;

@@ -8,6 +8,8 @@
 #include <sstream>
 #include <stdexcept>
 using namespace fc;
+constexpr std::array<int,9> equipmentTracks{42,43,60,61,62,63,64,65,66};
+bool unownedTrack(int i){return i>=97||std::find(equipmentTracks.begin(),equipmentTracks.end(),i)!=equipmentTracks.end();}
 void check(bool ok,const char* message){if(!ok)throw std::runtime_error(message);}
 struct FixtureNode {
     int id{},parentId{-1},order{};
@@ -66,7 +68,7 @@ void actualScene(const char* path,const Library& lib) {
     int oldMissing=-1;std::size_t oldMapped=0,oldVirtual=0;
     for(int i=0;i<99;++i) {
         if(scene.find(scene.root,lib.names[i]))++oldMapped;
-        else if(animationOnlyLeaf(i,lib.names,lib.parents))++oldVirtual;
+        else if(i==1||i==2||i==3||i==42||i==43||i==60)++oldVirtual;
         else {oldMissing=i;break;}
     }
     check(oldMissing==97&&oldMapped==91&&oldVirtual==6,"old six-optional policy reproduces actual index97 mapped91 failure");
@@ -77,29 +79,36 @@ void actualScene(const char* path,const Library& lib) {
         return scene.find(scene.root,name);
     };
     const auto actual=bindScene<FixtureNode*>(lib.names,lib.parents,lookup);
-    check(bool(actual)&&actual.count==91&&actual.virtualLeaves==6&&actual.unownedTracks==2,"installed NPC Root binds 91 body nodes, six virtual leaves, two engine-owned cameras");
-    check(lookups[97]==0&&lookups[98]==0,"binding never looks up either engine-owned camera");
+    check(bool(actual)&&actual.count==85&&actual.virtualLeaves==3&&actual.unownedTracks==11,"installed NPC Root binds 85 body nodes, three virtual helpers, eleven engine-owned tracks");
+    for(int i=0;i<99;++i)if(unownedTrack(i))check(lookups[i]==0&&!actual.nodes[i],"binding never looks up or stores engine-owned equipment or cameras");
     std::vector<FixtureNode*> mapped;
     actual.each([&](std::size_t i,FixtureNode* node){
-        check(i!=97&&i!=98&&scene.owned(node),"pose writes remain inside owned body and never touch cameras");
+        check(!unownedTrack(int(i))&&scene.owned(node),"pose writes remain inside owned body and never touch equipment or cameras");
         check(node->name==lib.names[i],"actual hierarchy preserves animation track index");mapped.push_back(node);
     });
-    check(mapped.size()==91,"only mapped body tracks are visited");
+    check(mapped.size()==85,"only mapped body tracks are visited");
     const auto bridges=sceneBridgeNodes<FixtureNode*>(std::span<FixtureNode* const>(mapped.data(),mapped.size()),scene.root,[](FixtureNode* node){return node->parent;});
     check(bool(bridges)&&!bridges->empty(),"real XP32 parent chains require controller/adjustment bridges");
     bool adjustmentBridge=false;
     for(auto* node:*bridges) {
         check(scene.owned(node)&&node!=scene.root,"bridge collector stops at owned NPC Root");
         check(std::find(mapped.begin(),mapped.end(),node)==mapped.end(),"bridges are actual unmapped ancestors");
-        check(node->name!=lib.names[97]&&node->name!=lib.names[98],"camera tracks cannot become body bridges");
+        for(int i=0;i<99;++i)if(unownedTrack(i))check(node->name!=lib.names[i],"unrelated equipment and camera tracks cannot become body bridges");
         adjustmentBridge|=node->name.starts_with("CME ")||node->name.starts_with("MOV ");
     }
     check(adjustmentBridge,"fixture preserves real CME/MOV intermediate nodes");
     for(int i=0;i<99;++i) {
-        if(animationOnlyLeaf(i,lib.names,lib.parents)||engineOwnedCameraTrack(i,lib.names,lib.parents))continue;
+        if(animationOnlyLeaf(i,lib.names,lib.parents)||unownedTrack(i))continue;
         auto missing=bindScene<FixtureNode*>(lib.names,lib.parents,[&](const std::string& name){return name==lib.names[i]?nullptr:scene.find(scene.root,name);});
         check(!missing&&missing.missing==i,"deleting each required body node from the actual lookup domain must fail");
     }
+    auto* axe=scene.find(scene.root,lib.names[61]);auto* spine=scene.find(scene.root,lib.names[26]);
+    check(axe&&spine&&axe->parent&&axe->children.empty(),"real fixture provides a movable WeaponAxe leaf and mapped spine");
+    auto& siblings=axe->parent->children;siblings.erase(std::find(siblings.begin(),siblings.end(),axe));
+    axe->parent=spine;axe->parentId=spine->id;spine->children.push_back(axe);
+    check(spine!=scene.find(scene.root,lib.names[lib.parents[61]])&&actual.nodes[26]==spine,"reparented WeaponAxe encounters another mapped bone before its canonical pelvis parent");
+    lookups.fill(0);const auto reparented=bindScene<FixtureNode*>(lib.names,lib.parents,lookup);
+    check(bool(reparented)&&reparented.nodes==actual.nodes&&lookups[61]==0,"reported equipment reparenting preserves the exact anatomical binding without looking up WeaponAxe");
     std::cout<<"PASS actual hierarchy: "<<path<<" root="<<scene.root->id<<" mapped="<<actual.count
         <<" virtual="<<actual.virtualLeaves<<" engineOwned="<<actual.unownedTracks<<" bridges="<<bridges->size()<<" legacyMissing="<<oldMissing<<'\n';
 }
@@ -115,21 +124,22 @@ int main(int argc,char** argv) {
             return present.contains(name)?&objects[i]:nullptr;
         };
         auto full=bindScene<int*>(lib.names,lib.parents,lookup);
-        check(bool(full)&&full.count==97&&full.virtualLeaves==0&&full.unownedTracks==2,"complete body binds while both camera tracks remain engine-owned");
-        check(lookups[97]==0&&lookups[98]==0,"even present cameras are excluded before lookup");
+        check(bool(full)&&full.count==88&&full.virtualLeaves==0&&full.unownedTracks==11,"complete body binds while equipment and camera tracks remain engine-owned");
+        for(int i=0;i<99;++i)if(unownedTrack(i))check(lookups[i]==0&&!full.nodes[i],"present equipment and cameras are excluded before lookup");
         for(int i:{1,2,3})present.erase(lib.names[i]);
         auto partial=bindScene<int*>(lib.names,lib.parents,lookup);
-        check(bool(partial)&&partial.count==94&&partial.virtualLeaves==3&&partial.unownedTracks==2,"standard scene without three animation-only leaves binds");
+        check(bool(partial)&&partial.count==85&&partial.virtualLeaves==3&&partial.unownedTracks==11,"standard scene without three animation-only leaves binds");
         std::size_t visits=0;partial.each([&](std::size_t i,int* node){check(node==&objects[i],"preserve track indices");*node=int(i)+100;++visits;});
-        check(visits==94&&objects[1]==0&&objects[2]==0&&objects[3]==0&&objects[97]==0&&objects[98]==0,"no read/write visits an absent helper or engine-owned camera");
+        check(visits==85&&objects[1]==0&&objects[2]==0&&objects[3]==0,"no read/write visits an absent helper");
+        for(int i=0;i<99;++i)if(unownedTrack(i))check(objects[i]==0&&lookups[i]==0,"no read/write or lookup visits engine-owned equipment or cameras");
         check(objects[4]==104&&objects[38]==138&&objects[96]==196,"COM, hand and fingers must not shift by three tracks");
-        for(int i:{42,43,60})present.erase(lib.names[i]);
+        for(int i:equipmentTracks)present.erase(lib.names[i]);
         partial=bindScene<int*>(lib.names,lib.parents,lookup);
-        check(bool(partial)&&partial.count==91&&partial.virtualLeaves==6&&partial.unownedTracks==2,"missing unequipped attachment nodes do not reject the body");
+        check(bool(partial)&&partial.count==85&&partial.virtualLeaves==3&&partial.unownedTracks==11,"all absent equipment nodes retain the same anatomical binding");
         present.erase(lib.names[97]);present.erase(lib.names[98]);
         check(bool(bindScene<int*>(lib.names,lib.parents,lookup)),"absence of engine camera nodes cannot disable body binding");
         for(int i=0;i<99;++i) {
-            if(animationOnlyLeaf(i,lib.names,lib.parents)||engineOwnedCameraTrack(i,lib.names,lib.parents))continue;
+            if(animationOnlyLeaf(i,lib.names,lib.parents)||unownedTrack(i))continue;
             present.erase(lib.names[i]);auto invalid=bindScene<int*>(lib.names,lib.parents,lookup);
             check(!invalid&&invalid.missing==i,"every non-helper scene bone remains mandatory");present.insert(lib.names[i]);
         }
@@ -137,6 +147,33 @@ int main(int argc,char** argv) {
         check(!bindScene<int*>(lib.names,changed,lookup),"a helper cannot be optional when an anatomical bone inherits from it");
         auto names=lib.names;names[1]="x_unknown";
         check(!bindScene<int*>(names,lib.parents,lookup),"arbitrary x_ names do not bypass validation");
+        for(int equipment:equipmentTracks) {
+            check(engineOwnedEquipmentTrack(equipment,lib.names,lib.parents),"all nine canonical equipment leaves remain native");
+            check(engineOwnedEquipmentName(lib.names[equipment],lib.names,lib.parents),"equipment ancestor guard recognizes each native equipment name");
+            check(!engineOwnedEquipmentName("x_"+lib.names[equipment],lib.names,lib.parents),"equipment ancestor guard never uses fuzzy names");
+            names=lib.names;changed=lib.parents;std::swap(names[1],names[equipment]);std::swap(changed[1],changed[equipment]);
+            check(!engineOwnedEquipmentTrack(1,names,changed)&&!engineOwnedEquipmentName(lib.names[equipment],names,changed),"equipment identity requires its exact canonical index");
+            names=lib.names;names[equipment]="Unknown equipment";
+            check(!engineOwnedEquipmentTrack(equipment,names,lib.parents),"equipment exclusions require exact canonical names");
+            auto invalid=bindScene<int*>(names,lib.parents,lookup);
+            check(!invalid&&invalid.missing==equipment,"unknown equipment identity remains required");
+            for(int parent:{-1,0,4,99})if(parent!=lib.parents[equipment]) {
+                changed=lib.parents;changed[equipment]=parent;
+                check(!engineOwnedEquipmentTrack(equipment,lib.names,changed)&&!engineOwnedEquipmentName(lib.names[equipment],lib.names,changed),"equipment exclusions require exact canonical parents");
+                invalid=bindScene<int*>(lib.names,changed,lookup);
+                check(!invalid&&invalid.missing==equipment,"changed canonical equipment parent cannot be silently excluded");
+            }
+            changed=lib.parents;changed[96]=equipment;
+            check(!engineOwnedEquipmentTrack(equipment,lib.names,changed)&&!engineOwnedEquipmentName(lib.names[equipment],lib.names,changed),"equipment that becomes a body ancestor cannot be excluded");
+            invalid=bindScene<int*>(lib.names,changed,lookup);
+            check(!invalid&&invalid.missing==equipment,"a required anatomical ancestor cannot be omitted");
+        }
+        for(int i=0;i<99;++i)if(std::find(equipmentTracks.begin(),equipmentTracks.end(),i)==equipmentTracks.end())
+            check(!engineOwnedEquipmentTrack(i,lib.names,lib.parents)&&!engineOwnedEquipmentName(lib.names[i],lib.names,lib.parents),"only the nine recognized equipment tracks are excluded");
+        check(!engineOwnedEquipmentTrack(99,lib.names,lib.parents),"out-of-range equipment index rejected");
+        auto shortNames=lib.names;shortNames.pop_back();auto shortParents=lib.parents;shortParents.pop_back();
+        check(!engineOwnedEquipmentName("WeaponAxe",shortNames,lib.parents)&&!engineOwnedEquipmentName("WeaponAxe",lib.names,shortParents),"equipment ancestor guard rejects incomplete canonical layouts");
+        check(!engineOwnedEquipmentName("",lib.names,lib.parents)&&!engineOwnedEquipmentName("WeaponAxeExtra",lib.names,lib.parents),"equipment ancestor guard rejects empty and partial names");
         for(int camera:{97,98}) {
             names=lib.names;names[camera]="Unknown camera";
             check(!engineOwnedCameraTrack(camera,names,lib.parents),"unknown camera identity cannot be excluded");
@@ -154,6 +191,6 @@ int main(int argc,char** argv) {
             check(!invalid&&invalid.missing==camera,"a missing ancestor of the body is never optional");
         }
         for(int file=2;file<argc;++file)actualScene(argv[file],lib);
-        std::cout<<"PASS: owned hierarchy, exact camera schema, required body bones, stable indices, null-safe iteration\n";
+        std::cout<<"PASS: owned hierarchy, exact equipment and camera schema, required body bones, stable indices, null-safe iteration\n";
     } catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}
 }

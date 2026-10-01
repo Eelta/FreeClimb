@@ -37,6 +37,7 @@ int main() {
     write(path,"[General]\nDiagnostics=1\n");
     const auto explicitDiagnostics=loadUserSettings(path);
     expect(explicitDiagnostics.settings.diagnostics,"Existing explicit Diagnostics=1 must remain enabled when read");
+    expect(explicitDiagnostics.warnings.empty()&&explicitDiagnostics.settings.gamepad==GamepadSettings{},"Old INI files without a gamepad section retain keyboard behavior and adopt gamepad defaults");
     std::string diagnosticsError;
     expect(saveUserSettings(path,explicitDiagnostics.settings,diagnosticsError),"Explicit diagnostic setting should save");
     expect(loadUserSettings(path).settings.diagnostics,"Saving an explicit Diagnostics=1 must preserve the user's choice");
@@ -55,6 +56,10 @@ int main() {
     expect(serializeKeyChord(conflict.settings.bindings.forward)=="W"&&!conflict.warnings.empty(),"Conflicting INI bindings must fall back coherently");
     UserSettings settings;settings.language="chinese";settings.staminaEnabled=false;settings.audioVolume=.35f;
     settings.bindings.hop=*parseKeyChord("Ctrl+Space");settings.automaticSideWeights={.2f,.7f};
+    settings.gamepad.enabled=false;settings.gamepad.deadzone=.35f;settings.gamepad.triggerThreshold=.7f;
+    settings.gamepad.bindings.entry=*parseGamepadChord("RB+X");settings.gamepad.bindings.runModifier=*parseGamepadChord("RB");
+    settings.gamepad.bindings.hop=*parseGamepadChord("X");settings.gamepad.bindings.drop=*parseGamepadChord("A");
+    expect(validateGamepadBindings(settings.gamepad.bindings).valid,"Test custom gamepad combinations must be valid");
     expect(validateBindings(settings.bindings).valid,"Test custom combination is valid");
     write(path,"; preserve my settings\n[FutureMod]\nCustom=keep\n[Audio]\nVolume=.1\nVolume=.9\n");
     std::string error;expect(saveUserSettings(path,settings,error),"Valid settings should save");
@@ -63,9 +68,12 @@ int main() {
     expect(std::abs(roundtrip.settings.audioVolume-.35f)<.0001f,"Last duplicate must not override saved value");
     expect(serializeKeyChord(roundtrip.settings.bindings.hop)=="Ctrl+Space","Combination persists");
     expect(roundtrip.settings.automaticSideWeights==settings.automaticSideWeights,"Opportunity rates persist");
+    expect(roundtrip.warnings.empty()&&roundtrip.settings.gamepad==settings.gamepad,"Gamepad enable, thresholds and every binding survive an INI round trip");
     expect(read(path).find("Custom=keep")!=std::string::npos&&read(path).find("; preserve my settings")!=std::string::npos,"Unknown sections and comments survive saving");
     const auto before=read(path);settings.bindings.forward=settings.bindings.backward;
     expect(!saveUserSettings(path,settings,error)&&read(path)==before,"Invalid menu bindings must not overwrite INI");
+    settings=roundtrip.settings;settings.gamepad.bindings.drop=settings.gamepad.bindings.hop;
+    expect(!saveUserSettings(path,settings,error)&&!error.empty()&&read(path)==before,"Invalid gamepad bindings must reject save without modifying the INI");
     settings=roundtrip.settings;write(std::filesystem::path(path.string()+".freeclimb.bak"),"recovery");
     expect(!saveUserSettings(path,settings,error)&&read(path)==before,"Unresolved prior save must preserve both files");
     std::filesystem::remove(std::filesystem::path(path.string()+".freeclimb.bak"));
@@ -127,6 +135,54 @@ int main() {
         expect(restored.settings.language==language.expected&&read(path).find(std::string("Language=")+language.expected+"\n")!=std::string::npos,"Save must persist canonical language rather than a legacy number or comment");
         expect(std::abs(restored.settings.audioVolume-.35f)<.0001f&&read(path).find("Keep=unchanged")!=std::string::npos,"Language migration must preserve other settings and unknown fields");
     }
+    for(const auto value:{"false ; disabled", "FALSE # disabled", "0 ; disabled", "0 # disabled"}) {
+        write(path,std::string("[Gamepad]\nEnabled=")+value+"\n[Audio]\nEnabled=TrUe ; enabled\nVolume=.35 # volume\n[Menu]\nLanguage=chinese ; local\n");
+        const auto commented=loadUserSettings(path);
+        expect(commented.warnings.empty()&&!commented.settings.gamepad.enabled&&commented.settings.audioEnabled&&
+            commented.settings.audioVolume==.35f&&commented.settings.language=="chinese",
+            "Boolean words and numeric flags accept inline comments without changing numbers or language parsing");
+    }
+    write(path,"[Gamepad]\nEnabled=bad\nDeadzone=nan\nTriggerThreshold=inf\nEntry=Start\nHop=NoSuchButton\n");
+    const auto invalidGamepad=loadUserSettings(path);
+    expect(invalidGamepad.settings.gamepad==GamepadSettings{}&&invalidGamepad.warnings.size()==5,
+        "Malformed gamepad flags, numbers and unsupported buttons warn and use defaults");
+    write(path,"[Gamepad]\nDeadzone=-1\nTriggerThreshold=10\n");
+    const auto boundedGamepad=loadUserSettings(path);
+    expect(boundedGamepad.settings.gamepad.deadzone==.1f&&boundedGamepad.settings.gamepad.triggerThreshold==.95f,
+        "Gamepad thresholds clamp to the same bounds as the menu");
+    write(path,"[Gamepad]\nDeadzone=4\nTriggerThreshold=-1\n");
+    const auto oppositeBounds=loadUserSettings(path);
+    expect(oppositeBounds.settings.gamepad.deadzone==.8f&&oppositeBounds.settings.gamepad.triggerThreshold==.1f,
+        "Both gamepad threshold ranges have bounded lower and upper limits");
+    for(const auto controls:{"Entry=LB+B\n", "RunModifier=Y\n", "Hop=B\n", "Drop=LB\n"}) {
+        write(path,std::string("[Gamepad]\nEnabled=0\nDeadzone=.4\n")+controls+"[Controls]\nEntry=G\n[Menu]\nLanguage=chinese\n[General]\nDiagnostics=1\n");
+        const auto value=loadUserSettings(path);
+        expect(!value.warnings.empty()&&value.settings.gamepad.bindings==GamepadBindings{},
+            "Conflicting gamepad actions must fall back to a coherent default binding set");
+        expect(!value.settings.gamepad.enabled&&value.settings.gamepad.deadzone==.4f&&
+            serializeKeyChord(value.settings.bindings.entry)=="G"&&value.settings.language=="chinese"&&value.settings.diagnostics,
+            "Gamepad binding fallback preserves other gamepad, keyboard and local settings");
+    }
+    write(path,"[gAmEpAd]\neNaBlEd=false\ndEaDzOnE=.3 ; stick\ntRiGgErThReShOlD=.6 # trigger\n"
+        "eNtRy=LT+RT ; entry\nrUnMoDiFiEr=LB\nhOp=Y\ndRoP=B\nFutureOption=keep\n"
+        "[Other]\nEntry=unrelated\n[Menu]\nLanguage=chinese\n[General]\nDiagnostics=1\n");
+    const auto namedGamepad=loadUserSettings(path);
+    expect(namedGamepad.warnings.empty()&&!namedGamepad.settings.gamepad.enabled&&
+        namedGamepad.settings.gamepad.bindings.entry==*parseGamepadChord("LT+RT"),
+        "Case-insensitive INI names, comments and trigger chords are supported");
+    expect(saveUserSettings(path,namedGamepad.settings,error),"Custom gamepad settings should merge into existing INI");
+    const auto savedGamepad=loadUserSettings(path);
+    expect(savedGamepad.settings.gamepad==namedGamepad.settings.gamepad&&savedGamepad.settings.language=="chinese"&&
+        savedGamepad.settings.diagnostics&&read(path).find("FutureOption=keep")!=std::string::npos&&
+        read(path).find("Entry=unrelated")!=std::string::npos,
+        "Gamepad saves retain unknown fields and the author's language and diagnostic preferences");
+    auto nonfiniteGamepad=namedGamepad.settings;
+    nonfiniteGamepad.gamepad.deadzone=std::numeric_limits<float>::quiet_NaN();
+    nonfiniteGamepad.gamepad.triggerThreshold=std::numeric_limits<float>::infinity();
+    const auto sanitizedGamepad=sanitizeUserSettings(nonfiniteGamepad);
+    expect(sanitizedGamepad.gamepad.deadzone==GamepadSettings{}.deadzone&&
+        sanitizedGamepad.gamepad.triggerThreshold==GamepadSettings{}.triggerThreshold,
+        "Non-finite in-memory gamepad thresholds return to defaults before runtime use");
     settings.language=" CHINESE ";
     expect(sanitizeUserSettings(settings).language=="chinese","In-memory language must canonicalize before applying");
     write(path,
@@ -141,7 +197,8 @@ int main() {
         "[Audio]\nEnabled=0\nVolume=0.2\n"
         "[Detection]\nReach=120\nGrabMaxSnap=25\nGroundJumpHeight=40\nMaxNormalZ=0.5\n"
         "[Controls]\nForward=Up\nBackward=Down\nLeft=Left\nRight=Right\n"
-        "Entry=Ctrl+Up\nRunModifier=Alt\nHop=Enter\n");
+        "Entry=Ctrl+Up\nRunModifier=Alt\nHop=Enter\n"
+        "[Gamepad]\nEnabled=0\nDeadzone=.35\nTriggerThreshold=.7\nEntry=RB+X\nRunModifier=RB\nHop=X\nDrop=A\n");
     const auto customized=loadUserSettings(path);
     expect(customized.warnings.empty()&&validateBindings(customized.settings.bindings).valid,"Page reset fixture must have valid non-default settings");
     const auto originalFields=iniFields(customized.settings),defaultFields=iniFields(UserSettings{});
@@ -154,7 +211,8 @@ int main() {
         {SettingsPage::stamina,{"stamina/enabled","stamina/movingpersecond","stamina/hangingpersecond","stamina/requiredtograb"}},
         {SettingsPage::audio,{"audio/enabled","audio/volume"}},
         {SettingsPage::keys,{"controls/forward","controls/backward","controls/left","controls/right","controls/entry",
-            "controls/runmodifier","controls/hop"}},
+            "controls/runmodifier","controls/hop","gamepad/enabled","gamepad/deadzone","gamepad/triggerthreshold",
+            "gamepad/entry","gamepad/runmodifier","gamepad/hop","gamepad/drop"}},
         {SettingsPage::diagnostics,{"general/diagnostics"}}
     };
     for(const auto& page:pages) {
@@ -175,11 +233,14 @@ int main() {
             "Saving page defaults must retain unknown INI fields and comments");
         auto invalidDraft=customized.settings;
         invalidDraft.language=" FRENCH ";invalidDraft.reach=999;invalidDraft.bindings.forward=invalidDraft.bindings.backward;
+        invalidDraft.gamepad.bindings.drop=invalidDraft.gamepad.bindings.hop;invalidDraft.gamepad.deadzone=5;
         const auto retained=restoreSettingsPage(page.page,invalidDraft);
         expect(retained.language==invalidDraft.language&&retained.reach==999,"Page reset must not normalize unrelated editor values");
         expect(page.page==SettingsPage::keys?validateBindings(retained.bindings).valid:
             serializeKeyChord(retained.bindings.forward)==serializeKeyChord(invalidDraft.bindings.forward),
             "Only resetting the keys page may replace unrelated invalid binding drafts");
+        expect(page.page==SettingsPage::keys?retained.gamepad==GamepadSettings{}:retained.gamepad==invalidDraft.gamepad,
+            "Only the keys page resets gamepad controls and replaces invalid gamepad drafts");
     }
     std::filesystem::remove(path);std::filesystem::remove(directory);
     std::cout<<checks<<" settings checks, "<<failures<<" failures\n";return failures?1:0;

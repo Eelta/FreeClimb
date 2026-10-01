@@ -1,9 +1,11 @@
 #pragma once
+#include "PoseRig.h"
 #include "Core.h"
 #include <cstdint>
 #include <fstream>
 #include <string>
 #include <vector>
+#include <limits>
 
 namespace fc {
 inline float smooth(float t) { t=std::clamp(t,0.f,1.f); return t*t*t*(10+t*(-15+6*t)); }
@@ -66,6 +68,7 @@ struct Library {
     std::vector<std::string> names;
     std::vector<int> parents;
     Pose rest;
+    PoseRig<Pose> rig;
     std::array<Clip,motionCount> clips;
     std::array<RotationOverride,motionCount> rotationOverrides;
     bool hasAnimationOverride(Motion motion) const {
@@ -87,7 +90,8 @@ struct Library {
     bool configureThreepeat(Settings& cfg) const {
         if(!hasThreepeat()){cfg.threepeatAnimations=false;return false;}
         cfg.threepeatProfile=threepeatProfile;
-        const auto hang=world(clip(Motion::contextHang).frames.front());
+        auto hangPose=clip(Motion::contextHang).frames.front();rig.adapt(hangPose);
+        const auto hang=world(hangPose);
         const auto left=palm(hang,0),right=palm(hang,1),middle=(left+right)*.5f;
         cfg.threepeatHangHeight=middle.z;
         cfg.threepeatHandHalfWidth=std::abs(right.x-left.x)*.5f;
@@ -100,7 +104,8 @@ struct Library {
         }
         const auto& mantle=clip(Motion::contextMantle);
         cfg.threepeatMantleHeight=mantle.height;cfg.threepeatMantleSeconds=mantle.seconds;cfg.threepeatMantleForward=mantle.travel.y;
-        const auto mantleStart=world(mantle.frames.front());
+        auto mantlePose=mantle.frames.front();rig.adapt(mantlePose);
+        const auto mantleStart=world(mantlePose);
         const auto mantleLeft=palm(mantleStart,0),mantleRight=palm(mantleStart,1);
         cfg.threepeatMantlePalmHeight=(mantleLeft.z+mantleRight.z)*.5f;
         cfg.threepeatMantleHalfWidth=std::abs(mantleRight.x-mantleLeft.x)*.5f;
@@ -121,7 +126,7 @@ struct Library {
         for(int hand=0;hand<2;++hand) {
             const int upper=hand?31:28,elbow=hand?32:29,wrist=hand?39:38;
             if(parents[elbow]!=upper||parents[wrist]!=elbow)continue;
-            const auto& capture=hang.front();
+            auto capture=hang.front();rig.adapt(capture);
             const Vec axis=rest[elbow].t.unit();
             const Vec forearm=capture[elbow].q.rotate(capture[wrist].t).unit();
             const Vec normal=axis.cross(forearm);
@@ -160,6 +165,15 @@ struct Library {
         std::uint8_t result=0;
         for(int hand=0;hand<2;++hand)if(guardArmBend(p,hand))result|=std::uint8_t(1u<<hand);
         return result;
+    }
+    bool configureRig(const Pose& reference,const std::array<Transform,99>& basis,const std::array<bool,99>& mapped) {
+        PoseRig<Pose> next;
+        if(!next.configure(rig.source().empty()?rest:rig.source(),reference,basis,mapped))return false;
+        rest=next.reference();rig=std::move(next);calibrateArmBends();return true;
+    }
+    void clearRig() {
+        if(rig.active())rest=rig.source();
+        rig.clear();calibrateArmBends();
     }
     bool load(const std::string& path) {
         if(path.size()>=5&&path.substr(path.size()-5)==".json")return loadAnimationPackFile(*this,path,lastLoadError);
@@ -235,6 +249,7 @@ struct Library {
             }};
             for(const auto& fix:fixes)out[fix.bone].q=(out[fix.bone].q*fix.right).unit();
         }
+        rig.adapt(out);
         return out;
     }
     Pose sample(Motion motion,float phase) const {
@@ -245,7 +260,7 @@ struct Library {
         const float frame=std::clamp(phase,0.f,1.f)*float(frames.size()-1);
         const auto first=std::min(std::size_t(frame),frames.size()-2);
         for(std::size_t bone=5;bone<97;++bone)if(replacement.bones[bone])
-            result[bone].q=blend(frames[first][bone],frames[first+1][bone],frame-float(first));
+            result[bone].q=rig.rotation(bone,blend(frames[first][bone],frames[first+1][bone],frame-float(first)));
         return result;
     }
     const Clip& clip(Motion motion) const {
@@ -264,6 +279,18 @@ struct Library {
         for(std::size_t i=0;i<local.size();++i) result[i]=parents[i]<0?local[i]:compose(result[parents[i]],local[i]);
         return result;
     }
+    std::optional<Transform> worldBone(const Pose& local,int index) const {
+        if(index<0)return {};
+        std::array<int,99> chain;
+        std::size_t count=0;
+        while(index>=0) {
+            if(std::size_t(index)>=local.size()||std::size_t(index)>=parents.size()||count==chain.size())return {};
+            chain[count++]=index;index=parents[index];
+        }
+        Transform result=local[chain[--count]];
+        while(count)result=compose(result,local[chain[--count]]);
+        return result;
+    }
     Vec palm(const Pose& worldPose,int hand) const {
         const int wrist=hand==0?38:39,base=hand==0?67:82;
         return worldPose[wrist].t*.5f+(worldPose[base+3].t+worldPose[base+6].t+
@@ -280,11 +307,14 @@ struct Library {
         rotateWorld(pose,wrist,(correction*body[wrist].q).unit());return true;
     }
     void rotateWorld(Pose& p,int index,Quat desired) const {
-        auto w=world(p); p[index].q=(parents[index]<0?desired:w[parents[index]].q.inverse()*desired).unit();
+        if(index<0||std::size_t(index)>=p.size()||std::size_t(index)>=parents.size())return;
+        if(parents[index]<0)p[index].q=desired.unit();
+        else if(const auto parent=worldBone(p,parents[index]))p[index].q=(parent->q.inverse()*desired).unit();
     }
     void contactOrientation(Pose& p,int index,Quat authored,Quat desiredWorld) const {
-        const auto w=world(p);
-        const Quat desired=w[parents[index]].q.inverse()*desiredWorld;
+        if(index<0||std::size_t(index)>=p.size()||std::size_t(index)>=parents.size())return;
+        const auto parent=worldBone(p,parents[index]);if(!parent)return;
+        const Quat desired=parent->q.inverse()*desiredWorld;
 
         p[index].q=boundedRotation(authored,desired,.2617994f);
     }
@@ -306,7 +336,9 @@ struct Library {
     float ik(Pose& p,int a,int b,int c,Vec target,Vec pole) const {
         const int hand=a==28&&b==29&&c==38?0:a==31&&b==32&&c==39?1:-1;
         if(hand>=0)guardArmBend(p,hand);
-        auto w=world(p); Vec start=w[a].t,mid=w[b].t,end=w[c].t;
+        const auto worldA=worldBone(p,a),worldB=worldBone(p,b),worldC=worldBone(p,c);
+        if(!worldA||!worldB||!worldC)return std::numeric_limits<float>::infinity();
+        Vec start=worldA->t,mid=worldB->t,end=worldC->t;
         float upper=(mid-start).length(),lower=(end-mid).length();
         Vec axis=(target-start).unit();
         if(upper<.001f||lower<.001f||axis.length()<.9f)return (target-end).length();
@@ -315,21 +347,24 @@ struct Library {
         if(plane.length()<.01f) {plane=axis.cross({0,1,0}); if(plane.length()<.01f)plane=axis.cross({1,0,0});}
         float along=(upper*upper-lower*lower+distance*distance)/(2*distance);
         const float radial=std::sqrt(std::max(0.f,upper*upper-along*along));
-        const auto originalA=p[a].q,originalB=p[b].q,upperWorld=w[a].q;
+        const auto originalA=p[a].q,originalB=p[b].q,upperWorld=worldA->q;
         auto solve=[&](float side) {
             p[a].q=originalA;p[b].q=originalB;
             const Vec joint=start+axis*along+plane.unit()*(radial*side);
             rotateWorld(p,a,Quat::between(mid-start,joint-start)*upperWorld);
-            const auto aimed=world(p);
-            rotateWorld(p,b,Quat::between(aimed[c].t-aimed[b].t,start+axis*distance-aimed[b].t)*aimed[b].q);
+            const auto aimedB=worldBone(p,b),aimedC=worldBone(p,c);
+            if(!aimedB||!aimedC)return false;
+            rotateWorld(p,b,Quat::between(aimedC->t-aimedB->t,start+axis*distance-aimedB->t)*aimedB->q);
+            return true;
         };
-        solve(1);
+        if(!solve(1))return std::numeric_limits<float>::infinity();
         if(hand>=0&&!armBendValid(p,hand)) {
 
-            solve(-1);
+            if(!solve(-1))return std::numeric_limits<float>::infinity();
             if(!armBendValid(p,hand))guardArmBend(p,hand);
         }
-        return (target-world(p)[c].t).length();
+        const auto result=worldBone(p,c);
+        return result?(target-result->t).length():std::numeric_limits<float>::infinity();
     }
 };
 

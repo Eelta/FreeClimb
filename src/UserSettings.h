@@ -1,5 +1,6 @@
 #pragma once
 #include "InputBindings.h"
+#include "GamepadInput.h"
 #include <array>
 #include <filesystem>
 #include <string>
@@ -18,6 +19,7 @@ struct UserSettings {
     float movingPerSecond=10,hangingPerSecond=0,requiredToGrab=12;
     std::array<float,2> automaticSideWeights{1,1};
     InputBindings bindings;
+    GamepadSettings gamepad;
 };
 enum class SettingsPage { general, movement, automatic, stamina, audio, keys, diagnostics };
 struct SettingsLoadResult {

@@ -1,4 +1,5 @@
 #include "Controls.h"
+#include "NativeWalkableApproach.h"
 #include <algorithm>
 #include <array>
 #include <iostream>
@@ -167,8 +168,87 @@ static void wallRunSpaceRoutingAndEntryGate() {
     Keys native;native.w=native.space=true;check(!approachIntent(native),"W+Space alone remains native jumping");
     native.shift=true;check(!approachIntent(native),"ordinary sprint jumping cannot attach without the complete configured chord");
 }
+static void nativeJumpWindow() {
+    for(int fps:{30,60,120}) {
+        const float dt=1.f/fps;NativeJumpIntent jump;ClimbEntryIntent climb;const auto keys=grabKeys();
+        check(jump.sample(true,0),"initial physical native jump press opens a short intent window");
+        const auto first=climb.sample(keys,false,false,0,false);
+        check(first.requested&&first.fresh&&first.began,"complete entry chord still starts immediately");
+        bool expired=false;int fresh=1;
+        for(int frame=1;frame<=fps*4;++frame) {
+            const float elapsed=frame*dt;const bool native=jump.sample(true,dt);
+            if(elapsed>.15f+dt)check(!native,"held jump does not remain a native jump request after its short window");
+            if(expired)check(!native,"landing while Space is still held cannot manufacture another native press");
+            expired|=!native;
+            const auto request=climb.sample(keys,false,false,dt,false);fresh+=request.fresh;
+            check(request.requested&&!request.fresh&&!request.began,"full held chord retries immediately without another physical press");
+            if(expired) {
+                check(groundEntryGeometryAllowed(true,false,native,false,false),"expired native Space intent retains staircase and low-obstacle exclusion");
+                const auto onGround=grabFlight(false,false,false,native,0);
+                check(!onGround.airborne&&!onGround.confirmedAirborne,"expired native intent cannot mark a landed character airborne");
+                const auto falling=grabFlight(true,false,false,native,-100);
+                check(falling.airborne&&falling.confirmedAirborne&&falling.descending,"real physical flight remains airborne after native intent expires");
+                check(!groundEntryGeometryAllowed(false,false,native,falling.airborne,falling.confirmedAirborne),"actual flight does not use grounded entry exclusions");
+            }
+        }
+        check(expired&&fresh==1,"native press expires independently of immediate held-chord retries");
+        check(!jump.sample(false,dt)&&jump.sample(true,0),"releasing native jump permits a genuinely new short press window");
+        for(int frame=0;frame<fps;++frame)jump.sample(true,dt);
+        for(int repeat=0;repeat<50;++repeat)for(float invalid:{0.f,-1.f,std::numeric_limits<float>::quiet_NaN(),std::numeric_limits<float>::infinity()})
+            check(!jump.sample(true,invalid),"invalid timing cannot revive an expired still-held jump press");
+    }
+}
+static void preparationGrace() {
+    for(int fps:{30,60,120})for(bool gamepad:{false,true}) {
+        const float dt=1.f/fps;EntryPreparationGrace grace;const Keys released;
+        for(int frame=0;frame<fps;++frame) {
+            check(!grace.sample(dt,gamepad,released),"unarmed background frames cannot create a deferred catch");
+            check(!grace.sample(dt,gamepad,grabKeys()),"a chord alone does not authorize preparation grace without validated geometry");
+        }
+        grace.arm(gamepad);check(grace.sample(.000001f,gamepad,released),"a newly armed verified preparation survives an immediate release on the next valid update");
+        bool expired=false;float expiry=0;
+        for(int frame=1;frame<=fps;++frame) {
+            const float elapsed=frame*dt;const bool permitted=grace.sample(dt,gamepad,released);
+            if(elapsed<.15f-.0001f)check(permitted,"verified render preparation may finish within the short grace window");
+            if(elapsed>.15f+dt+.0001f)check(!permitted,"preparation grace cannot persist past the150ms deadline");
+            if(expired)check(!permitted,"expired grace cannot reactivate while released");
+            if(!permitted&&!expired){expired=true;expiry=elapsed;}
+            const auto movement=wallInput(released,false);
+            check(!movement.hop&&!movement.run&&!movement.release&&movement.x==0&&movement.y==0,"retaining verified preparation does not fabricate direction jump or run input");
+        }
+        check(expired&&expiry>=.15f-.0001f&&expiry<=.15f+dt+.0001f,"grace deadlines remain bounded at30,60and120fps");
+        for(int frame=0;frame<fps;++frame)check(!grace.sample(dt,gamepad,grabKeys()),"pressing keys cannot revive expired grace without new verified arming");
+        for(int cancelKind=0;cancelKind<4;++cancelKind) {
+            grace.arm(gamepad);check(grace.sample(dt,gamepad,released),"cancellation fixture starts with live preparation grace");
+            auto keys=released;
+            if(cancelKind==0)grace.cancel();
+            if(cancelKind==1)keys.s=true;
+            if(cancelKind==2)keys.letGo=true;
+            check(!grace.sample(dt,cancelKind==3?!gamepad:gamepad,keys),"menu or explicit cancel backward let-go and device switch discard preparation immediately");
+            for(int frame=0;frame<fps;++frame)check(!grace.sample(dt,gamepad,released),"clearing cancellation input cannot silently restore a prepared catch");
+        }
+    }
+    for(float dt:{0.f,-1.f,std::numeric_limits<float>::quiet_NaN(),std::numeric_limits<float>::infinity(),.2f,1000.f}) {
+        EntryPreparationGrace grace;grace.arm(false);
+        check(!grace.sample(dt,false,{}),"invalid timing or a frame beyond the full deadline cancels grace without a time clamp");
+        check(!grace.sample(0,false,{})&&!grace.sample(.001f,false,grabKeys()),"hitches and invalid samples cannot leave a revivable authorization");
+    }
+    for(bool airborneOrigin:{false,true}) {
+        ClimbEntryIntent intent;JumpGrabGate gate;EntryPreparationGrace grace;
+        const auto request=intent.sample(grabKeys(),false,false,0,airborneOrigin);
+        gate.hold({0,1,0},false,request.airborneAtBegin,request.fresh);grace.arm(false);
+        const auto released=intent.sample({},false,false,.01f,true);
+        check(!released.requested&&!released.fresh&&!released.began,"released chord cannot produce new airborne input intent");
+        check(grace.sample(.01f,false,{}),"confirmed preparation may finish briefly after the original physical chord ends");
+        gate.hold({1,0,0},false,true,released.fresh);
+        const auto falling=grabFlight(true,false,false,false,-100);
+        check(gate.explicitAirCatch(falling)==airborneOrigin,"preparation grace cannot upgrade ground-origin intent into a fresh-air cooldown bypass");
+        check(!grace.sample(.2f,false,{}),"a pending preparation expires through a real frame hitch");
+        gate.cancel();check(!gate.pending()&&!gate.explicitAirCatch(falling),"expiration can fully retire the pending physical preflight");
+    }
+}
 int main(){try {
     chordTruthTableAndNativeSpace();heldApproachAndReleaseRearming();flightClassificationAndFreshAirBypass();
-    currentPositionCatchAndDistantHold();wallRunSpaceRoutingAndEntryGate();
-    std::cout<<"PASS: full configurable climb chord, all 24 key orders, held retry and release rearm, physical-air provenance, native Space and attached run gate\n";
+    currentPositionCatchAndDistantHold();wallRunSpaceRoutingAndEntryGate();nativeJumpWindow();preparationGrace();
+    std::cout<<"PASS: full configurable climb chord, all 24 key orders, held retry and release rearm, physical-air provenance, native jump expiry, bounded verified preparation grace and attached run gate\n";
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

@@ -32,9 +32,8 @@ bool tryEaveTransfer(World& originalWorld,Input intent={0,1},bool wallRun=false,
     if(!source||!gripSupport(w,position,*source,true)||bounded.exhausted)return false;
     for(float height:{6.f,cfg.chest,cfg.height}) {
         const Vec center=position+Vec{0,0,height};
-        for(int ring=0;ring<16;++ring) {
-            const float angle=ring*(6.28318530718f/16);
-            const Vec outer=center+Vec{std::cos(angle),std::sin(angle),0}*(cfg.radius+4);
+        for(const auto direction:bodyRingDirections()) {
+            const Vec outer=center+direction*(cfg.radius+4);
             if(w.ray(center,outer)||w.ray(outer,center)||bounded.exhausted)return false;
         }
     }
@@ -68,6 +67,7 @@ bool tryEaveTransfer(World& originalWorld,Input intent={0,1},bool wallRun=false,
             if(shift.length()>cfg.reach+.01f)continue;
             const Vec outside=position+shift;
             if(!clearPath(w,position,outside)||!roofPathClear(w,position,outside))continue;
+            bool prefixChecked=false,prefixClear=false;
             for(std::size_t ai=0;ai<advances.size();++ai) {
                 const float advance=advances[ai];
                 if(bounded.exhausted)return false;
@@ -77,8 +77,12 @@ bool tryEaveTransfer(World& originalWorld,Input intent={0,1},bool wallRun=false,
                 if(duplicate)continue;
                 const Vec over=outside+heading*advance;
                 if(!clearPath(w,outside,over)||!roofPathClear(w,outside,over)) {
-                    const Vec prefix=outside+heading*48;
-                    if(!clearPath(w,outside,prefix)||!roofPathClear(w,outside,prefix))break;
+                    if(!prefixChecked) {
+                        const Vec prefix=outside+heading*48;
+                        prefixClear=clearPath(w,outside,prefix)&&roofPathClear(w,outside,prefix);
+                        prefixChecked=true;
+                    }
+                    if(!prefixClear)break;
                     continue;
                 }
                 for(Vec search:{over,position+heading*advance+right*side}) {

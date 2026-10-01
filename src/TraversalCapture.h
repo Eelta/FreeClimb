@@ -17,7 +17,7 @@ class TraversalCapture {
 public:
     static constexpr std::size_t capacity=8192;
     static constexpr std::size_t maxTextBytes=4*1024*1024;
-    static constexpr std::string_view coreVersion="active35-2";
+    static constexpr std::string_view coreVersion="active35-5";
     enum class Kind {ray,body};
     struct Call {
         Kind kind=Kind::ray;
@@ -145,6 +145,9 @@ private:
         for(auto& value:s.threepeatMantleReplant)v(value);
         v(t.threepeatMantle);
         v(t.threepeatPlanStatus);
+        for(auto* retry:{&t.topSearchRetry,&t.hopSearchRetry}) {
+            v(retry->remaining);v(retry->position);v(retry->normal);v(retry->input);v(retry->mode);v(retry->valid);v(retry->standingPath);
+        }
         v(s.automaticClimbActions);v(s.autoActionMinSeconds);v(s.autoActionMaxSeconds);
         v(t.automaticRandomState);v(t.automaticActions);v(t.automaticElapsed);v(t.automaticInterval);
         v(t.automaticAttempts);v(t.automaticBlocked);v(t.automaticRetry);

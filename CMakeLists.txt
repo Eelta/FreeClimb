@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(FreeClimb VERSION 0.2.16 LANGUAGES CXX)
+project(FreeClimb VERSION 0.2.30 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(FREECLIMB_PLUGIN "Build the Windows SKSE plugin" ON)
@@ -61,7 +61,7 @@ if(FREECLIMB_PLUGIN)
   endif()
   include(external/CommonLibNG/cmake/CommonLibSSE.cmake)
   add_commonlibsse_plugin(FreeClimb AUTHOR "Epsilona"
-    COMPATIBLE_RUNTIMES 1.5.97.0 1.6.317.0 1.6.318.0 1.6.323.0 1.6.342.0 1.6.353.0 1.6.629.0 1.6.640.0 1.6.659.0 1.6.1130.0 1.6.1170.0 1.6.1179.0 1.7.99.0
+    COMPATIBLE_RUNTIMES 1.5.97.0 1.6.317.0 1.6.318.0 1.6.323.0 1.6.342.0 1.6.353.0 1.6.629.0 1.6.640.0 1.6.659.1 1.6.1130.0 1.6.1170.0 1.6.1179.1 1.7.99.0 1.7.104.0
     SOURCES src/Plugin.cpp src/SettingsMenu.cpp)
   target_include_directories(FreeClimb PRIVATE src)
   target_link_libraries(FreeClimb PRIVATE FreeClimbAnimationInput FreeClimbSettings)

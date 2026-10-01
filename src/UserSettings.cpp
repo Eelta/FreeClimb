@@ -82,6 +82,10 @@ Values valuesOf(const UserSettings& source) {
     put("AutomaticActions","LeftWeight",settings.automaticSideWeights[0]);
     put("AutomaticActions","RightWeight",settings.automaticSideWeights[1]);
     for(const auto& f:iniBindingFields)values[key("Controls",f.name)]=serializeKeyChord(settings.bindings.*f.member);
+    put("Gamepad","Enabled",settings.gamepad.enabled?1.f:0.f);
+    put("Gamepad","Deadzone",settings.gamepad.deadzone);
+    put("Gamepad","TriggerThreshold",settings.gamepad.triggerThreshold);
+    for(const auto& f:gamepadBindingFields)values[key("Gamepad",f.name)]=serializeGamepadChord(settings.gamepad.bindings.*f.member);
     return values;
 }
 std::string mergeIni(std::istream& existing,const UserSettings& settings) {
@@ -128,6 +132,7 @@ UserSettings sanitizeUserSettings(UserSettings settings) {
     settings.legacyAutomaticHops=false;
     for(auto& weight:settings.automaticSideWeights)weight=std::isfinite(weight)?std::clamp(weight,0.f,1.f):1.f;
     if(!validateBindings(settings.bindings).valid)settings.bindings=InputBindings{};
+    settings.gamepad=sanitizeGamepadSettings(settings.gamepad);
     return settings;
 }
 UserSettings restoreSettingsPage(SettingsPage page,const UserSettings& current) {
@@ -156,7 +161,7 @@ UserSettings restoreSettingsPage(SettingsPage page,const UserSettings& current) 
         settings.audioEnabled=defaults.audioEnabled;settings.audioVolume=defaults.audioVolume;
         break;
     case SettingsPage::keys:
-        settings.bindings=defaults.bindings;
+        settings.bindings=defaults.bindings;settings.gamepad=defaults.gamepad;
         break;
     case SettingsPage::diagnostics:
         settings.diagnostics=defaults.diagnostics;
@@ -171,7 +176,7 @@ SettingsLoadResult loadUserSettings(const std::filesystem::path& path) {
     auto read=[&](const char* section,const char* name,float fallback) {
         const auto it=values.find(key(section,name));if(it==values.end())return fallback;
         if(auto parsed=number(it->second))return *parsed;
-        const auto word=lower(trim(it->second));if(word=="true")return 1.f;if(word=="false")return 0.f;
+        const auto word=lower(trim(it->second.substr(0,it->second.find_first_of(";#"))));if(word=="true")return 1.f;if(word=="false")return 0.f;
         result.warnings.push_back(std::string(section)+"/"+name+": invalid value; using default");return fallback;
     };
     for(const auto& f:fields)result.settings.*f.member=read(f.section,f.name,result.settings.*f.member);
@@ -184,6 +189,15 @@ SettingsLoadResult loadUserSettings(const std::filesystem::path& path) {
         if(auto chord=parseKeyChord(it->second.substr(0,it->second.find_first_of(";#"))))result.settings.bindings.*f.member=*chord;
         else result.warnings.push_back(std::string("Controls/")+f.name+": invalid chord; using default");
     }
+    result.settings.gamepad.enabled=read("Gamepad","Enabled",result.settings.gamepad.enabled?1.f:0.f)>0;
+    result.settings.gamepad.deadzone=read("Gamepad","Deadzone",result.settings.gamepad.deadzone);
+    result.settings.gamepad.triggerThreshold=read("Gamepad","TriggerThreshold",result.settings.gamepad.triggerThreshold);
+    for(const auto& f:gamepadBindingFields)if(const auto it=values.find(key("Gamepad",f.name));it!=values.end()) {
+        if(auto chord=parseGamepadChord(it->second.substr(0,it->second.find_first_of(";#"))))result.settings.gamepad.bindings.*f.member=*chord;
+        else result.warnings.push_back(std::string("Gamepad/")+std::string(f.name)+": invalid chord; using default");
+    }
+    if(const auto validation=validateGamepadBindings(result.settings.gamepad.bindings);!validation.valid)
+        result.warnings.push_back("Gamepad: "+validation.message+"; using default bindings");
     if(!values.contains(key("Controls","Entry"))) {
         if(const auto it=values.find(key("Controls","EntryModifier"));it!=values.end()) {
             const auto old=parseKeyChord(it->second.substr(0,it->second.find_first_of(";#")));
@@ -202,6 +216,7 @@ std::string userSettingsIni(const UserSettings& settings) {
 bool saveUserSettings(const std::filesystem::path& path,const UserSettings& settings,std::string& error) {
     error.clear();
     if(!validateBindings(settings.bindings).valid){error="Invalid or conflicting key bindings";return false;}
+    if(!validateGamepadBindings(settings.gamepad.bindings).valid){error="Invalid or conflicting gamepad bindings";return false;}
     std::error_code ec;const auto parent=path.parent_path();
     if(!parent.empty())std::filesystem::create_directories(parent,ec);
     if(ec){error=ec.message();return false;}

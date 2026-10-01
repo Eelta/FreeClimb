@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+namespace RE {class InputEvent;}
+
 namespace fc {
 struct MenuAnimationSlot {
     std::string name,file,reason;
@@ -30,4 +32,7 @@ struct SettingsMenuCallbacks {
 };
 bool registerSettingsMenu(SettingsMenuCallbacks callbacks);
 bool settingsMenuBlocking();
+void settingsMenuKeyboardSample(const std::uint8_t* keys);
+void settingsMenuGamepadSample(bool available,std::uint16_t buttons=0,std::uint8_t leftTrigger=0,std::uint8_t rightTrigger=0);
+bool settingsMenuFilterInput(RE::InputEvent* event);
 }

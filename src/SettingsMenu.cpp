@@ -1,10 +1,12 @@
 #include "SettingsMenu.h"
+#include "BindingCapture.h"
 #include "TranslationDefaults.h"
 #include "RuntimeLog.h"
 #include <algorithm>
 #include <atomic>
 #include <cstdarg>
-#include <cstring>
+#include <chrono>
+#include <mutex>
 #include <utility>
 #include <RE/Skyrim.h>
 #include "vendor/SKSEMenuFramework/SKSEMenuFramework.h"
@@ -17,11 +19,53 @@ UserSettings draft;
 SettingsPage activePage=SettingsPage::general;
 bool initialized=false,registered=false,dirty=false;
 std::string notice,detail;
-std::array<std::array<char,96>,7> bindingText{};
-constexpr std::array<KeyChord InputBindings::*,7> bindingMembers{
-    &InputBindings::forward,&InputBindings::backward,&InputBindings::left,&InputBindings::right,
-    &InputBindings::entry,&InputBindings::runModifier,&InputBindings::hop
-};
+struct CaptureSession {
+    std::mutex mutex;
+    BindingCapture capture;
+    BindingCaptureSnapshot input;
+    BindingCaptureOwnership ownership;
+    std::atomic<bool> filtering{},cancelRequested{},observing{};
+    std::atomic<float> triggerThreshold{.5f};
+    std::size_t index{};
+    bool active{},rendered{},uiLocked{},unavailable{};
+    std::chrono::steady_clock::time_point started;
+} recording;
+bool captureNeutral() {
+    return std::none_of(recording.input.keyboard.down.begin(),recording.input.keyboard.down.end(),[](bool down){return down;})&&
+        !recording.input.gamepad&&!(GetAsyncKeyState(VK_LBUTTON)&0x8000)&&!(GetAsyncKeyState(VK_RBUTTON)&0x8000);
+}
+void captureFilterState() {
+    recording.filtering.store(recording.active||recording.ownership.pending());
+}
+void advanceCapture() {
+    if(!recording.active)return;
+    recording.input.activationHeld=!captureNeutral();
+    recording.capture.sample(recording.input);
+}
+void captureUI(bool lock) {
+    if(recording.uiLocked==lock)return;
+    auto* io=ui::GetIO();
+    ui::ImGuiIOManager::ClearEventsQueue(io);
+    ui::ImGuiIOManager::ClearInputKeys(io);
+    ui::ImGuiIOManager::SetAppAcceptingEvents(io,!lock);
+    recording.uiLocked=lock;
+}
+void stopCapture() {
+    std::scoped_lock lock(recording.mutex);
+    recording.capture.cancel();recording.active=false;captureFilterState();
+}
+void cancelCapture() {stopCapture();captureUI(false);}
+void __stdcall captureEvent(SKSEMenuFramework::Model::EventType event) {
+    if(event==SKSEMenuFramework::Model::kBeforeRender) {
+        recording.rendered=false;
+        DWORD process=0;GetWindowThreadProcessId(GetForegroundWindow(),&process);
+        if(recording.cancelRequested.exchange(false)||process!=GetCurrentProcessId())cancelCapture();
+    } else if(event==SKSEMenuFramework::Model::kCloseMenu) {
+        recording.observing.store(false);stopCapture();recording.cancelRequested.store(true);
+    } else if(event==SKSEMenuFramework::Model::kAfterRender&&!recording.rendered) {
+        recording.observing.store(false);cancelCapture();
+    }
+}
 TranslationCatalog translations{std::span<const TranslationEntry>{translationDefaults}};
 const char* tr(std::string_view key){return translations.text(draft.language,key);}
 std::string label(std::string_view key,const char* id){return std::string(tr(key))+"###"+id;}
@@ -48,40 +92,85 @@ void reloadTranslations() {
         SKSE::log::warn("Menu translation loading failed: {}",error.what());
     }
 }
-void syncBindings() {
-    for(std::size_t i=0;i<bindingMembers.size();++i) {
-        const auto value=serializeKeyChord(draft.bindings.*bindingMembers[i]);
-        bindingText[i].fill(0);std::copy_n(value.data(),std::min(value.size(),bindingText[i].size()-1),bindingText[i].data());
-    }
-}
 bool acceptBindings() {
-    InputBindings value=draft.bindings;
-    for(std::size_t i=0;i<bindingMembers.size();++i) {
-        auto parsed=parseKeyChord(bindingText[i].data());
-        if(!parsed){notice="binding-invalid";detail=bindingText[i].data();return false;}
-        value.*bindingMembers[i]=*parsed;
-    }
-    if(auto validation=validateBindings(value);!validation.valid){notice="binding-conflict";detail=validation.message;return false;}
-    draft.bindings=value;return true;
+    for(const auto& validation:{validateBindings(draft.bindings),validateGamepadBindings(draft.gamepad.bindings)})
+        if(!validation.valid){notice="binding-conflict";detail=validation.message;return false;}
+    return true;
 }
 void saveSettings() {
-    draft=sanitizeUserSettings(draft);syncBindings();callbacks.requestSave(draft);notice="save-queued";detail.clear();dirty=false;
+    draft=sanitizeUserSettings(draft);callbacks.requestSave(draft);notice="save-queued";detail.clear();dirty=false;
 }
 void restoreDefaults() {
     const auto saved=restoreSettingsPage(activePage,callbacks.getSettings());
     draft=restoreSettingsPage(activePage,draft);
-    if(activePage==SettingsPage::keys)syncBindings();
     callbacks.requestSave(saved);notice="save-queued";detail.clear();
-    dirty=userSettingsIni(draft)!=userSettingsIni(saved);
-    for(std::size_t i=0;i<bindingMembers.size();++i)
-        dirty|=bindingText[i].data()!=serializeKeyChord(draft.bindings.*bindingMembers[i]);
+    dirty=userSettingsIni(draft)!=userSettingsIni(saved)||draft.bindings!=saved.bindings||
+        draft.gamepad.bindings!=saved.gamepad.bindings;
+}
+void beginCapture(BindingCaptureDevice device,std::size_t index) {
+    {
+        std::scoped_lock lock(recording.mutex);
+        recording.index=index;recording.unavailable=false;recording.input={};
+        recording.capture.begin(device);recording.started=std::chrono::steady_clock::now();
+        recording.active=true;captureFilterState();
+    }
+    notice.clear();detail.clear();captureUI(true);
+}
+void finishCapture() {
+    BindingCaptureResult result;
+    std::size_t index{};bool finished=false,unavailable=false;
+    {
+        std::scoped_lock lock(recording.mutex);
+        if(recording.active) {
+            if(std::chrono::steady_clock::now()-recording.started>std::chrono::seconds(20))recording.capture.cancel();
+            if(!recording.capture.active()&&captureNeutral()) {
+                result=recording.capture.result();index=recording.index;unavailable=recording.unavailable;
+                recording.active=false;captureFilterState();finished=true;
+            }
+        }
+    }
+    if(!finished)return;
+    captureUI(false);
+    if(result.status==BindingCaptureStatus::captured) {
+        if(result.device==BindingCaptureDevice::keyboard)draft.bindings.*bindingFields[index].member=result.keyboard;
+        else draft.gamepad.bindings.*gamepadBindingFields[index].member=result.gamepad;
+        dirty=true;notice.clear();detail.clear();acceptBindings();
+    } else notice=unavailable?"$FC_CAPTURE_UNAVAILABLE":
+        result.status==BindingCaptureStatus::error?"$FC_CAPTURE_INVALID":"$FC_CAPTURE_TIMEOUT";
+}
+void bindingButton(BindingCaptureDevice device,std::size_t index,const char* key,const char* id) {
+    const auto value=device==BindingCaptureDevice::keyboard?serializeKeyChord(draft.bindings.*bindingFields[index].member):
+        serializeGamepadChord(draft.gamepad.bindings.*gamepadBindingFields[index].member);
+    if(ui::Button((value+"###"+id).c_str()))beginCapture(device,index);
+    ui::SameLine();text(key);
+}
+void capturePrompt() {
+    BindingCaptureResult result;bool active=false;
+    {
+        std::scoped_lock lock(recording.mutex);
+        active=recording.active;result=recording.capture.result();
+    }
+    if(!active)return;
+    const auto position=ui::GetWindowPos(),size=ui::GetWindowSize();
+    ui::SetNextWindowPos({position.x+size.x*.5f,position.y+size.y*.5f},ui::ImGuiCond_Always,{.5f,.5f});
+    ui::SetNextWindowSize({std::clamp(size.x*.8f,280.f,680.f),0},ui::ImGuiCond_Always);
+    if(ui::Begin(label("$FC_CAPTURE_TITLE","FreeClimbBindingCapture").c_str(),nullptr,
+        ui::ImGuiWindowFlags_AlwaysAutoResize|ui::ImGuiWindowFlags_NoCollapse|ui::ImGuiWindowFlags_NoSavedSettings|
+        ui::ImGuiWindowFlags_NoMove|ui::ImGuiWindowFlags_NoNav)) {
+        text(result.device==BindingCaptureDevice::keyboard?"$FC_KEYBOARD_SECTION":"$FC_GAMEPAD_SECTION");
+        text(result.status==BindingCaptureStatus::armed?"$FC_CAPTURE_READY":"$FC_CAPTURE_WAITING");
+        if(!result.preview.empty())ui::Text("%s",result.preview.c_str());
+        text("$FC_CAPTURE_HELP");
+    }
+    ui::End();
 }
 const char* translatedNotice() {
     if(notice=="binding-invalid")return tr("$FC_NOTICE_BINDING_INVALID");
+    if(notice=="gamepad-binding-invalid")return tr("$FC_NOTICE_GAMEPAD_BINDING_INVALID");
     if(notice=="binding-conflict")return tr("$FC_NOTICE_BINDING_CONFLICT");
     if(notice=="save-queued")return tr("$FC_NOTICE_SAVE_QUEUED");
     if(notice=="reload-queued")return tr("$FC_NOTICE_RELOAD_QUEUED");
-    return "";
+    return notice.starts_with("$FC_")?tr(notice):"";
 }
 const char* runtimeStatus(std::string_view value) {
     if(value=="ready")return tr("$FC_STATUS_READY");
@@ -151,15 +240,17 @@ void movement() {
 }
 void automaticActions() {
     check("$FC_AUTO_SIDE_ACTIONS","autoActions",draft.automaticClimbActions);
+    text("$FC_ATTEMPT_HELP");
     check("$FC_WALL_RUN_OBSTACLES","obstacleJumps",draft.wallRunObstacleJumps);
     check("$FC_CONTEXT_MANTLE","contextMantle",draft.contextualMantleEnabled);
+    ui::BeginDisabled(!draft.automaticClimbActions);
     slider("$FC_ATTEMPT_INTERVAL_MIN","intervalMin",draft.autoActionMinSeconds,.65f,20);
     draft.autoActionMaxSeconds=std::max(draft.autoActionMinSeconds,draft.autoActionMaxSeconds);
     slider("$FC_ATTEMPT_INTERVAL_MAX","intervalMax",draft.autoActionMaxSeconds,draft.autoActionMinSeconds,30);
     slider("$FC_LEFT_OPPORTUNITY","leftWeight",draft.automaticSideWeights[0],0,1,"%.2f");
     slider("$FC_RIGHT_OPPORTUNITY","rightWeight",draft.automaticSideWeights[1],0,1,"%.2f");
     text("$FC_OPPORTUNITY_HELP");
-    text("$FC_ATTEMPT_HELP");
+    ui::EndDisabled();
 }
 void stamina() {
     check("$FC_STAMINA_ENABLED","staminaEnabled",draft.staminaEnabled);
@@ -178,13 +269,25 @@ void audio() {
     text("$FC_AUDIO_HELP");
 }
 void bindings() {
+    text("$FC_KEYBOARD_SECTION");
     const char* keys[]{"$FC_BIND_FORWARD","$FC_BIND_BACKWARD","$FC_BIND_LEFT","$FC_BIND_RIGHT","$FC_BIND_ENTRY","$FC_BIND_RUN","$FC_BIND_HOP"};
     const char* ids[]{"bindForward","bindBackward","bindLeft","bindRight","bindEntry","bindRun","bindHop"};
-    for(std::size_t i=0;i<bindingText.size();++i)dirty|=ui::InputText(label(keys[i],ids[i]).c_str(),bindingText[i].data(),bindingText[i].size());
+    for(std::size_t i=0;i<bindingFields.size();++i)bindingButton(BindingCaptureDevice::keyboard,i,keys[i],ids[i]);
     text("$FC_BINDING_HELP");
     text("$FC_BINDING_DERIVED_HELP");
+    ui::Separator();
+    text("$FC_GAMEPAD_SECTION");
+    check("$FC_GAMEPAD_ENABLED","gamepadEnabled",draft.gamepad.enabled);
+    slider("$FC_GAMEPAD_DEADZONE","gamepadDeadzone",draft.gamepad.deadzone,.1f,.8f);
+    slider("$FC_GAMEPAD_TRIGGER_THRESHOLD","gamepadTriggerThreshold",draft.gamepad.triggerThreshold,.1f,.95f);
+    const char* gamepadKeys[]{"$FC_BIND_ENTRY","$FC_BIND_RUN","$FC_BIND_HOP","$FC_GAMEPAD_DROP"};
+    const char* gamepadIds[]{"gamepadEntry","gamepadRun","gamepadHop","gamepadDrop"};
+    recording.triggerThreshold.store(draft.gamepad.triggerThreshold);
+    for(std::size_t i=0;i<gamepadBindingFields.size();++i)bindingButton(BindingCaptureDevice::gamepad,i,gamepadKeys[i],gamepadIds[i]);
+    text("$FC_GAMEPAD_BINDING_HELP");
+    text("$FC_GAMEPAD_CONTROL_HELP");
     if(button("$FC_VALIDATE_BINDINGS","validateBindings")) {
-        if(acceptBindings()){notice.clear();detail.clear();syncBindings();}
+        if(acceptBindings()){notice.clear();detail.clear();}
     }
 }
 void diagnostics(const SettingsMenuSnapshot& snapshot) {
@@ -241,7 +344,11 @@ void languageControls() {
     }
 }
 void __stdcall render() {
-    if(!initialized){draft=callbacks.getSettings();syncBindings();reloadTranslations();initialized=true;}
+    recording.rendered=true;recording.observing.store(true);finishCapture();
+    if(!initialized){draft=callbacks.getSettings();reloadTranslations();initialized=true;}
+    bool capturing=false;
+    {std::scoped_lock lock(recording.mutex);capturing=recording.active;}
+    ui::BeginDisabled(capturing);
     languageControls();
     const auto snapshot=callbacks.snapshot?callbacks.snapshot():SettingsMenuSnapshot{};
     if(ui::BeginTabBar("FreeClimbSettingsTabs")) {
@@ -258,6 +365,7 @@ void __stdcall render() {
     if(button("$FC_SAVE_SETTINGS","saveSettings")&&acceptBindings())saveSettings();
     ui::SameLine();
     if(button("$FC_RESTORE_DEFAULTS","restoreDefaults"))restoreDefaults();
+    ui::EndDisabled();capturePrompt();
     if(dirty)text("$FC_UNSAVED_CHANGES");
     if(!notice.empty())ui::TextWrapped("%s",translatedNotice());
     if(!detail.empty())ui::TextWrapped("%s: %s",tr("$FC_DETAILS"),detail.c_str());
@@ -273,12 +381,50 @@ bool registerSettingsMenu(SettingsMenuCallbacks value) {
     const auto module=GetMenuFrameworkModule();
     if(!module||!value.getSettings||!value.requestSave)return false;
     constexpr const char* required[]{"AddSectionItem","igTextWrappedV","igTextV","igCheckbox","igSliderFloat","igButton","igSameLine",
-        "igCombo_Str_arr","igInputText","igBeginDisabled","igEndDisabled","igCollapsingHeader_TreeNodeFlags",
+        "igCombo_Str_arr","igGetIO","ImGuiIO_SetAppAcceptingEvents","ImGuiIO_ClearEventsQueue","ImGuiIO_ClearInputKeys",
+        "igBegin","igEnd","igGetWindowPos","igGetWindowSize","igSetNextWindowPos","igSetNextWindowSize",
+        "RegisterEventPriority","igBeginDisabled","igEndDisabled","igCollapsingHeader_TreeNodeFlags",
         "igBeginTabBar","igEndTabBar","igBeginTabItem","igEndTabItem","igSeparator",
         "IsAnyBlockingWindowOpened"};
     for(const auto name:required)if(!GetProcAddress(module,name))return false;
     callbacks=std::move(value);SKSEMenuFramework::SetSection("FreeClimb");
-    SKSEMenuFramework::AddSectionItem("Settings",render);registered=true;return true;
+    SKSEMenuFramework::AddSectionItem("Settings",render);
+    static SKSEMenuFramework::Model::Event events(captureEvent,0.f);
+    registered=true;return true;
+}
+void settingsMenuKeyboardSample(const std::uint8_t* keys) {
+    if(!recording.observing.load())return;
+    std::scoped_lock lock(recording.mutex);
+    for(unsigned i=0;i<256;++i)recording.input.keyboard.down[i]=(keys[i]&0x80)!=0;
+    recording.input.keyboardValid=true;advanceCapture();
+}
+void settingsMenuGamepadSample(bool available,std::uint16_t buttons,std::uint8_t leftTrigger,std::uint8_t rightTrigger) {
+    if(!recording.observing.load())return;
+    std::scoped_lock lock(recording.mutex);
+    recording.input.gamepad=0;recording.input.gamepadValid=available;
+    if(available) {
+        for(unsigned i=0;i<14;++i)if(buttons&(1u<<(i<10?i:i+2)))recording.input.gamepad|=gamepadButtonMask(i);
+        const float threshold=recording.triggerThreshold.load()*255.f;
+        if(leftTrigger>=threshold)recording.input.gamepad|=gamepadButtonMask(14);
+        if(rightTrigger>=threshold)recording.input.gamepad|=gamepadButtonMask(15);
+    } else if(recording.active&&recording.capture.result().device==BindingCaptureDevice::gamepad) {
+        recording.unavailable=true;recording.capture.cancel();
+    }
+    advanceCapture();
+}
+bool settingsMenuFilterInput(RE::InputEvent* event) {
+    if(!event||!recording.filtering.load())return false;
+    std::scoped_lock lock(recording.mutex);
+    const auto device=event->GetDevice();
+    if(device!=RE::INPUT_DEVICE::kKeyboard&&device!=RE::INPUT_DEVICE::kGamepad)return false;
+    auto* button=event->AsButtonEvent();
+    if(!button)return recording.active;
+    const auto code=device==RE::INPUT_DEVICE::kKeyboard?button->GetIDCode():
+        SKSE::InputMap::GamepadMaskToKeycode(button->GetIDCode())-SKSE::InputMap::kMacro_GamepadOffset;
+    const bool consume=recording.ownership.filter(device==RE::INPUT_DEVICE::kKeyboard?
+        BindingCaptureDevice::keyboard:BindingCaptureDevice::gamepad,code,button->IsDown(),button->IsUp(),recording.active);
+    captureFilterState();
+    return consume;
 }
 bool settingsMenuBlocking() {return registered&&SKSEMenuFramework::IsAnyBlockingWindowOpened();}
 }

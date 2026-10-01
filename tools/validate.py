@@ -124,15 +124,26 @@ def dll_version(data, expected):
     require(flags_ex == 3, 'Expected NoStructUse and AddressLibraryV5 metadata')
     require(flags == 0, 'Expected explicit runtime list instead of unrestricted version independence')
     runtimes = struct.unpack_from('<16I', data, start + 0x30C)
-    supported = package.dependencies()['supported_runtimes']
+    lock = package.dependencies()
+    supported, skse_ids = lock['supported_runtimes'], lock.get('skse_runtime_ids')
+    require(isinstance(supported, list) and 0 < len(supported) <= 16 and
+            all(isinstance(value, str) for value in supported) and len(set(supported)) == len(supported),
+            'Invalid supported runtime list')
+    gog = {'1.6.659.0': '1.6.659.1', '1.6.1179.0': '1.6.1179.1'}
     packed_supported = []
     for runtime in supported:
+        require(re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+\.0', runtime), 'Invalid EXE runtime version')
         major, minor, patch, tweak = (int(x) for x in runtime.split('.'))
-        packed_supported.append(major << 24 | minor << 16 | patch << 4 | tweak)
+        require(major <= 255 and minor <= 255 and patch <= 4095 and
+                runtime == f'{major}.{minor}.{patch}.{tweak}', 'Invalid EXE runtime version')
+        packed_supported.append(major << 24 | minor << 16 | patch << 4 | int(runtime in gog))
+    require(skse_ids == [gog.get(runtime, runtime) for runtime in supported],
+            'Invalid EXE to SKSE runtime mapping')
     require(list(runtimes[:len(supported)]) == packed_supported, 'Explicit runtime whitelist mismatch')
     require(all(value in (0, 1 << 24) for value in runtimes[len(supported):]), 'Unexpected runtime compatibility tail')
     return {'architecture': 'x64', 'version': actual, 'author': 'Epsilona', 'exports': sorted(symbols),
-            'supported_runtimes': supported, 'address_library_v5': True, 'structs_cross_version': True,
+            'supported_runtimes': supported, 'skse_runtime_ids': skse_ids,
+            'address_library_v5': True, 'structs_cross_version': True,
             'version_independence_ex': flags_ex, 'version_independence': flags}
 
 

@@ -20,10 +20,10 @@ struct EdgeWall:World {
         ++bodyCalls;return motion==Motion::backFlipOut&&a<b;
     }
 };
-static Traversal stalledTraversal(EdgeWall& world) {
+static Traversal stalledTraversal(EdgeWall& world,float dt=1.f/48) {
     Traversal t;t.cfg.radius=31;t.cfg.gap=37;t.cfg.height=138;t.cfg.approachSeconds=0;
     check(t.attach(world,world.origin+Vec{0,-37,200},{0,1,0},1000,35),"real wall attachment");
-    for(int frame=0;frame<100&&t.stalledSeconds()<=.4f;++frame)t.update(world,{1,0},1.f/48,1000);
+    for(int frame=0;frame<100&&t.stalledSeconds()<=.4f;++frame)t.update(world,{1,0},dt,1000);
     check(t.active()&&t.stalledSeconds()>.35f,"finite wall edge creates a real supported movement stall");
     return t;
 }
@@ -147,6 +147,44 @@ static void privateTransitionState() {
     std::cout<<"transition snapshots replayed="<<replayed<<'\n';
 }
 
+static void failedSearchCooldownState() {
+    for(const int fps:{30,60,120}) {
+        EdgeWall world;auto t=stalledTraversal(world,1.f/fps);const Vec stopped=t.position;
+        auto capture=std::make_unique<TraversalCapture>();auto decoded=std::make_unique<TraversalCapture>();
+        TraversalCapture::RecordingWorld recorder(world,*capture);
+        unsigned topSearches=0,hopSearches=0;bool topGap=false,hopGap=false,topRetried=false,hopRetried=false;
+        for(int frame=0;frame<fps;++frame) {
+            const Vec before=t.position,normal=t.normal,right{-normal.y,normal.x,0};
+            const Vec topFrom=before+Vec{0,0,t.cfg.grip+28};
+            const Vec topTo=before-normal*(t.cfg.gap+std::max(12.f,t.cfg.radius*.55f)+4)+Vec{0,0,t.cfg.grip+28};
+            const Vec hopBase=before+right*48+Vec{0,0,6};
+            const Vec hopFrom=hopBase+normal*16,hopTo=hopBase-normal*t.cfg.reach;
+            const auto sourceCalls=world.calls;
+            capture->begin(t,{1,0},1.f/fps,1000);
+            const auto result=t.update(recorder,{1,0},1.f/fps,1000);capture->finish(t,result);
+            check(capture->complete()&&capture->count()==world.calls-sourceCalls,"cooldown frames retain complete World tape without extra queries");
+            if(t.state!=State::wall||result.released||(t.position-stopped).length()>=.01f)
+                std::cerr<<"cooldown fixture fps="<<fps<<" frame="<<frame<<" state="<<int(t.state)<<" delta="<<(t.position-stopped).length()<<" step="<<(t.position-before).length()<<" reason="<<result.reason<<" blocked="<<t.blockedReason<<'\n';
+            check(t.state==State::wall&&!result.released&&(t.position-stopped).length()<.01f,"failed searches preserve supported blocked position throughout cooldown");
+            bool topSearched=false,hopSearched=false;
+            for(std::size_t index=0;index<capture->count();++index) {
+                const auto& call=capture->call(index);if(call.kind!=TraversalCapture::Kind::ray)continue;
+                topSearched|=(call.from-topFrom).length()<.001f&&(call.to-topTo).length()<.001f;
+                hopSearched|=(call.from-hopFrom).length()<.001f&&(call.to-hopTo).length()<.001f;
+            }
+            if(topSearched){topRetried|=topSearches>0&&topGap;++topSearches;}else if(topSearches)topGap=true;
+            if(hopSearched){hopRetried|=hopSearches>0&&hopGap;++hopSearches;}else if(hopSearches)hopGap=true;
+            const auto encoded=capture->serialize();std::string error;
+            check(decoded->deserialize(encoded,error)&&decoded->serialize()==encoded,"active failure retry fields round trip exactly");
+            const auto report=decoded->replay();
+            if(!report.matched)std::cerr<<"cooldown fps="<<fps<<" frame="<<frame<<" "<<report.error<<'\n';
+            check(report.matched&&report.callsConsumed==capture->count(),"failure retry countdown, skipped searches and expiry replay every query and final state");
+        }
+        check(topRetried&&hopRetried,"top and ordinary hop searches both defer intervening frames and retry after cooldown");
+        std::cout<<"cooldown snapshots fps="<<fps<<" replayed="<<fps<<" top searches="<<topSearches<<" hop searches="<<hopSearches<<'\n';
+    }
+}
+
 static void animationProfileValidation() {
     auto capture=std::make_unique<TraversalCapture>();auto decoded=std::make_unique<TraversalCapture>();
     Traversal t;t.cfg.staminaEnabled=false;t.cfg.automaticSideWeights={.25f,.75f};
@@ -185,7 +223,7 @@ static int replayLog(const char* path) {
 }
 int main(int argc,char** argv){try {
     if(argc==2)return replayLog(argv[1]);
-    snapshotRoundTrip();limitsAndWorldCompleteness();sessionBudget();privateTransitionState();animationProfileValidation();
+    snapshotRoundTrip();limitsAndWorldCompleteness();sessionBudget();privateTransitionState();failedSearchCooldownState();animationProfileValidation();
     std::cout<<"PASS TraversalCapture exact versioned replay, no extra queries, truncation and session budgets\n";
     return 0;
 }catch(const std::exception& e){std::cerr<<"FAIL "<<e.what()<<'\n';return 1;}}

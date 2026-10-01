@@ -3,6 +3,7 @@ import os
 import configparser
 from pathlib import Path
 import shutil
+import struct
 import sys
 import tempfile
 import unittest
@@ -30,6 +31,81 @@ class ReleasePipelineTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.temporary.cleanup()
+
+    def dll_fixture(self):
+        data = (ROOT / 'build-multiruntime/Release/FreeClimb.dll').read_bytes()
+        expected = [int(value) for value in package.version().split('.')] + [0]
+        major, minor, build, platform = expected
+        marker = struct.pack('<II', 1, major << 24 | minor << 16 | build << 4 | platform) + b'FreeClimb\0'
+        self.assertEqual(data.count(marker), 1, 'Missing or ambiguous current DLL metadata')
+        return data, expected, data.index(marker) + 0x30C
+
+    def test_dll_runtime_platform_metadata(self):
+        data, expected, start = self.dll_fixture()
+        result = validate.dll_version(data, expected)
+        lock = package.dependencies()
+        self.assertEqual(result['supported_runtimes'], lock['supported_runtimes'])
+        self.assertEqual(result['skse_runtime_ids'], lock['skse_runtime_ids'])
+        runtimes = struct.unpack_from('<16I', data, start)
+        for exe, skse, packed in zip(result['supported_runtimes'], result['skse_runtime_ids'], runtimes):
+            major, minor, build, platform = (int(value) for value in exe.split('.'))
+            self.assertEqual(platform, 0)
+            gog = exe in ('1.6.659.0', '1.6.1179.0')
+            self.assertEqual(skse, exe[:-1] + '1' if gog else exe)
+            self.assertEqual(packed, major << 24 | minor << 16 | build << 4 | int(gog))
+        for packed in (0x01062931, 0x010649B1):
+            self.assertIn(packed, runtimes)
+            self.assertNotIn(packed & ~15, runtimes)
+
+    def test_dll_rejects_legacy_gog_platform_zero(self):
+        data, expected, start = self.dll_fixture()
+        runtimes = struct.unpack_from('<16I', data, start)
+        for value in (0x01062931, 0x010649B1):
+            with self.subTest(runtime=hex(value)):
+                changed = bytearray(data)
+                struct.pack_into('<I', changed, start + 4 * runtimes.index(value), value & ~15)
+                with self.assertRaisesRegex(ValueError, 'Explicit runtime whitelist mismatch'):
+                    validate.dll_version(changed, expected)
+
+    def test_dll_rejects_unknown_runtime_platforms(self):
+        data, expected, start = self.dll_fixture()
+        runtimes = struct.unpack_from('<16I', data, start)
+        for value, platform in ((0x010649B1, 2), (0x01064920, 1), (0x01064920, 2)):
+            with self.subTest(runtime=hex(value), platform=platform):
+                changed = bytearray(data)
+                struct.pack_into('<I', changed, start + 4 * runtimes.index(value), value & ~15 | platform)
+                with self.assertRaisesRegex(ValueError, 'Explicit runtime whitelist mismatch'):
+                    validate.dll_version(changed, expected)
+
+    def test_dll_rejects_invalid_runtime_mapping(self):
+        data, expected, _ = self.dll_fixture()
+        for original, replacement in (('1.6.659.1', '1.6.659.0'), ('1.6.1179.1', '1.6.1179.0'),
+                                      ('1.6.1179.1', '1.6.1179.2'), ('1.6.1170.0', '1.6.1170.1')):
+            lock = package.dependencies()
+            lock['skse_runtime_ids'][lock['skse_runtime_ids'].index(original)] = replacement
+            with self.subTest(runtime=replacement), patch.object(package, 'dependencies', return_value=lock):
+                with self.assertRaisesRegex(ValueError, 'Invalid EXE to SKSE runtime mapping'):
+                    validate.dll_version(data, expected)
+        lock = package.dependencies()
+        lock['supported_runtimes'][0] = '1.5.97.1'
+        with patch.object(package, 'dependencies', return_value=lock):
+            with self.assertRaisesRegex(ValueError, 'Invalid EXE runtime version'):
+                validate.dll_version(data, expected)
+
+    def test_dll_runtime_tail_validation(self):
+        data, expected, start = self.dll_fixture()
+        count = len(package.dependencies()['skse_runtime_ids'])
+        self.assertLess(count, 16)
+        for index in range(count, 16):
+            for value in (0, 1 << 24, 0x010649B2):
+                changed = bytearray(data)
+                struct.pack_into('<I', changed, start + 4 * index, value)
+                with self.subTest(index=index, value=hex(value)):
+                    if value in (0, 1 << 24):
+                        validate.dll_version(changed, expected)
+                    else:
+                        with self.assertRaisesRegex(ValueError, 'Unexpected runtime compatibility tail'):
+                            validate.dll_version(changed, expected)
 
     def test_pack_structure(self):
         result = validate.validate_animation_pack(self.root, self.manifest)

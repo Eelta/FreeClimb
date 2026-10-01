@@ -1,10 +1,10 @@
 #pragma once
 #include "Core.h"
 namespace fc {
-struct Keys { bool w{},a{},s{},d{},shift{},space{},entry{},bindingsMapped{}; };
+struct Keys { bool w{},a{},s{},d{},shift{},space{},entry{},bindingsMapped{},letGo{}; };
 
 inline Input wallInput(Keys k,bool spacePressed,bool autoMantle=true,bool justAttached=false,bool wasWallRunning=false) {
-    if(k.a&&k.s&&k.d&&(spacePressed||k.space))return {0,0,true,false,false,false,false};
+    if(k.letGo||(k.a&&k.s&&k.d&&(spacePressed||k.space)))return {0,0,true,false,false,false,false};
     spacePressed=spacePressed&&!justAttached;
     return {float(k.d)-float(k.a),float(k.w)-float(k.s),spacePressed&&k.s,
         autoMantle&&k.w,spacePressed&&!k.s&&!k.shift&&!wasWallRunning,k.s,k.shift&&!k.s};
@@ -43,6 +43,29 @@ public:
         return {true,began,began,originAirborne};
     }
     bool waitingForRelease()const{return blocked;}
+};
+class EntryPreparationGrace {
+    float remaining{};
+    bool gamepad{};
+public:
+    void arm(bool fromGamepad){remaining=.15f;gamepad=fromGamepad;}
+    void cancel(){remaining=0;}
+    bool sample(float dt,bool fromGamepad,Keys keys) {
+        if(!std::isfinite(dt)||dt<=0||fromGamepad!=gamepad||keys.s||keys.letGo){cancel();return false;}
+        remaining=std::max(0.f,remaining-dt);
+        return remaining>0;
+    }
+};
+class NativeJumpIntent {
+    bool down{};
+    float remaining{};
+public:
+    bool sample(bool held,float dt) {
+        if(!held){down=false;remaining=0;return false;}
+        if(!down){down=true;remaining=.15f;}
+        else if(std::isfinite(dt)&&dt>0)remaining=std::max(0.f,remaining-std::min(dt,.1f));
+        return remaining>0;
+    }
 };
 
 struct GrabFlight {bool airborne{},descending{};float verticalSpeed{};bool confirmedAirborne{};};

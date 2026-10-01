@@ -4,6 +4,8 @@
 #include "Core.h"
 #include "Controls.h"
 #include "InputBindings.h"
+#include "GamepadInput.h"
+#include <SKSE/InputMap.h>
 #include "UserSettings.h"
 #include "SettingsMenu.h"
 #include "ControllerGravityLease.h"
@@ -14,8 +16,10 @@
 #include "PoseRuntime.h"
 #include "TraversalAudioRuntime.h"
 #include "ViewHeading.h"
+#include "CameraHeading.h"
 #include "FilteredRayCollector.h"
 #include "RayFilterPolicy.h"
+#include "RayCandidateCache.h"
 #include "vendor/TrueDirectionalMovementAPI.h"
 #include <chrono>
 
@@ -23,8 +27,13 @@ namespace {
 fc::Traversal traversal;
 fc::JumpGrabGate jumpGrab;
 fc::ClimbEntryIntent climbEntry;
+fc::NativeJumpIntent nativeJumpIntent;
+fc::EntryPreparationGrace entryPreparationGrace;
 fc::InputState inputState;
 fc::InputOwnership inputOwnership;
+fc::GamepadState gamepadState;
+fc::GamepadOwnership gamepadOwnership;
+bool gamepadAvailable{},gamepadPreferred{},gamepadOwned{},gamepadLost{},gamepadHookReady{};
 fc::WallRunEntryGate wallRunEntryGate;
 fc::PoseRuntime poses;
 fc::TraversalAudioRuntime traversalAudio;
@@ -52,6 +61,7 @@ float grabMaxSnap=60,diagnosticCooldown{},attachedTime{};
 float approachSpeed{},stallReportTime{},poseRefreshTime{},wallRunSpeedOverride{},yawReportTime{};
 float outputReportTime{},peakTraversalMs{},peakPublishMs{};
 int peakFrameCasts{};
+std::uint64_t peakFrameRayCandidates{},peakFrameRayClassifications{};
 unsigned lastContextStatus{},lastThreepeatStatus{};
 bool lastCornerReported{},lastEdgeReported{};
 float contextReportTime{};
@@ -91,7 +101,28 @@ void refreshMenuSnapshot();
 std::array<std::uint32_t,fc::motionCount+1> motionUses{};
 REL::Relocation<void(*)(RE::PlayerCharacter*,float)> originalUpdate;
 
-fc::Keys keys() {return fc::mapKeys(inputState,activeSettings.bindings);}
+bool gamepadSelected() {
+    if(traversal.active())return gamepadOwned;
+    if(!gamepadHookReady||!gamepadAvailable||!activeSettings.gamepad.enabled)return false;
+    if(fc::entryChord(fc::mapKeys(inputState,activeSettings.bindings)))return false;
+    return gamepadState.keys(activeSettings.gamepad.bindings).entry||gamepadPreferred;
+}
+fc::Keys keys() {
+    return gamepadSelected()?gamepadState.keys(activeSettings.gamepad.bindings):fc::mapKeys(inputState,activeSettings.bindings);
+}
+unsigned gamepadButtonIndex(std::uint32_t mask) {
+    if(!RE::ControlMap::GetSingleton())return 16;
+    const auto code=SKSE::InputMap::GamepadMaskToKeycode(mask);
+    return code>=SKSE::InputMap::kMacro_GamepadOffset?code-SKSE::InputMap::kMacro_GamepadOffset:16;
+}
+bool nativeJumpHeld() {
+    const auto* controls=RE::ControlMap::GetSingleton();
+    if(!controls)return false;
+    const auto keyboard=controls->GetMappedKey("Jump",RE::INPUT_DEVICE::kKeyboard);
+    const auto gamepad=gamepadButtonIndex(controls->GetMappedKey("Jump",RE::INPUT_DEVICE::kGamepad));
+    return (keyboard<256&&inputState.held(static_cast<fc::KeyCode>(keyboard))&&inputOwnership.nativeDown(keyboard))||
+        (gamepadAvailable&&gamepadState.held(gamepad)&&gamepadOwnership.startedNativeJump(gamepad));
+}
 
 RE::NiPoint3 ni(fc::Vec v) { return {v.x,v.y,v.z}; }
 fc::Vec vec(RE::NiPoint3 v) { return {v.x,v.y,v.z}; }
@@ -106,7 +137,7 @@ struct EntryLookDiagnostics {
     unsigned probes{};
     float beforeActorYaw{},beforeCameraYaw{},beforeLookX{},beforeLookY{};
     void beforeNative(RE::PlayerCharacter* player) {
-        if(!diagnostics||(!tracking&&!fc::entryChord(fc::mapKeys(inputState,activeSettings.bindings))))return;
+        if(!diagnostics||(!tracking&&!fc::entryChord(keys())))return;
         beforeActorYaw=player->GetAngleZ();
         const auto* camera=RE::PlayerCamera::GetSingleton();
         const auto* state=camera?camera->currentState.get():nullptr;
@@ -164,7 +195,7 @@ bool grabInputSuspended() {
         ui->IsMenuOpen("Loading Menu")||ui->IsMenuOpen("TweenMenu");
 }
 void cancelEntryPreparation() {
-    poses.cancelPreparation();preparationStarted=0;
+    entryPreparationGrace.cancel();poses.cancelPreparation();preparationStarted=0;
     if(preparationChangedView) {
         if(auto* camera=RE::PlayerCamera::GetSingleton();camera&&camera->IsInThirdPerson())camera->ForceFirstPerson();
         preparationChangedView=false;
@@ -173,7 +204,7 @@ void cancelEntryPreparation() {
 void cancelGrabRequest() {
 
     if(jumpGrab.pending()||preparationStarted||preparationChangedView)cancelEntryPreparation();
-    jumpGrab.tick(0,true);preparationStarted=0;
+    entryPreparationGrace.cancel();jumpGrab.tick(0,true);preparationStarted=0;
     climbEntry.blockUntilRelease();grabProbeCooldown=0;
 }
 
@@ -216,6 +247,8 @@ void fitBody(RE::PlayerCharacter* p) {
 struct GameWorld final:fc::World {
     RE::PlayerCharacter* player;
     RE::hkRefPtr<RE::hkpShapePhantom> playerPhantom;
+    fc::RayCollectorValidationCache<RE::NiPointer<RE::bhkWorld>,fc::FilteredRayCollector::NativeAdd> rayCollectorValidation;
+    std::uint64_t rayCandidates{},rayClassifications{};
     int casts{},hits{},selfHits{},controllerSelfHits{},firstLayer=-1;
     std::uint32_t firstReference{},firstBaseReference{},firstFilterInfo{};
     int firstFormType=-1,firstBroadphase=-1,firstMotionType=-1,firstResponseType=-1;
@@ -233,18 +266,17 @@ struct GameWorld final:fc::World {
         if(auto* controller=skyrim_cast<RE::bhkCharProxyController*>(p->GetCharController()))
             if(auto* proxy=controller->GetCharacterProxy())playerPhantom=RE::hkRefPtr<RE::hkpShapePhantom>(proxy->shapePhantom);
     }
-    struct RayContext {
-        GameWorld& owner;
-        const RE::hkpCollidable* firstTrigger{};
-        float firstTriggerFraction{};
+    struct Candidate {
+        const RE::TESObjectREFR* reference{};
+        bool ownController{};
+        fc::RayDecision decision=fc::RayDecision::keep;
     };
-    static bool keepRayHit(void* opaque,const RE::hkpCollidable& body,float fraction) {
-        auto& context=*static_cast<RayContext*>(opaque);
-        auto& owner=context.owner;
+    Candidate classify(const RE::hkpCollidable& body) {
+        ++rayClassifications;
         const auto* ref=RE::TESHavokUtilities::FindCollidableRef(body);
-        const bool ownController=owner.playerPhantom&&owner.playerPhantom->GetCollidable()==&body;
+        const bool ownController=playerPhantom&&playerPhantom->GetCollidable()==&body;
         fc::RayHitFacts facts;
-        facts.exactPlayer=ref==owner.player||ownController;
+        facts.exactPlayer=ref==player||ownController;
         facts.actorZone=body.GetCollisionLayer()==RE::COL_LAYER::kActorZone;
         facts.actor=ref&&ref->Is(RE::FormType::ActorCharacter);
         if(facts.actorZone&&!facts.actor&&!facts.exactPlayer) {
@@ -267,10 +299,27 @@ struct GameWorld final:fc::World {
                 facts.primitiveActivatorWithoutModel=acti&&primitive&&primitive->primitive&&(!model||!*model);
             }
         }
-        bool accepted=false;
-        const auto decision=fc::dispatchRayHit(facts,[&]{accepted=true;});
+        return {ref,ownController,fc::rayHitDecision(facts)};
+    }
+    struct RayContext {
+        GameWorld& owner;
+        const RE::hkpCollidable* firstTrigger{};
+        float firstTriggerFraction{};
+        std::optional<fc::RayCandidateCache<Candidate>> candidates;
+        const Candidate& classify(const RE::hkpCollidable& body) {
+            if(!candidates)candidates.emplace();
+            return candidates->resolve(&body,[&]{return owner.classify(body);});
+        }
+    };
+    static bool keepRayHit(void* opaque,const RE::hkpCollidable& body,float fraction) {
+        auto& context=*static_cast<RayContext*>(opaque);
+        auto& owner=context.owner;
+        ++owner.rayCandidates;
+        const auto& candidate=context.classify(body);
+        const auto decision=candidate.decision;
+        const bool accepted=decision==fc::RayDecision::keep;
         if(decision==fc::RayDecision::ignorePlayer) {
-            ++owner.selfHits;owner.controllerSelfHits+=ownController;
+            ++owner.selfHits;owner.controllerSelfHits+=candidate.ownController;
         } else if(decision==fc::RayDecision::ignoreTrigger) {
             ++owner.ignoredTriggerHits;
             if(owner.firstTriggerLayer<0&&!context.firstTrigger) {
@@ -279,7 +328,7 @@ struct GameWorld final:fc::World {
         }
         return accepted;
     }
-    void recordIgnoredTrigger(const RayContext& context,fc::Vec from,fc::Vec to) {
+    void recordIgnoredTrigger(RayContext& context,fc::Vec from,fc::Vec to) {
         const auto* body=context.firstTrigger;
         if(!body||firstTriggerLayer>=0)return;
         firstTriggerLayer=static_cast<int>(body->GetCollisionLayer());
@@ -287,7 +336,7 @@ struct GameWorld final:fc::World {
         firstTriggerBroadphase=static_cast<int>(body->broadPhaseHandle.type);
         firstTriggerHitPoint=from+(to-from)*context.firstTriggerFraction;
         firstTriggerDistance=(firstTriggerHitPoint-from).length();
-        const auto* ref=RE::TESHavokUtilities::FindCollidableRef(*body);
+        const auto* ref=context.classify(*body).reference;
         if(ref) {
             firstTriggerReference=ref->GetFormID();
             if(const auto* base=ref->GetBaseObject()) {
@@ -310,6 +359,7 @@ struct GameWorld final:fc::World {
     std::optional<fc::Hit> ray(fc::Vec from,fc::Vec to) override {
         auto cell=player->GetParentCell();
         auto world=cell?cell->GetbhkWorld():nullptr;
+        rayCollectorValidation.bind(world);
         if(!world) return fc::Hit{from,{0,0,1},false};
         const auto scale=RE::bhkWorld::GetWorldScale();
         RE::CFilter filter{}; player->GetCollisionFilterInfo(filter);
@@ -321,7 +371,10 @@ struct GameWorld final:fc::World {
             pick.rayInput.to=RE::hkVector4(ni(to)*scale);
             pick.rayInput.filterInfo.filter=(filter.filter&0xFFFF0000)|static_cast<std::uint32_t>(RE::COL_LAYER::kCharController);
             RayContext context{*this};
-            const auto nativeAdd=fc::verifiedRayCollectorAdd(world);
+            const auto table=*reinterpret_cast<const std::uintptr_t*>(world);
+            const auto nativeAdd=rayCollectorValidation.resolve(table,[](std::uintptr_t value) {
+                return reinterpret_cast<const std::uintptr_t*>(value)[0x33];
+            },fc::verifiedRayCollectorAdd);
             fc::FilteredRayCollector collector(&context,keepRayHit,nativeAdd);
             if(nativeAdd)pick.closestRayHitCollector=collector.enginePrefix();
             ++casts;
@@ -332,7 +385,8 @@ struct GameWorld final:fc::World {
             if(!hit||!pick.rayOutput.HasHit()) return {};
             const auto& r=pick.rayOutput;
             const auto point=from+(to-from)*r.hitFraction;
-            const auto ref=RE::TESHavokUtilities::FindCollidableRef(*r.rootCollidable);
+            const auto* ref=nativeAdd?context.classify(*r.rootCollidable).reference:
+                RE::TESHavokUtilities::FindCollidableRef(*r.rootCollidable);
 
             const bool ownController=playerPhantom&&playerPhantom->GetCollidable()==r.rootCollidable;
             if(ref==player||ownController) {
@@ -395,13 +449,15 @@ void setMotion(RE::PlayerCharacter*,fc::Motion m) {
 }
 
 void release(RE::PlayerCharacter* p,const char* reason,bool fade=false,bool physicalFall=false,bool completedTop=false) {
+    const auto releaseStarted=diagnostics?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     wallRunEntryGate.reset();
     if(preparationChangedView)cancelEntryPreparation();
     if(fade)traversalAudio.resetTiming();else traversalAudio.stop();
-    preparationStarted=0;poseHealth.reset();
+    entryPreparationGrace.cancel();preparationStarted=0;poseHealth.reset();
     viewHeading.reset();
     const bool topRecoveryReady=poses.topRecoveryReady();
     poses.release(fade,physicalFall,completedTop);
+    const auto poseReleased=diagnostics?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     const bool wasOwned=ownedController.get()!=nullptr;
     jumpGrab.cancel();climbEntry.blockUntilRelease();grabProbeCooldown=0;
     const auto gravityRelease=controllerGravity.release(p?p->GetCharController():nullptr);
@@ -415,11 +471,12 @@ void release(RE::PlayerCharacter* p,const char* reason,bool fade=false,bool phys
         if(auto controls=RE::PlayerControls::GetSingleton()) controls->data.running=savedRunning;
         runningSaved=false;
     }
-    traversal.stop(); climbingCell=nullptr; climbingWorldspace=nullptr;
+    traversal.stop(); gamepadOwned=false; climbingCell=nullptr; climbingWorldspace=nullptr;
     if(animationState) animationState->value=0;
     if(p&&wasOwned) {
 
         if(!topRecoveryReady&&!physicalFall)p->NotifyAnimationGraph("IdleForceDefaultState");
+        const auto controlsReleased=diagnostics?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
         SKSE::log::info("Released: {}",reason);
         if(diagnostics)for(int i=1;i<=fc::motionCount;++i)if(motionUses[i])
             SKSE::log::info("Session action {} entries={} selectedSeconds={:.3f}",i,motionUses[i],selectedSeconds[i]);
@@ -431,6 +488,10 @@ void release(RE::PlayerCharacter* p,const char* reason,bool fade=false,bool phys
             SKSE::log::info("Session wall input seconds: up={:.3f} side={:.3f} diagonalUp={:.3f} down={:.3f} run={:.3f} idle={:.3f}; request exposure, not accepted travel",
                 inputSeconds[0],inputSeconds[1],inputSeconds[2],inputSeconds[3],inputSeconds[4],inputSeconds[5]);
             for(unsigned motion=39;motion<=fc::motionCount;++motion)SKSE::log::info("Session rendered new action: motion={} starts={} observedSpanSeconds={:.3f}",motion,renderedUses[motion],observedSpanSeconds[motion]);
+            SKSE::log::info("Release timing: poseMs={:.3f} controlsMs={:.3f} loggingMs={:.3f}; fade={} physicalFall={} completedTop={}",
+                std::chrono::duration<float,std::milli>(poseReleased-releaseStarted).count(),
+                std::chrono::duration<float,std::milli>(controlsReleased-poseReleased).count(),
+                std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-controlsReleased).count(),fade,physicalFall,completedTop);
         }
     }
     lastMotion=fc::Motion::none;
@@ -466,7 +527,22 @@ bool faceWall(RE::PlayerCharacter* p,float dt) {
         }
     }
 
-    if(std::abs(fc::yawDifference(referenceYaw,before))>.001f)p->SetHeading(referenceYaw);
+    bool cameraPreserved=false;
+    if(std::abs(fc::yawDifference(referenceYaw,before))>.001f) {
+        auto* camera=RE::PlayerCamera::GetSingleton();
+        const auto cameraState=camera?camera->currentState:RE::BSTSmartPointer<RE::TESCameraState>{};
+        auto* third=cameraState&&cameraState->id==RE::CameraState::kThirdPerson?
+            static_cast<RE::ThirdPersonState*>(cameraState.get()):nullptr;
+        const auto view=third&&third->freeRotationEnabled&&third->applyOffsets&&camera->cameraTarget.get().get()==p?
+            fc::CameraHeading::capture(before,third->freeRotation.x):std::nullopt;
+        p->SetHeading(referenceYaw);
+        if(view&&camera->currentState.get()==cameraState.get()&&camera->cameraTarget.get().get()==p&&
+            third->freeRotationEnabled&&third->applyOffsets) {
+            if(const auto relative=view->relativeTo(p->GetAngleZ())) {
+                third->freeRotation.x=*relative;cameraPreserved=true;
+            }
+        }
+    }
     if(diagnostics&&attachedTime>=yawReportTime) {
         yawReportTime=attachedTime+1;
         const auto pose=poses.lastOrientation();
@@ -475,18 +551,20 @@ bool faceWall(RE::PlayerCharacter* p,float dt) {
             const auto& m=root->world.rotate.entry;
             actorRootYaw=fc::headingYaw({m[0][1],m[1][1],m[2][1]});
         }
-        SKSE::log::info("Wall facing: target={:.3f} viewReference={:.3f} viewRate={:.3f} actorBefore={:.3f} actorAfter={:.3f} actor3D={:.3f}/{}; renderedTarget={:.3f} parent={:.3f}/{} frame={:.3f}/{} ageMs={}; TDM={}",
+        SKSE::log::info("Wall facing: target={:.3f} viewReference={:.3f} viewRate={:.3f} actorBefore={:.3f} actorAfter={:.3f} actor3D={:.3f}/{}; renderedTarget={:.3f} parent={:.3f}/{} frame={:.3f}/{} ageMs={}; TDM={} cameraPreserved={}",
             *desired,referenceYaw,viewHeading.speed(),before,p->GetAngleZ(),actorRootYaw.value_or(0),actorRootYaw.has_value(),pose.targetYaw,
             pose.parentYaw,pose.parentValid,pose.renderedYaw,pose.renderedValid,
-            pose.sampledAt?GetTickCount64()-pose.sampledAt:0,tdm?yawResultName(result):"absent");
+            pose.sampledAt?GetTickCount64()-pose.sampledAt:0,tdm?yawResultName(result):"absent",cameraPreserved);
     }
     return true;
 }
 
-void reportOutput(RE::PlayerCharacter* p,fc::Motion motion,float coreMs,float publishMs,int casts,bool finishing) {
+void reportOutput(RE::PlayerCharacter* p,fc::Motion motion,float coreMs,float publishMs,int casts,std::uint64_t rayCandidates,std::uint64_t rayClassifications,bool finishing) {
     if(!diagnostics)return;
     peakTraversalMs=std::max(peakTraversalMs,coreMs);peakPublishMs=std::max(peakPublishMs,publishMs);
     peakFrameCasts=std::max(peakFrameCasts,casts);
+    peakFrameRayCandidates=std::max(peakFrameRayCandidates,rayCandidates);
+    peakFrameRayClassifications=std::max(peakFrameRayClassifications,rayClassifications);
     const auto output=poses.lastOutputAudit();
     const bool observedOutputValid=output.sampledAt&&output.worldMismatches==0&&output.layerWeight>.95f&&GetTickCount64()-output.sampledAt<250;
     if(!observedOutputValid)observedSpanContinuous=false;
@@ -508,19 +586,19 @@ void reportOutput(RE::PlayerCharacter* p,fc::Motion motion,float coreMs,float pu
     }
     if(!finishing&&attachedTime<outputReportTime)return;
     outputReportTime=attachedTime+1;
-    SKSE::log::info("Pose output audit: publishedMotion={} renderedMotion={} layerWeight={:.4f} nativeRecovery={:.4f} synced={} ageMs={}; applied={} retired={} overwriteFrames={} lastOverwriteBone={} anglePeak={:.4f} distancePeak={:.3f}; worldMismatchFrames={} worldMismatches={} worldAngle={:.4f} worldDistance={:.3f} pass={} transformPasses={} selectedFlagRepairs={}; upperRollDeg={:.2f}/{:.2f}; coreMs={:.3f}/{:.3f} publishMs={:.3f}/{:.3f} callbackMs={:.3f} propagationMs={:.3f} casts={}/{}",
+    SKSE::log::info("Pose output audit: publishedMotion={} renderedMotion={} layerWeight={:.4f} nativeRecovery={:.4f} synced={} ageMs={}; applied={} retired={} overwriteFrames={} lastOverwriteBone={} anglePeak={:.4f} distancePeak={:.3f}; worldMismatchFrames={} worldMismatches={} worldAngle={:.4f} worldDistance={:.3f} pass={} transformPasses={} selectedFlagRepairs={}; upperRollDeg={:.2f}/{:.2f}; coreMs={:.3f}/{:.3f} publishMs={:.3f}/{:.3f} callbackMs={:.3f} propagationMs={:.3f} casts={}/{} rayCandidates={}/{} rayClassifications={}/{}",
         int(motion),int(output.motion),output.layerWeight,output.nativeRecovery,graph(p,"bIsSynced"),
         output.sampledAt?GetTickCount64()-output.sampledAt:0,poses.applied.load(),poses.retiredOutputs.load(),
         output.overwriteFrames,output.lastOverwritten,output.peakOverwrittenAngle,output.peakOverwrittenDistance,
         output.worldMismatchFrames,output.worldMismatches,output.worldAngle,output.worldDistance,unsigned(output.pass),output.transformPasses,output.selectedFlagRepairs,
         output.upperRollDegrees[0],output.upperRollDegrees[1],
-        coreMs,peakTraversalMs,publishMs,peakPublishMs,output.callbackMs,output.propagationMs,casts,peakFrameCasts);
+        coreMs,peakTraversalMs,publishMs,peakPublishMs,output.callbackMs,output.propagationMs,casts,peakFrameCasts,rayCandidates,peakFrameRayCandidates,rayClassifications,peakFrameRayClassifications);
     SKSE::log::info("Surface placement audit: motion={} support={} samples={} gap={:.2f}/{:.2f}/{:.2f} palmPlaneGap={:.2f}/{:.2f} contacts={} reachError={:.2f} pos=({:.2f},{:.2f},{:.2f}) normal=({:.3f},{:.3f},{:.3f})",
         int(motion),poses.surface.surfaceGapValid,poses.surface.surfaceSamples,traversal.cfg.gap,
         poses.surface.measuredSurfaceGap,poses.surface.appliedSurfaceGap,poses.surface.surfacePalmGaps[0],poses.surface.surfacePalmGaps[1],
         poses.surface.contactCount,poses.surface.maxReachError,traversal.position.x,traversal.position.y,traversal.position.z,
         traversal.surfaceNormal.x,traversal.surfaceNormal.y,traversal.surfaceNormal.z);
-    peakTraversalMs=peakPublishMs=0;peakFrameCasts=0;
+    peakTraversalMs=peakPublishMs=0;peakFrameCasts=0;peakFrameRayCandidates=peakFrameRayClassifications=0;
     SKSE::log::info("Final display audit (sampled): lateWorldUpdates={} lateRootUpdates={} skinCalls={} ownedSkinSamples={} bodyInputs={} ownedInputs={} cachedSamples={} bodyMismatchSamples={}",
         poses.lateWorldUpdates.load(),poses.lateRootUpdates.load(),poses.skinCalls.load(),poses.ownedSkinCalls.load(),
         poses.skinBodyInputs.load(),poses.skinOwnedInputs.load(),poses.skinCacheHits.load(),poses.skinMismatchCalls.load());
@@ -642,6 +720,7 @@ fc::GrabFlight entryFlight(RE::PlayerCharacter* p,bool nativeJump) {
 }
 
 bool acquire(RE::PlayerCharacter* p) {
+    const auto acquireStarted=diagnostics?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     if(graph(p,"bIsSynced")||graph(p,"SkyParkourOngoing")||graph(p,"SkyParkourSliding")||p->IsAnimationDriven()) return false;
     if(tdm) {
         if(tdm->GetTargetLockState()) return false;
@@ -654,18 +733,18 @@ bool acquire(RE::PlayerCharacter* p) {
     }
     if(!p->SetGraphVariableBool("bIsSynced",true)) { release(p,"unsupported animation graph"); return false; }
     syncOwned=true;
-    RE::PlayerCamera::GetSingleton()->ForceThirdPerson();
+    const auto attachStarted=diagnostics?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     if(!poses.attach(p)) {
         SKSE::log::error("Cannot attach pose layer: {}",poses.bindingFailure);
         release(p,"pose binding failed");note("FreeClimb: pose binding failed; see log");return false;
     }
+    const auto poseAttached=diagnostics?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     takeController(p->GetCharController(),false);
     climbingCell=p->GetParentCell();
     climbingWorldspace=p->GetWorldspace();
     if(auto controls=RE::PlayerControls::GetSingleton()) { savedRunning=idleRunningKnown?idleRunning:controls->data.running; runningSaved=true; }
-    RE::PlayerCamera::GetSingleton()->ForceThirdPerson();
     attachedTime=0;poseHealth.reset();geometryCaptureGate.reset();preparationStarted=0;stallReportTime=0;poseRefreshTime=0;yawReportTime=0;lowStaminaNoted=false;motionUses.fill(0);
-    outputReportTime=peakTraversalMs=peakPublishMs=0;peakFrameCasts=0;
+    outputReportTime=peakTraversalMs=peakPublishMs=0;peakFrameCasts=0;peakFrameRayCandidates=peakFrameRayClassifications=0;
     lastContextStatus=lastThreepeatStatus=0;lastCornerReported=lastEdgeReported=false;contextReportTime=0;
     contextHops=contextCorners=contextEaves=0;
     automaticActionBase=lastAutomaticAction=traversal.automaticActionCount();
@@ -675,38 +754,60 @@ bool acquire(RE::PlayerCharacter* p) {
     observedSpanContinuous=false;
     lastRenderedMotion=fc::Motion::none;lastRenderedSample=0;
     obstacleJumpBase=lastObstacleJump=traversal.obstacleJumpCount();
+    const auto controlsAcquired=diagnostics?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     SKSE::log::info("Attached at ({:.1f},{:.1f},{:.1f}); normal=({:.2f},{:.2f},{:.2f}); actorScale={:.2f}; controllerBounds=({:.2f},{:.2f},{:.2f}); actorHeight={:.2f}",
         traversal.position.x,traversal.position.y,traversal.position.z,traversal.normal.x,traversal.normal.y,traversal.normal.z,
         p->GetScale(),ownedController->collisionBound.extents.x,ownedController->collisionBound.extents.y,
         ownedController->collisionBound.extents.z,ownedController->actorHeight);
     const auto& b=activeSettings.bindings;
-    const auto help="FreeClimb: "+fc::serializeKeyChord(b.runModifier)+" wall run | "+fc::serializeKeyChord(b.hop)+" climb hop | "+
+    const auto& g=activeSettings.gamepad.bindings;
+    const auto help=gamepadOwned?"FreeClimb: "+fc::serializeGamepadChord(g.runModifier)+" wall run | "+fc::serializeGamepadChord(g.hop)+" climb hop | "+
+        fc::serializeGamepadChord(g.drop)+" let go":"FreeClimb: "+fc::serializeKeyChord(b.runModifier)+" wall run | "+fc::serializeKeyChord(b.hop)+" climb hop | "+
         fc::serializeKeyChord(b.backward)+"+"+fc::serializeKeyChord(b.hop)+" leave wall";
     note(help.c_str());
+    SKSE::log::info("Traversal input: {}",gamepadOwned?"controller":"keyboard");
     ++attachmentsSinceLoad;
+    if(diagnostics)SKSE::log::info("Attach timing: ownershipMs={:.3f} poseMs={:.3f} controlsMs={:.3f} loggingMs={:.3f}",
+        std::chrono::duration<float,std::milli>(attachStarted-acquireStarted).count(),
+        std::chrono::duration<float,std::milli>(poseAttached-attachStarted).count(),
+        std::chrono::duration<float,std::milli>(controlsAcquired-poseAttached).count(),
+        std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-controlsAcquired).count());
     return true;
 }
 
 void update(RE::PlayerCharacter* p,float dt) {
+    if(gamepadOwned) {
+        auto* manager=RE::BSInputDeviceManager::GetSingleton();
+        if(gamepadLost||!gamepadAvailable||!manager||!manager->IsGamepadEnabled()) {
+            release(p,"controller disconnected",false,true);
+            gamepadState.reset();gamepadOwnership.reset();gamepadAvailable=false;gamepadPreferred=false;
+        }
+    }
+    gamepadLost=false;
     entryLookDiagnostics.beforeNative(p);
     if(traversal.active()) stopLocomotion();
     originalUpdate(p,dt);
+    if(poses.consumeRigInvalidated()) {
+        if(traversal.active())release(p,"character rig changed");
+        else {cancelEntryPreparation();cancelGrabRequest();}
+    }
     if(std::isfinite(dt)&&dt>1e-6f)poses.tick(dt);
     serviceSettings();
     if(!ready||!enabled||!animationState) return;
 
     if(grabInputSuspended()) {
         groundMotionProbe.suspend();
-        inputState.reset();wallRunEntryGate.reset();traversalAudio.stop();
+        inputState.reset();gamepadState.blockUntilButtonsReleased();wallRunEntryGate.reset();traversalAudio.stop();
 
         if(traversal.active())release(p,"input suspended");
         cancelGrabRequest();
         return;
     }
 
-    if(!std::isfinite(dt)||dt<=1e-6f)return;
+    if(!std::isfinite(dt)||dt<=1e-6f){entryPreparationGrace.cancel();return;}
     traversalAudio.observe(dt);
     observeNativeShapeBaseline(p,dt);
+    const bool fromGamepad=gamepadSelected();
     const auto heldKeys=keys();
     entryLookDiagnostics.sample(p,heldKeys,dt);
     if(crestAuditTime>=0) {
@@ -724,10 +825,11 @@ void update(RE::PlayerCharacter* p,float dt) {
         } else crestAuditTime=-1;
     }
     jumpGrab.tick(dt);
-    const bool nativeJump=inputState.held(0x39)&&inputOwnership.nativeDown(0x39);
+    const bool nativeJump=nativeJumpIntent.sample(nativeJumpHeld(),dt);
     const auto initialFlight=entryFlight(p,nativeJump);
     const auto grabIntent=climbEntry.sample(heldKeys,traversal.active(),false,dt,initialFlight.confirmedAirborne);
-    const bool grab=grabIntent.requested,grabPressed=grabIntent.fresh;
+    const bool preparedRetry=entryPreparationGrace.sample(dt,fromGamepad,heldKeys);
+    const bool grab=grabIntent.requested||preparedRetry,grabPressed=grabIntent.fresh;
     const bool hop=heldKeys.space,hopPressed=hop&&!lastHop;
     lastHop=hop;
     if(!traversal.active()&&!grab){jumpGrab.cancel();cancelEntryPreparation();grabProbeCooldown=0;}
@@ -784,8 +886,8 @@ void update(RE::PlayerCharacter* p,float dt) {
         if(!grab){jumpGrab.cancel();cancelEntryPreparation();return;}
         const float actorYaw=p->GetAngleZ();
         jumpGrab.hold({std::sin(actorYaw),std::cos(actorYaw),0},nativeJump,grabIntent.airborneAtBegin,grabPressed);
-        if(grabPressed&&diagnostics)SKSE::log::info("Grab request: entry chord={}; airborne={} descending={} velocityZ={:.2f}; releaseCooldown={:.3f}; nativeSpace={} airborneAtBegin={}",
-            fc::serializeKeyChord(activeSettings.bindings.entry),initialFlight.airborne,initialFlight.descending,
+        if(grabPressed&&diagnostics)SKSE::log::info("Grab request: device={} entry chord={}; airborne={} descending={} velocityZ={:.2f}; releaseCooldown={:.3f}; nativeJumpPending={} airborneAtBegin={}",
+            fromGamepad?"gamepad":"keyboard",fromGamepad?fc::serializeGamepadChord(activeSettings.gamepad.bindings.entry):fc::serializeKeyChord(activeSettings.bindings.entry),initialFlight.airborne,initialFlight.descending,
             initialFlight.verticalSpeed,traversal.cooldown,nativeJump,grabIntent.airborneAtBegin);
         const auto flight=entryFlight(p,jumpGrab.startedNativeJump());
         const bool explicitAirCatch=jumpGrab.explicitAirCatch(flight);
@@ -856,8 +958,13 @@ void update(RE::PlayerCharacter* p,float dt) {
         }
         auto* camera=RE::PlayerCamera::GetSingleton();
         if(camera->IsInFirstPerson()){preparationChangedView=true;camera->ForceThirdPerson();}
+        const auto prepareStarted=diagnostics?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
         const auto preparation=poses.prepare(p);
+        if(diagnostics&&(preparation!=fc::PoseRuntime::Preparation::waiting||!preparationStarted))
+            SKSE::log::info("Pose preflight timing: state={} bindingMs={:.3f} changedView={}",int(preparation),
+                std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-prepareStarted).count(),preparationChangedView);
         if(preparation!=fc::PoseRuntime::Preparation::ready) {
+            if(preparation==fc::PoseRuntime::Preparation::waiting&&grabIntent.requested)entryPreparationGrace.arm(fromGamepad);
             const auto now=GetTickCount64();
             if(!preparationStarted)preparationStarted=now;
             if(preparation==fc::PoseRuntime::Preparation::rejected||now-preparationStarted>=1000) {
@@ -869,13 +976,15 @@ void update(RE::PlayerCharacter* p,float dt) {
             }
             return;
         }
-        preparationStarted=0;
-        traversal=std::move(candidate);
+        entryPreparationGrace.cancel();preparationStarted=0;
+        candidate.cfg.threepeatAnimations=activeSettings.threepeatAnimations;
+        poses.library.configureThreepeat(candidate.cfg);
+        traversal=std::move(candidate);gamepadOwned=fromGamepad;
         const bool nativeSpace=jumpGrab.startedNativeJump();
         reportIgnoredTrigger(world);
         const auto entry=fc::grabEntryMotion(flight);
         if(!acquire(p)) {
-            traversal.stop();
+            traversal.stop();gamepadOwned=false;
             cancelEntryPreparation();
             if(diagnosticCooldown<=0) {
                 SKSE::log::info("Attach blocked by animation/movement ownership; synced={}, parkour={}, sliding={}, animationDriven={}, targetLock={}",
@@ -886,6 +995,7 @@ void update(RE::PlayerCharacter* p,float dt) {
             return;
         }
         preparationChangedView=false;
+        if(diagnostics&&preparedRetry&&!grabIntent.requested)SKSE::log::info("Completed validated entry preparation after chord release within 150ms");
         wallRunEntryGate.begin(heldKeys);
         traversal.entry(entry,!flight.airborne);jumpGrab.cancel();climbEntry.blockUntilRelease();attachedThisFrame=true;
         if(diagnostics)SKSE::log::info("Entry={} preEntryForwardSpeed={:.1f} airborne={} descending={} nativeSpace={} velocityZ={:.2f} entryLift={} explicitAirCatch={} snap={:.2f} raisedTarget={:.1f} roundedCapsule={} duration={:.3f}; groundSupported={} supportedState={} nativeProbes={} lowProbes={}; target=({:.2f},{:.2f},{:.2f}) targetDelta=({:.2f},{:.2f},{:.2f})",
@@ -995,9 +1105,9 @@ void update(RE::PlayerCharacter* p,float dt) {
     }
     if(diagnostics&&traversal.stalledSeconds()>.35f&&attachedTime>=stallReportTime) {
         stallReportTime=attachedTime+1;
-        SKSE::log::info("Blocked movement: time={:.2f} dt={:.5f} input=({:.1f},{:.1f}) pos=({:.2f},{:.2f},{:.2f}) surface=({:.3f},{:.3f},{:.3f}) state={} casts={} hits={} reason={} top={}",
+        SKSE::log::info("Blocked movement: time={:.2f} dt={:.5f} input=({:.1f},{:.1f}) pos=({:.2f},{:.2f},{:.2f}) surface=({:.3f},{:.3f},{:.3f}) state={} casts={} hits={} rayCandidates={} rayClassifications={} reason={} top={}",
             traversal.stalledSeconds(),dt,input.x,input.y,traversal.position.x,traversal.position.y,traversal.position.z,
-            traversal.surfaceNormal.x,traversal.surfaceNormal.y,traversal.surfaceNormal.z,int(traversal.state),world.casts,world.hits,traversal.blockedReason,traversal.ledgeReason);
+            traversal.surfaceNormal.x,traversal.surfaceNormal.y,traversal.surfaceNormal.z,int(traversal.state),world.casts,world.hits,world.rayCandidates,world.rayClassifications,traversal.blockedReason,traversal.ledgeReason);
         if(traversal.blockedHit) {
             const auto& hit=*traversal.blockedHit;const auto a=traversal.blockedFrom,b=traversal.blockedTo;
             SKSE::log::info("Clearance obstruction: from=({:.2f},{:.2f},{:.2f}) to=({:.2f},{:.2f},{:.2f}) hit=({:.2f},{:.2f},{:.2f}) normal=({:.3f},{:.3f},{:.3f}) climbable={}",
@@ -1027,7 +1137,7 @@ void update(RE::PlayerCharacter* p,float dt) {
     poses.update(world,traversal,result.motion,dt,p->GetScale());
     traversalAudio.update(poses.library,traversal,result,poses.surface.sampledPhase(),effectiveDt,animationReady);
     const float publishMs=std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-publishStarted).count();
-    reportOutput(p,result.motion,traversalMs,publishMs,world.casts,result.released);
+    reportOutput(p,result.motion,traversalMs,publishMs,world.casts,world.rayCandidates,world.rayClassifications,result.released);
     if(poseHealth.stale()>.25f&&attachedTime>=poseRefreshTime) {
         poseRefreshTime=attachedTime+.5f;
         if(poses.refresh(p)) {
@@ -1088,6 +1198,7 @@ struct AttachedSpaceGuard {
     static inline REL::Relocation<void(*)(RE::BSWin32KeyboardDevice*,float)> original;
     static void process(RE::BSWin32KeyboardDevice* keyboard,float dt) {
         original(keyboard,dt);
+        fc::settingsMenuKeyboardSample(keyboard->GetRuntimeData().curState);
         const bool suspended=grabInputSuspended();
         if(suspended) {
             cancelGrabRequest();inputState.reset();wallRunEntryGate.reset();
@@ -1101,14 +1212,16 @@ struct AttachedSpaceGuard {
             for(std::size_t i=0;i<events.size();++i)nativeMovementKeys[i]=controls->GetMappedKey(events[i],RE::INPUT_DEVICE::kKeyboard);
         }
         fc::removeInputEvents(queue->GetQueueHead(),queue->GetQueueTail(),[suspended,nativeMovementKeys](RE::InputEvent* event) {
+            if(fc::settingsMenuFilterInput(event))return true;
             auto* button=event->AsButtonEvent();
             if(!button||event->GetDevice()!=RE::INPUT_DEVICE::kKeyboard)return false;
             const auto scan=button->GetIDCode();
             const auto before=inputState;
             if(!suspended)inputState.set(scan,button->IsPressed());
-            if(traversal.active())wallRunEntryGate.filter(fc::mapKeys(inputState,activeSettings.bindings));
+            if(button->IsDown()&&!suspended&&!traversal.active())gamepadPreferred=false;
+            if(traversal.active()&&!gamepadOwned)wallRunEntryGate.filter(fc::mapKeys(inputState,activeSettings.bindings));
             return inputOwnership.filter(scan,button->IsDown(),button->IsUp(),
-                !suspended&&traversal.active(),before,inputState,activeSettings.bindings,
+                !suspended&&traversal.active()&&!gamepadOwned,before,inputState,activeSettings.bindings,
                 !suspended&&std::find(nativeMovementKeys.begin(),nativeMovementKeys.end(),scan)!=nativeMovementKeys.end());
         });
         entryLookDiagnostics.queue(queue->GetQueueHead(),1);
@@ -1119,12 +1232,68 @@ struct AttachedSpaceGuard {
     }
 };
 
+struct GamepadGuard {
+    static inline REL::Relocation<void(*)(RE::BSPCGamepadDeviceHandler*,float)> original;
+    static RE::BSWin32GamepadDevice* device(RE::BSPCGamepadDeviceHandler* handler) {
+        auto* delegate=handler?handler->GetRuntimeData().currentPCGamePadDelegate:nullptr;
+        return delegate&&delegate->IsEnabled()?skyrim_cast<RE::BSWin32GamepadDevice*>(delegate):nullptr;
+    }
+    static void sample(const RE::BSWin32GamepadDevice& pad) {
+        const auto& raw=pad.GetRuntimeData().currentState.gamepad;
+        gamepadState.sampleXInput(raw.buttons,raw.leftTrigger,raw.rightTrigger,raw.thumbLX,raw.thumbLY,activeSettings.gamepad);
+    }
+    static void process(RE::BSPCGamepadDeviceHandler* handler,float dt) {
+        original(handler,dt);
+        auto* pad=device(handler);
+        const bool available=pad!=nullptr;
+        if(available!=gamepadAvailable) {
+            SKSE::log::info("XInput controller available={}",available);
+            gamepadLost|=gamepadOwned&&!available;
+            gamepadState.reset();gamepadOwnership.reset();gamepadPreferred=false;
+            gamepadAvailable=available;
+        }
+        if(!pad){fc::settingsMenuGamepadSample(false);return;}
+        const auto& raw=pad->GetRuntimeData().currentState.gamepad;
+        fc::settingsMenuGamepadSample(true,raw.buttons,raw.leftTrigger,raw.rightTrigger);
+        const bool suspended=grabInputSuspended()||!enabled||!activeSettings.gamepad.enabled;
+        if(suspended)gamepadState.blockUntilButtonsReleased();
+        const auto before=gamepadState;
+        sample(*pad);
+        auto* queue=RE::BSInputEventQueue::GetSingleton();
+        if(!queue)return;
+        fc::removeInputEvents(queue->GetQueueHead(),queue->GetQueueTail(),[suspended,&before](RE::InputEvent* event) {
+            if(fc::settingsMenuFilterInput(event))return true;
+            if(event->GetDevice()!=RE::INPUT_DEVICE::kGamepad)return false;
+            if(auto* button=event->AsButtonEvent()) {
+                const auto index=gamepadButtonIndex(button->GetIDCode());
+                if(index>=16)return false;
+                if(!suspended&&!traversal.active()&&button->IsDown())gamepadPreferred=true;
+                return gamepadOwnership.filter(index,button->IsDown(),button->IsUp(),
+                    !suspended&&traversal.active()&&gamepadOwned,before,gamepadState,activeSettings.gamepad.bindings);
+            }
+            if(const auto* stick=event->AsThumbstickEvent();stick&&stick->IsLeft()&&!suspended&&!traversal.active()&&
+                std::hypot(stick->xValue,stick->yValue)>activeSettings.gamepad.deadzone)gamepadPreferred=true;
+            return false;
+        });
+        if(!suspended)gamepadState.resumeIfButtonsReleased();
+        if(traversal.active()&&gamepadOwned)wallRunEntryGate.filter(gamepadState.keys(activeSettings.gamepad.bindings));
+    }
+    static void install() {
+        REL::Relocation<std::uintptr_t> table{RE::VTABLE_BSPCGamepadDeviceHandler[0]};
+        if(!fc::runtime::hookSite(table.address(),fc::runtime::gamepadPollSlot)) {
+            SKSE::log::error("Controller input hook unavailable; keyboard controls retained");return;
+        }
+        original=table.write_vfunc(fc::runtime::gamepadPollSlot,process);
+        gamepadHookReady=true;gamepadState.reset();
+    }
+};
+
 struct MenuListener:RE::BSTEventSink<RE::MenuOpenCloseEvent> {
     RE::BSEventNotifyControl ProcessEvent(const RE::MenuOpenCloseEvent* e,RE::BSTEventSource<RE::MenuOpenCloseEvent>*) override {
         if(e&&e->opening&&e->menuName!="HUD Menu"&&e->menuName!="Cursor Menu") {
             traversalAudio.stop();
 
-            inputState.reset();wallRunEntryGate.reset();
+            inputState.reset();gamepadState.blockUntilButtonsReleased();wallRunEntryGate.reset();
             if(traversal.active())release(RE::PlayerCharacter::GetSingleton(),"menu opened");
             cancelGrabRequest();
         }
@@ -1151,7 +1320,9 @@ bool runtimeHooksReady() {
 }
 
 void applyRuntimeSettings(const fc::UserSettings& value) {
+    const auto oldGamepad=activeSettings.gamepad;
     activeSettings=fc::sanitizeUserSettings(value);
+    if(activeSettings.gamepad!=oldGamepad)gamepadState.blockUntilButtonsReleased();
     const auto& u=activeSettings;
     enabled=u.enabled;notifications=u.notifications;lowStaminaNotifications=u.lowStaminaNotifications;
     jumpToAttach=u.jumpToAttach;autoMantle=u.autoMantle;diagnostics=u.diagnostics;
@@ -1276,8 +1447,13 @@ void loadSettings() {
     const auto loaded=fc::loadUserSettings("Data/SKSE/Plugins/FreeClimb.ini");
     desiredSettings=loaded.settings;applyRuntimeSettings(desiredSettings);
     for(const auto& warning:loaded.warnings)SKSE::log::warn("Settings: {}",warning);
-    SKSE::log::info("FreeClimb 0.2.16; standalone HKX framework; climb entry={}; wall-run modifier={}; stamina enabled={}",
+    SKSE::log::info("FreeClimb {}; standalone HKX framework; climb entry={}; wall-run modifier={}; stamina enabled={}",
+        SKSE::PluginDeclaration::GetSingleton()->GetVersion().string("."),
         fc::serializeKeyChord(activeSettings.bindings.entry),fc::serializeKeyChord(activeSettings.bindings.runModifier),traversal.cfg.staminaEnabled);
+    SKSE::log::info("Experimental controller: enabled={} entry={} run={} hop={} drop={} deadzone={:.2f} trigger={:.2f}",
+        activeSettings.gamepad.enabled,fc::serializeGamepadChord(activeSettings.gamepad.bindings.entry),
+        fc::serializeGamepadChord(activeSettings.gamepad.bindings.runModifier),fc::serializeGamepadChord(activeSettings.gamepad.bindings.hop),
+        fc::serializeGamepadChord(activeSettings.gamepad.bindings.drop),activeSettings.gamepad.deadzone,activeSettings.gamepad.triggerThreshold);
 }
 
 void initializeRuntime() {
@@ -1293,6 +1469,7 @@ void initializeRuntime() {
         REL::Relocation<std::uintptr_t> vtable{RE::VTABLE_PlayerCharacter[0]};
         originalUpdate=vtable.write_vfunc(fc::runtime::actorUpdateSlot,update);
         AttachedSpaceGuard::install();
+        GamepadGuard::install();
         InputGuard<RE::MovementHandler,0>::install(RE::VTABLE_MovementHandler[0]);
         InputGuard<RE::JumpHandler,1>::install(RE::VTABLE_JumpHandler[0]);
         InputGuard<RE::SneakHandler,2>::install(RE::VTABLE_SneakHandler[0]);
@@ -1329,7 +1506,8 @@ void onMessage(SKSE::MessagingInterface::Message* m) {
         release(p,"new game / loaded"); traversal.reset();
         attachmentsSinceLoad=0;
         nativeShapeBaselineSamples=nativeShapeBaselineAttempts=0;nativeShapeBaselineAge=nativeShapeBaselineRetry=0;
-        jumpGrab.cancel();inputState.reset();inputOwnership.reset();
+        jumpGrab.cancel();nativeJumpIntent={};inputState.reset();inputOwnership.reset();
+        gamepadState.reset();gamepadOwnership.reset();gamepadPreferred=false;gamepadLost=false;
         totalMotionUses.fill(0);totalObservedUses.fill(0);
         climbEntry.blockUntilRelease();lastHop=false;refreshMenuSnapshot();break;
     }
@@ -1341,10 +1519,25 @@ void onMessage(SKSE::MessagingInterface::Message* m) {
 
 SKSEPluginLoad(const SKSE::LoadInterface* skse) {
 
-    if(!skse||!fc::runtime::supported(skse->RuntimeVersion().pack()))return false;
     fc::initializeLogging();
+    if(!skse){SKSE::log::error("Plugin load rejected: missing SKSE interface");return false;}
+    const auto reportedVersion=skse->RuntimeVersion();
+    const auto expectedVersion=REL::Version::unpack(fc::runtime::gameVersionFromSKSE(reportedVersion.pack()));
+    SKSE::log::info("Plugin load: FreeClimb={} game={} SKSE={} loaderRuntime={}",
+        SKSE::PluginDeclaration::GetSingleton()->GetVersion().string("."),expectedVersion.string("."),
+        REL::Version::unpack(skse->SKSEVersion()).string("."),reportedVersion.string("."));
+    if(!fc::runtime::supportedSKSE(reportedVersion.pack())) {
+        SKSE::log::error("Plugin load rejected: SKSE runtime {} is outside the supported loader table",reportedVersion.string("."));
+        return false;
+    }
+    SKSE::log::info("Initializing SKSE; expected Address Library: Data/SKSE/Plugins/{}-{}.bin",
+        fc::runtime::addressFormat(expectedVersion.pack())==1?"version":"versionlib",expectedVersion.string("-"));
     SKSE::Init(skse,SKSE::InitInfo{.log=false});
     const auto gameVersion=REL::Module::get().version();
+    if(gameVersion!=expectedVersion||!fc::runtime::supported(gameVersion.pack())) {
+        SKSE::log::error("Plugin load rejected: executable {} does not match SKSE runtime {}",gameVersion.string("."),reportedVersion.string("."));
+        return false;
+    }
     SKSE::log::info("Runtime {}: family={}, addressLibraryFormat={}, explicit support table; AE builds have not been tested in-game",
         gameVersion.string("."),static_cast<int>(fc::runtime::family(gameVersion.pack())),fc::runtime::addressFormat(gameVersion.pack()));
     loadSettings();
@@ -1352,5 +1545,8 @@ SKSEPluginLoad(const SKSE::LoadInterface* skse) {
     serialization->SetUniqueID(0x46434C4D);
     serialization->SetSaveCallback([](SKSE::SerializationInterface*) { release(RE::PlayerCharacter::GetSingleton(),"serialize"); });
     serialization->SetRevertCallback([](SKSE::SerializationInterface*) { release(RE::PlayerCharacter::GetSingleton(),"revert"); });
-    return SKSE::GetMessagingInterface()->RegisterListener(onMessage);
+    const bool registered=SKSE::GetMessagingInterface()->RegisterListener(onMessage);
+    if(registered)SKSE::log::info("Plugin load complete; waiting for game data");
+    else SKSE::log::error("Plugin load failed: SKSE message listener registration failed");
+    return registered;
 }

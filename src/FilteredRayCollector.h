@@ -2,6 +2,7 @@
 #include <RE/Skyrim.h>
 #include <SKSE/SKSE.h>
 #include "RuntimeSupport.h"
+#include "RayCollectorValidationCache.h"
 #include <cstddef>
 #include <cstring>
 #include <string_view>
@@ -47,8 +48,8 @@ inline void nativeClosestRayAdd(void* collector,const RE::hkpCdBody& body,
     static_cast<RE::hkpClosestRayHitCollector*>(collector)->RE::hkpClosestRayHitCollector::AddRayHit(body,hit);
 }
 
-inline FilteredRayCollector::NativeAdd verifiedRayCollectorAdd(RE::bhkWorld* world) {
-    struct Verified { FilteredRayCollector::NativeAdd add{};std::uintptr_t pick{}; };
+inline RayCollectorValidation<FilteredRayCollector::NativeAdd> verifiedRayCollectorAdd(RE::bhkWorld* world,std::uintptr_t table) {
+    using Verified=RayCollectorValidation<FilteredRayCollector::NativeAdd>;
     static const auto verified=[]()->Verified {
         if(!runtime::supported())return {};
         const auto base=REL::Module::get().base();
@@ -85,10 +86,10 @@ inline FilteredRayCollector::NativeAdd verifiedRayCollectorAdd(RE::bhkWorld* wor
             REL::Module::get().version().string(),runtime::isSE()?"SE bytes and mapped vtables":"mapped vtables and executable sections",add-base,pick-base);
         return valid?Verified{nativeClosestRayAdd,pick}:Verified{};
     }();
-    if(!verified.add||!world||!runtime::readable(reinterpret_cast<std::uintptr_t>(world),sizeof(std::uintptr_t)))return nullptr;
+    if(!verified.add||!world||!runtime::readable(reinterpret_cast<std::uintptr_t>(world),sizeof(std::uintptr_t)))return {};
 
-    const auto table=*reinterpret_cast<const std::uintptr_t*>(world);
-    if(!runtime::readable(table,0x34*sizeof(std::uintptr_t)))return nullptr;
-    return reinterpret_cast<const std::uintptr_t*>(table)[0x33]==verified.pick?verified.add:nullptr;
+    if(*reinterpret_cast<const std::uintptr_t*>(world)!=table)return {};
+    if(!runtime::readable(table,0x34*sizeof(std::uintptr_t)))return {};
+    return reinterpret_cast<const std::uintptr_t*>(table)[0x33]==verified.pick?verified:Verified{};
 }
 }
