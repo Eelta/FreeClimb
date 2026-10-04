@@ -21,7 +21,7 @@ struct Fixture {
     Pose source=canonical(),native=source;
     std::array<Transform,99> basis{};
     std::array<bool,99> mapped{};
-    Fixture(){mapped.fill(true);for(int bone:{1,2,3,42,43,60,61,62,63,64,65,66,97,98})mapped[bone]=false;}
+    Fixture(){mapped.fill(true);for(int bone:{1,2,3,42,43,46,47,48,49,60,61,62,63,64,65,66,97,98})mapped[bone]=false;}
     void customize(){
         for(int bone:{7,8,28,29,31,32,38,39,68,83})native[bone].t=source[bone].t*1.23f+Vec{.3f,-.2f,.4f};
         native[7].s={1.11f,.93f,1.07f};native[29].s={.89f,1.15f,1.04f};native[38].s={1.04f,1.04f,1.04f};
@@ -44,9 +44,9 @@ static void inactivePreservesBits(){
     Pose input=f.source;input[7].t.x=-0.f;input[8].q={.2f,.3f,.4f,.5f};input[9].s.y=-0.f;
     const Pose original=input;rig.adapt(input);check(exact(input,original),"inactive adaptation does not normalize, rescale or rewrite signed zero");
     for(std::size_t i=0;i<=100;++i){const auto& local=original[i%99];check(exact(rig.toEffective(i,local),local)&&exact(rig.toLocal(i,local),local),"inactive coordinate conversion preserves all input bits");check(exact(rig.rotation(i,local.q),local.q),"inactive rotation conversion preserves quaternion bits");}
-    for(int bone:{42,43,60,61,62,63,64,65,66,97,98}){f.native[bone].t={123,456,789};f.native[bone].s={2,3,4};f.basis[bone]={{7,8,9},Quat::axis({1,0,0},1),{2,2,2}};}
-    check(rig.configure(f.source,f.native,f.basis,f.mapped)&&!rig.active(),"engine-owned equipment and camera differences do not activate or authorize adaptation");
-    check(exact(rig.reference(),f.source),"unmapped equipment and cameras retain source tracks");
+    for(int bone:{42,43,46,47,48,49,60,61,62,63,64,65,66,97,98}){f.native[bone].t={123,456,789};f.native[bone].s={2,3,4};f.basis[bone]={{7,8,9},Quat::axis({1,0,0},1),{2,2,2}};}
+    check(rig.configure(f.source,f.native,f.basis,f.mapped)&&!rig.active(),"engine-owned attachment and camera differences do not activate or authorize adaptation");
+    check(exact(rig.reference(),f.source),"unmapped attachments and cameras retain source tracks");
 }
 static void sceneRotationValidation(){
     using Rig=PoseRig<Pose>;
@@ -129,7 +129,7 @@ static void structuralValidationRejectsInvalidData(){
 }
 static void adaptationAndBridges(){
     Fixture f;f.customize();f.source[29].s={.8f,1.4f,2};
-    for(int bone:{42,43,60,61,62,63,64,65,66,97,98}){f.native[bone].t={111,-222,333};f.native[bone].s={3,2,4};f.basis[bone]={{9,8,7},Quat::axis({0,1,0},.83f),{2,2,2}};}
+    for(int bone:{42,43,46,47,48,49,60,61,62,63,64,65,66,97,98}){f.native[bone].t={111,-222,333};f.native[bone].s={3,2,4};f.basis[bone]={{9,8,7},Quat::axis({0,1,0},.83f),{2,2,2}};}
     f.native[0].t={80,-70,60};f.native[4].t={40,-30,120};f.native[0].s={1.04f,1.04f,1.04f};
     f.native[4].s={.96f,.96f,.96f};f.basis[4]={{1,2,3},Quat::axis({0,0,1},.13f),{1,1,1}};
     PoseRig<Pose> rig;check(rig.configure(f.source,f.native,f.basis,f.mapped)&&rig.active(),"custom locked lengths, scales and adjustment bridges activate adaptation");

@@ -422,17 +422,14 @@ int main(int argc,char** argv) {
         require(t.attach(ledge,{0,-42,0},{0,1,0},100),"mantle pose attach");
         std::ofstream dump(std::filesystem::current_path()/("runtime-top-"+std::to_string(int(height))+".json"));dump<<'[';
         SurfacePose animator;PoseHandoff renderer;const Pose native=lib.rest;Pose visible;
-        float maxError=0,errorPhase=0,lipError=0,footPenetration=0,previousRecovery=0;int lipSamples=0;bool completed=false;float largestStep=0;Pose previous;Vec previousPosition;
+        float maxError=0,errorPhase=0,lipError=0,footPenetration=0;int lipSamples=0;bool completed=false;float largestStep=0;Pose previous;Vec previousPosition;
         for(int frame=0;frame<240&&t.active();++frame) {
             auto result=t.update(ledge,{0,1,false,true},1.f/60,100);
             auto pose=animator.update(lib,ledge,t,result.motion,1.f/60,1);auto w=lib.world(pose);
-            const float recovery=topRecovery(result.motion,t.progress(),t.topSeconds());
-            if(result.motion==Motion::contextMantle) {
-                require(recovery>=previousRecovery,"top-out recovery cannot reverse toward the captured animation");
-                if(t.progress()<.72f)require(recovery==0,"loaded-hand phase must retain the complete authored pose");
-                previousRecovery=recovery;
-            }
-            visible=renderer.compose(native,pose,1,recovery);
+            const auto rendered=renderer.evaluate(native,pose,1,0,frame/60.f);
+            require(renderer.consumed(rendered),"the complete authored mantle is propagated before native ownership resumes");visible=rendered.pose;
+            for(std::size_t bone=0;bone<pose.size();++bone)
+                require((visible[bone].t-pose[bone].t).length()<.00001f&&angleBetween(visible[bone].q,pose[bone].q)<.0001f,"no intermediate native standing pose replaces the collision-controlled mantle finish");
             for(int foot:{8,11}) {
                 const auto point=w[foot].t+t.position;
                 if(point.y>0)footPenetration=std::max(footPenetration,height-point.z);
@@ -476,14 +473,29 @@ int main(int argc,char** argv) {
         require(footPenetration<3,"feet must clear the platform before crossing its edge");
         const bool loadedTop=t.topHandWeight(0,t.topSampleBegin())>.05f||t.topHandWeight(1,t.topSampleBegin())>.05f;
         require((loadedTop?lipSamples>0:lipSamples==0)&&lipError<3,"only genuinely loaded palms contact actual collision tops; low tops do not invent hand support");
-        require(previousRecovery>.99999f,"a completed top-out must fully hand over the pose rather than merely stop its timeline");
+        require(renderer.beginExit(false,true),"completed collision-controlled top starts one native handoff");
+        const auto authoredFinish=visible;float exitStep=0,exitAngle=0;
+        for(int frame=0;frame<=int(std::ceil(PoseHandoff::nativeExitSeconds*60));++frame) {
+            const float elapsed=std::min(frame/60.f,PoseHandoff::nativeExitSeconds);renderer.advanceExitSource(elapsed,lib);
+            const auto output=renderer.evaluate(native,authoredFinish,1);const auto world=lib.world(output.pose);
+            if(frame==0)for(std::size_t bone=0;bone<visible.size();++bone)
+                require((output.pose[bone].t-visible[bone].t).length()<.00001f&&angleBetween(output.pose[bone].q,visible[bone].q)<.0001f,"native handoff starts at the actually displayed mantle endpoint");
+            else {
+                for(int bone:{38,39,8,11})exitStep=std::max(exitStep,(world[bone].t-previous[bone].t).length());
+                for(std::size_t bone=0;bone<visible.size();++bone)exitAngle=std::max(exitAngle,angleBetween(output.pose[bone].q,visible[bone].q));
+            }
+            visible=output.pose;previous=world;require(renderer.consumed(output),"native transition output is propagated");
+        }
+        std::cout<<"top native exit height="<<height<<" maxEndpointStep="<<exitStep<<" maxAngle="<<exitAngle<<'\n';
+        require(exitStep<12.6f&&exitAngle<=12.566371f/60+.005f,"single native handoff retains the original top endpoint and angular-rate budgets");
+        require(!renderer.nativeExitActive(),"completed top native handoff retires after reaching the actual target");
         for(std::size_t bone=0;bone<native.size();++bone) {
 
             const float translation=(visible[bone].t-native[bone].t).length(),angle=angleBetween(visible[bone].q.unit(),native[bone].q.unit());
             if(translation>=.0001f||angle>=.002f) {
                 const auto actual=visible[bone].q,target=native[bone].q;
                 std::cerr<<"terminal native mismatch height="<<height<<" bone="<<bone<<" name="<<lib.names[bone]
-                    <<" recovery="<<previousRecovery<<" translation="<<translation<<" angle="<<angle
+                    <<" translation="<<translation<<" angle="<<angle
                     <<" rawAngle="<<angleBetween(actual,target)
                     <<" actualNorm2="<<actual.dot(actual)<<" targetNorm2="<<target.dot(target)
                     <<" actualQ="<<actual.x<<','<<actual.y<<','<<actual.z<<','<<actual.w

@@ -49,7 +49,13 @@ inline bool cornerJoinValid(World& world,const Settings& cfg,const CornerRoute& 
     return true;
 }
 inline bool cornerGrip(World& world,const Settings& cfg,const CornerRoute& route,Vec feet,Vec facing) {
-    for(Vec normal:{facing,route.sourceNormal,route.targetNormal}) {
+    const std::array normals{facing,route.sourceNormal,route.targetNormal};
+    for(std::size_t index=0;index<normals.size();++index) {
+        const Vec normal=normals[index];
+        bool duplicate=false;
+        for(std::size_t prior=0;prior<index;++prior)
+            duplicate|=normal.x==normals[prior].x&&normal.y==normals[prior].y&&normal.z==normals[prior].z;
+        if(duplicate)continue;
         const Vec side=Vec{-normal.y,normal.x,0}.unit();
 
         for(float heightCenter:{cfg.grip,cfg.chest}) {
@@ -91,20 +97,24 @@ inline bool cornerLandingGrip(World& world,const Settings& cfg,const CornerRoute
     return false;
 }
 
-inline bool cornerBodyClear(World& world,const Settings& cfg,Vec from,Vec to,bool inclined=false) {
+inline bool cornerBodyClear(World& world,const Settings& cfg,Vec from,Vec to,bool inclined=false,bool destinationChecked=false) {
     const float radius=cfg.radius+std::max(4.f,cfg.radius*.085f);
+    const bool moving=(to-from).length()>.001f;
     if(inclined) {
 
         const std::array<float,7> heights{6.f,(6.f+cfg.radius)*.5f,cfg.radius,cfg.chest,
             cfg.height-cfg.radius,cfg.height-(6.f+cfg.radius)*.5f,cfg.height-6.f};
+        std::array<float,7> widths{};
+        for(std::size_t level=0;level<heights.size();++level) {
+            const float axial=std::max({cfg.radius-heights[level],0.f,heights[level]-(cfg.height-cfg.radius)});
+            widths[level]=std::sqrt(std::max(0.f,radius*radius-axial*axial));
+        }
         for(unsigned index=0;index<8;++index) {
             Vec previous{};bool first=true;
-            for(float height:heights) {
-                const float axial=std::max({cfg.radius-height,0.f,height-(cfg.height-cfg.radius)});
-                const float width=std::sqrt(std::max(0.f,radius*radius-axial*axial));
-                const Vec offset=cornerRotate({width,0,height},float(index)*.785398163397f);
-                if((to-from).length()>.001f&&world.ray(from+offset,to+offset))return false;
-                if(!first&&world.ray(to+previous,to+offset))return false;
+            for(std::size_t level=0;level<heights.size();++level) {
+                const Vec offset=cornerRotate({widths[level],0,heights[level]},float(index)*.785398163397f);
+                if(moving&&world.ray(from+offset,to+offset))return false;
+                if(!destinationChecked&&!first&&world.ray(to+previous,to+offset))return false;
                 previous=offset;first=false;
             }
         }
@@ -112,9 +122,9 @@ inline bool cornerBodyClear(World& world,const Settings& cfg,Vec from,Vec to,boo
     }
     for(unsigned index=0;index<8;++index) {
         const Vec offset=cornerRotate({radius,0,0},float(index)*.785398163397f);
-        if((to-from).length()>.001f)for(float height:{6.f,cfg.chest,cfg.height})
+        if(moving)for(float height:{6.f,cfg.chest,cfg.height})
             if(world.ray(from+offset+Vec{0,0,height},to+offset+Vec{0,0,height}))return false;
-        if(world.ray(to+offset+Vec{0,0,6},to+offset+Vec{0,0,cfg.height}))return false;
+        if(!destinationChecked&&world.ray(to+offset+Vec{0,0,6},to+offset+Vec{0,0,cfg.height}))return false;
     }
     return true;
 }
@@ -361,7 +371,9 @@ inline std::optional<CornerRoute> findCornerRoute(World& world,const Settings& c
             const float phase=float(step)/float(segments);
             const Vec point=start+(finish-start)*phase;
             const Vec facing=(beforeNormal*(1-phase)+afterNormal*phase).unit();
-            if(!cornerGrip(world,cfg,route,point,facing)||!clearPath(previous,point)||!cornerBodyClear(world,cfg,previous,point,std::abs(route.sourceNormal.z)>.12f||std::abs(route.targetNormal.z)>.12f))return false;
+            const unsigned shared=step*gripSteps/segments;
+            const bool checked=shared>0&&shared<gripSteps&&float(shared)/float(gripSteps)==phase;
+            if((!checked&&!cornerGrip(world,cfg,route,point,facing))||!clearPath(previous,point)||!cornerBodyClear(world,cfg,previous,point,std::abs(route.sourceNormal.z)>.12f||std::abs(route.targetNormal.z)>.12f))return false;
             previous=point;
         }
         return true;

@@ -5,6 +5,7 @@
 #include "Controls.h"
 #include "InputBindings.h"
 #include "GamepadInput.h"
+#include "MenuInterruption.h"
 #include <SKSE/InputMap.h>
 #include "UserSettings.h"
 #include "SettingsMenu.h"
@@ -46,7 +47,8 @@ RE::NiPointer<RE::bhkCharacterController> ownedController;
 RE::TESObjectCELL* climbingCell{};
 RE::TESWorldSpace* climbingWorldspace{};
 TDM_API::IVTDM3* tdm{};
-bool yawOwned{},directionOwned{},syncOwned{},ready{};
+bool yawOwned{},directionOwned{},syncOwned{};
+std::atomic<bool> ready{};
 bool savedRunning{},runningSaved{},idleRunning=true,idleRunningKnown{};
 fc::ControllerGravityLease<RE::bhkCharacterController> controllerGravity;
 fc::PoseHealth poseHealth;
@@ -99,7 +101,7 @@ void serviceSettings();
 void initializeRuntime();
 void refreshMenuSnapshot();
 std::array<std::uint32_t,fc::motionCount+1> motionUses{};
-REL::Relocation<void(*)(RE::PlayerCharacter*,float)> originalUpdate;
+fc::HookPublication<void(*)(RE::PlayerCharacter*,float)> originalUpdate;
 
 bool gamepadSelected() {
     if(traversal.active())return gamepadOwned;
@@ -129,6 +131,47 @@ fc::Vec vec(RE::NiPoint3 v) { return {v.x,v.y,v.z}; }
 bool graph(RE::Actor* p,const char* name) { bool result=false; p->GetGraphVariableBool(name,result); return result; }
 void note(const char* text) { if(notifications) RE::SendHUDMessage::ShowHUDMessage(text); }
 bool foreground() { DWORD pid=0; GetWindowThreadProcessId(GetForegroundWindow(),&pid); return pid==GetCurrentProcessId(); }
+
+
+struct ExitNativeDiagnostics {
+    std::uint64_t started{};
+    unsigned next{};
+    RE::FormID cell{};
+    fc::Vec origin{};
+    void reset(){started=0;}
+    void begin(RE::PlayerCharacter* player) {
+        reset();
+        if(!diagnostics||!ready||!enabled||!player||player!=RE::PlayerCharacter::GetSingleton())return;
+        const auto* currentCell=player->GetParentCell();
+        const auto position=vec(player->GetPosition());
+        if(!currentCell||!player->GetCharController()||!position.finite())return;
+        cell=currentCell->GetFormID();origin=position;next=0;started=GetTickCount64();
+    }
+    void sample(RE::PlayerCharacter* player,float dt,bool newEntry) {
+        if(!started)return;
+        if(!diagnostics||!ready||!enabled||traversal.active()||newEntry||!player||player!=RE::PlayerCharacter::GetSingleton()) {reset();return;}
+        const auto now=GetTickCount64();
+        const auto elapsed=now-started;
+        const auto* currentCell=player->GetParentCell();
+        const auto* controller=player->GetCharController();
+        const auto* controls=RE::PlayerControls::GetSingleton();
+        const auto position=vec(player->GetPosition());
+        const float scale=RE::bhkWorld::GetWorldScale();
+        if(elapsed>750||!currentCell||currentCell->GetFormID()!=cell||!controller||!controls||!position.finite()||
+            !std::isfinite(dt)||dt<=0||!std::isfinite(scale)||scale<=0) {reset();return;}
+        constexpr std::array<std::uint64_t,4> times{0,100,250,500};
+        if(elapsed<times[next])return;
+        const auto displacement=position-origin;
+        const auto& velocity=controller->outVelocity.quad;
+        SKSE::log::info("Top native resume: sample={} wallMs={} dt={:.5f} position=({:.2f},{:.2f},{:.2f}) displacement=({:.2f},{:.2f},{:.2f}) move=({:.3f},{:.3f}) velocity=({:.2f},{:.2f},{:.2f}) current={} wanted={} support={} synced={} animationDriven={}",
+            next,elapsed,dt,position.x,position.y,position.z,displacement.x,displacement.y,displacement.z,
+            controls->data.moveInputVec.x,controls->data.moveInputVec.y,velocity.m128_f32[0]/scale,velocity.m128_f32[1]/scale,velocity.m128_f32[2]/scale,
+            int(controller->context.currentState),int(controller->wantState),int(controller->surfaceInfo.supportedState.get()),
+            graph(player,"bIsSynced"),player->IsAnimationDriven());
+        while(++next<times.size()&&elapsed>=times[next]){}
+        if(next==times.size())reset();
+    }
+} exitNativeDiagnostics;
 
 
 struct EntryLookDiagnostics {
@@ -188,11 +231,25 @@ struct EntryLookDiagnostics {
     };
 } entryLookDiagnostics;
 
+fc::MenuInputState menuInputState(const RE::IMenu& menu) {
+    using Context=RE::UserEvents::INPUT_CONTEXT_ID;
+    bool input=menu.UsesMenuContext();
+    switch(menu.inputContext.get()) {
+    case Context::kMenuMode: case Context::kConsole: case Context::kItemMenu: case Context::kInventory:
+    case Context::kFavorites: case Context::kMap: case Context::kStats: case Context::kBook:
+    case Context::kJournal: case Context::kLockpicking: input=true;break;
+    default: break;
+    }
+    return {menu.PausesGame(),menu.InventoryItemMenu(),input};
+}
 bool grabInputSuspended() {
     const auto ui=RE::UI::GetSingleton();
-    return !foreground()||!ui||fc::settingsMenuBlocking()||ui->GameIsPaused()||ui->numItemMenus>0||
-        ui->IsMenuOpen("Console")||ui->IsMenuOpen("Dialogue Menu")||
-        ui->IsMenuOpen("Loading Menu")||ui->IsMenuOpen("TweenMenu");
+    if(!foreground()||!ui||fc::settingsMenuBlocking())return true;
+    RE::BSSpinLockGuard lock(ui->processMessagesLock);
+    if(ui->GameIsPaused()||ui->numItemMenus>0||ui->IsMenuOpen("Console")||ui->IsMenuOpen("Dialogue Menu")||
+        ui->IsMenuOpen("Loading Menu")||ui->IsMenuOpen("TweenMenu"))return true;
+    for(const auto& menu:ui->menuStack)if(menu&&fc::menuBlocksTraversal({},menuInputState(*menu)))return true;
+    return false;
 }
 void cancelEntryPreparation() {
     entryPreparationGrace.cancel();poses.cancelPreparation();preparationStarted=0;
@@ -395,13 +452,15 @@ struct GameWorld final:fc::World {
                 return fc::Hit{point,{0,0,1},false};
             }
             const auto layer=r.rootCollidable->GetCollisionLayer();
+            const bool tree=layer==RE::COL_LAYER::kTrees;
             bool stable=layer==RE::COL_LAYER::kStatic||layer==RE::COL_LAYER::kGround||layer==RE::COL_LAYER::kTerrain;
 
-            if(!stable&&(layer==RE::COL_LAYER::kClutter||layer==RE::COL_LAYER::kWard||layer==RE::COL_LAYER::kProps)&&
-                ref&&ref->GetBaseObject()&&ref->GetBaseObject()->Is(RE::FormType::Static)&&
+            if(!stable&&(tree||layer==RE::COL_LAYER::kClutter||layer==RE::COL_LAYER::kWard||layer==RE::COL_LAYER::kProps)&&
+                (tree||(ref&&ref->GetBaseObject()&&ref->GetBaseObject()->Is(RE::FormType::Static)))&&
                 r.rootCollidable->broadPhaseHandle.type==static_cast<int>(RE::hkpWorldObject::BroadPhaseType::kEntity)) {
                 const auto entity=r.rootCollidable->GetOwner<RE::hkpEntity>();
-                stable=entity&&entity->motion.type==RE::hkpMotion::MotionType::kFixed;
+                stable=entity&&entity->motion.type==RE::hkpMotion::MotionType::kFixed&&
+                    (!tree||entity->material.responseType==RE::hkpMaterial::ResponseType::kSimpleContact);
             }
             const auto& n=r.normal.quad;
             const fc::Vec normal{n.m128_f32[0],n.m128_f32[1],n.m128_f32[2]};
@@ -449,13 +508,13 @@ void setMotion(RE::PlayerCharacter*,fc::Motion m) {
 }
 
 void release(RE::PlayerCharacter* p,const char* reason,bool fade=false,bool physicalFall=false,bool completedTop=false) {
+    exitNativeDiagnostics.reset();
     const auto releaseStarted=diagnostics?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     wallRunEntryGate.reset();
     if(preparationChangedView)cancelEntryPreparation();
     if(fade)traversalAudio.resetTiming();else traversalAudio.stop();
     entryPreparationGrace.cancel();preparationStarted=0;poseHealth.reset();
     viewHeading.reset();
-    const bool topRecoveryReady=poses.topRecoveryReady();
     poses.release(fade,physicalFall,completedTop);
     const auto poseReleased=diagnostics?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     const bool wasOwned=ownedController.get()!=nullptr;
@@ -475,7 +534,7 @@ void release(RE::PlayerCharacter* p,const char* reason,bool fade=false,bool phys
     if(animationState) animationState->value=0;
     if(p&&wasOwned) {
 
-        if(!topRecoveryReady&&!physicalFall)p->NotifyAnimationGraph("IdleForceDefaultState");
+        if(!physicalFall)p->NotifyAnimationGraph("IdleForceDefaultState");
         const auto controlsReleased=diagnostics?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
         SKSE::log::info("Released: {}",reason);
         if(diagnostics)for(int i=1;i<=fc::motionCount;++i)if(motionUses[i])
@@ -495,6 +554,7 @@ void release(RE::PlayerCharacter* p,const char* reason,bool fade=false,bool phys
         }
     }
     lastMotion=fc::Motion::none;
+    if(wasOwned&&fade&&completedTop&&!physicalFall)exitNativeDiagnostics.begin(p);
 }
 
 const char* yawResultName(TDM_API::APIResult result) {
@@ -776,6 +836,9 @@ bool acquire(RE::PlayerCharacter* p) {
 }
 
 void update(RE::PlayerCharacter* p,float dt) {
+    const auto prior=originalUpdate.get();
+    if(!prior)return;
+    if(!ready){prior(p,dt);return;}
     if(gamepadOwned) {
         auto* manager=RE::BSInputDeviceManager::GetSingleton();
         if(gamepadLost||!gamepadAvailable||!manager||!manager->IsGamepadEnabled()) {
@@ -786,16 +849,17 @@ void update(RE::PlayerCharacter* p,float dt) {
     gamepadLost=false;
     entryLookDiagnostics.beforeNative(p);
     if(traversal.active()) stopLocomotion();
-    originalUpdate(p,dt);
+    prior(p,dt);
     if(poses.consumeRigInvalidated()) {
         if(traversal.active())release(p,"character rig changed");
         else {cancelEntryPreparation();cancelGrabRequest();}
     }
     if(std::isfinite(dt)&&dt>1e-6f)poses.tick(dt);
     serviceSettings();
-    if(!ready||!enabled||!animationState) return;
+    if(!ready||!enabled||!animationState) {exitNativeDiagnostics.reset();return;}
 
     if(grabInputSuspended()) {
+        exitNativeDiagnostics.reset();
         groundMotionProbe.suspend();
         inputState.reset();gamepadState.blockUntilButtonsReleased();wallRunEntryGate.reset();traversalAudio.stop();
 
@@ -804,7 +868,7 @@ void update(RE::PlayerCharacter* p,float dt) {
         return;
     }
 
-    if(!std::isfinite(dt)||dt<=1e-6f){entryPreparationGrace.cancel();return;}
+    if(!std::isfinite(dt)||dt<=1e-6f){exitNativeDiagnostics.reset();entryPreparationGrace.cancel();return;}
     traversalAudio.observe(dt);
     observeNativeShapeBaseline(p,dt);
     const bool fromGamepad=gamepadSelected();
@@ -828,8 +892,21 @@ void update(RE::PlayerCharacter* p,float dt) {
     const bool nativeJump=nativeJumpIntent.sample(nativeJumpHeld(),dt);
     const auto initialFlight=entryFlight(p,nativeJump);
     const auto grabIntent=climbEntry.sample(heldKeys,traversal.active(),false,dt,initialFlight.confirmedAirborne);
+    if(grabIntent.began)gamepadPreferred=fromGamepad;
     const bool preparedRetry=entryPreparationGrace.sample(dt,fromGamepad,heldKeys);
     const bool grab=grabIntent.requested||preparedRetry,grabPressed=grabIntent.fresh;
+    if(diagnostics&&!traversal.active()&&!grab&&activeSettings.gamepad.enabled&&gamepadAvailable&&
+        gamepadState.heldChord(activeSettings.gamepad.bindings.entry)) {
+        static ULONGLONG nextReport{};
+        const auto now=GetTickCount64();
+        if(now>=nextReport) {
+            nextReport=now+2000;
+            SKSE::log::info("Controller entry waiting: selected={} releaseButtons={} releaseChord={} backward={} drop={} preparing={} probeCooldown={:.3f}",
+                fromGamepad,gamepadState.waitingForButtonsRelease(),climbEntry.waitingForRelease(),
+                heldKeys.s,heldKeys.letGo,preparationStarted!=0,grabProbeCooldown);
+        }
+    }
+    exitNativeDiagnostics.sample(p,dt,grab);
     const bool hop=heldKeys.space,hopPressed=hop&&!lastHop;
     lastHop=hop;
     if(!traversal.active()&&!grab){jumpGrab.cancel();cancelEntryPreparation();grabProbeCooldown=0;}
@@ -892,9 +969,7 @@ void update(RE::PlayerCharacter* p,float dt) {
         const auto flight=entryFlight(p,jumpGrab.startedNativeJump());
         const bool explicitAirCatch=jumpGrab.explicitAirCatch(flight);
         if(!jumpGrab.permitted(traversal.cooldown,flight))return;
-        grabProbeCooldown=std::max(0.f,grabProbeCooldown-std::min(dt,.05f));
-        if(grabProbeCooldown>0&&!grabPressed)return;
-        grabProbeCooldown=.08f;
+        if(!fc::entryProbeReady(grabProbeCooldown,dt,grabPressed))return;
         EntryLookDiagnostics::Probe probeTimer(entryLookDiagnostics);
         fitBody(p);
 
@@ -1128,11 +1203,6 @@ void update(RE::PlayerCharacter* p,float dt) {
     if(result.staminaCost>0) p->AsActorValueOwner()->ModActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage,RE::ActorValue::kStamina,-result.staminaCost);
     if(traversal.cfg.staminaEnabled&&lowStaminaNotifications&&stamina<=20&&!lowStaminaNoted){note("FreeClimb: low stamina - stop to rest or climb down");lowStaminaNoted=true;}
     if(stamina>30)lowStaminaNoted=false;
-    if(poses.requestTopRecovery(traversal.state,traversal.progress(),traversal.topSeconds())) {
-        const bool accepted=p->NotifyAnimationGraph("IdleForceDefaultState");
-        poses.resolveTopRecovery(accepted);
-        if(diagnostics)SKSE::log::info("Top-out native standing endpoint requested at progress={:.3f}; windowSeconds={:.3f}; accepted={}",traversal.progress(),(1.f-fc::topRecoveryBegin(traversal.topSeconds()))*traversal.topSeconds(),accepted);
-    }
     const auto publishStarted=std::chrono::steady_clock::now();
     poses.update(world,traversal,result.motion,dt,p->GetScale());
     traversalAudio.update(poses.library,traversal,result,poses.surface.sampledPhase(),effectiveDt,animationReady);
@@ -1179,25 +1249,31 @@ void update(RE::PlayerCharacter* p,float dt) {
 }
 
 template<class Handler,int Index> struct InputGuard {
-    static inline REL::Relocation<bool(*)(Handler*,RE::InputEvent*)> original;
+    static inline fc::HookPublication<bool(*)(Handler*,RE::InputEvent*)> original;
     static bool canProcess(Handler* self,RE::InputEvent* event) {
+        const auto prior=original.get();
+        if(!prior)return false;
+        if(!ready)return prior(self,event);
         if(traversal.active()) {
 
-            if(event) if(auto button=event->AsButtonEvent();button&&button->IsUp()) return original(self,event);
+            if(event) if(auto button=event->AsButtonEvent();button&&button->IsUp()) return prior(self,event);
             return false;
         }
-        return original(self,event);
+        return prior(self,event);
     }
-    static void install(REL::VariantID table) {
+    static bool install(REL::VariantID table) {
         REL::Relocation<std::uintptr_t> vtable{table};
-        original=vtable.write_vfunc(fc::runtime::inputFilterSlot,canProcess);
+        return fc::runtime::installVfunc(vtable.address(),fc::runtime::inputFilterSlot,canProcess,original);
     }
 };
 
 struct AttachedSpaceGuard {
-    static inline REL::Relocation<void(*)(RE::BSWin32KeyboardDevice*,float)> original;
+    static inline fc::HookPublication<void(*)(RE::BSWin32KeyboardDevice*,float)> original;
     static void process(RE::BSWin32KeyboardDevice* keyboard,float dt) {
-        original(keyboard,dt);
+        const auto prior=original.get();
+        if(!prior)return;
+        prior(keyboard,dt);
+        if(!ready)return;
         fc::settingsMenuKeyboardSample(keyboard->GetRuntimeData().curState);
         const bool suspended=grabInputSuspended();
         if(suspended) {
@@ -1226,14 +1302,14 @@ struct AttachedSpaceGuard {
         });
         entryLookDiagnostics.queue(queue->GetQueueHead(),1);
     }
-    static void install() {
+    static bool install() {
         REL::Relocation<std::uintptr_t> table{RE::VTABLE_BSWin32KeyboardDevice[0]};
-        original=table.write_vfunc(fc::runtime::keyboardProcessSlot,process);
+        return fc::runtime::installVfunc(table.address(),fc::runtime::keyboardProcessSlot,process,original);
     }
 };
 
 struct GamepadGuard {
-    static inline REL::Relocation<void(*)(RE::BSPCGamepadDeviceHandler*,float)> original;
+    static inline fc::HookPublication<void(*)(RE::BSPCGamepadDeviceHandler*,float)> original;
     static RE::BSWin32GamepadDevice* device(RE::BSPCGamepadDeviceHandler* handler) {
         auto* delegate=handler?handler->GetRuntimeData().currentPCGamePadDelegate:nullptr;
         return delegate&&delegate->IsEnabled()?skyrim_cast<RE::BSWin32GamepadDevice*>(delegate):nullptr;
@@ -1243,7 +1319,10 @@ struct GamepadGuard {
         gamepadState.sampleXInput(raw.buttons,raw.leftTrigger,raw.rightTrigger,raw.thumbLX,raw.thumbLY,activeSettings.gamepad);
     }
     static void process(RE::BSPCGamepadDeviceHandler* handler,float dt) {
-        original(handler,dt);
+        const auto prior=original.get();
+        if(!prior)return;
+        prior(handler,dt);
+        if(!ready)return;
         auto* pad=device(handler);
         const bool available=pad!=nullptr;
         if(available!=gamepadAvailable) {
@@ -1280,19 +1359,37 @@ struct GamepadGuard {
     }
     static void install() {
         REL::Relocation<std::uintptr_t> table{RE::VTABLE_BSPCGamepadDeviceHandler[0]};
-        if(!fc::runtime::hookSite(table.address(),fc::runtime::gamepadPollSlot)) {
+        if(!fc::runtime::installVfunc(table.address(),fc::runtime::gamepadPollSlot,process,original)) {
             SKSE::log::error("Controller input hook unavailable; keyboard controls retained");return;
         }
-        original=table.write_vfunc(fc::runtime::gamepadPollSlot,process);
-        gamepadHookReady=true;gamepadState.reset();
+        gamepadHookReady=true;
     }
 };
 
 struct MenuListener:RE::BSTEventSink<RE::MenuOpenCloseEvent> {
+    std::uint64_t nextOverlayLog{};
     RE::BSEventNotifyControl ProcessEvent(const RE::MenuOpenCloseEvent* e,RE::BSTEventSource<RE::MenuOpenCloseEvent>*) override {
-        if(e&&e->opening&&e->menuName!="HUD Menu"&&e->menuName!="Cursor Menu") {
+        if(!e||!e->opening)return RE::BSEventNotifyControl::kContinue;
+        fc::MenuInputState state;
+        std::uint32_t flags{},context{};
+        bool available=false;
+        if(auto* ui=RE::UI::GetSingleton()) {
+            RE::BSSpinLockGuard lock(ui->processMessagesLock);
+            if(const auto menu=ui->GetMenu(e->menuName)) {
+                state=menuInputState(*menu);flags=menu->menuFlags.underlying();context=menu->inputContext.underlying();available=true;
+            }
+        }
+        const bool blocking=fc::menuInterruptsTraversal(e->menuName.c_str(),e->opening,state);
+        const bool relevant=traversal.active()||preparationStarted||jumpGrab.pending();
+        const auto now=GetTickCount64();
+        if(relevant&&(blocking||(diagnostics&&now>=nextOverlayLog))) {
+            SKSE::log::info("Climb menu event: name='{}' available={} flags=0x{:X} context={} blocking={} attached={}",
+                e->menuName.c_str(),available,flags,context,blocking,traversal.active());
+            if(!blocking)nextOverlayLog=now+250;
+        }
+        if(blocking) {
+            exitNativeDiagnostics.reset();
             traversalAudio.stop();
-
             inputState.reset();gamepadState.blockUntilButtonsReleased();wallRunEntryGate.reset();
             if(traversal.active())release(RE::PlayerCharacter::GetSingleton(),"menu opened");
             cancelGrabRequest();
@@ -1457,6 +1554,8 @@ void loadSettings() {
 }
 
 void initializeRuntime() {
+        static std::mutex initializationMutex;
+        std::scoped_lock initializationLock(initializationMutex);
         if(ready)return;
         if(!runtimeHooksReady())return;
         animationState=RE::TESDataHandler::GetSingleton()->LookupForm<RE::TESGlobal>(0x800,"FreeClimb.esp");
@@ -1467,23 +1566,27 @@ void initializeRuntime() {
         poses.library.configureThreepeat(traversal.cfg);
         SKSE::log::info("Threepeat animations: library={}, enabled={}, surfaceVariants={}",poses.library.hasThreepeat(),traversal.cfg.threepeatAnimations,traversal.cfg.surfaceActionVariants);
         REL::Relocation<std::uintptr_t> vtable{RE::VTABLE_PlayerCharacter[0]};
-        originalUpdate=vtable.write_vfunc(fc::runtime::actorUpdateSlot,update);
-        AttachedSpaceGuard::install();
+        if(!fc::runtime::installVfunc(vtable.address(),fc::runtime::actorUpdateSlot,update,originalUpdate)||
+            !AttachedSpaceGuard::install()) {
+            SKSE::log::error("Player or keyboard hook unavailable; native input retained");return;
+        }
         GamepadGuard::install();
-        InputGuard<RE::MovementHandler,0>::install(RE::VTABLE_MovementHandler[0]);
-        InputGuard<RE::JumpHandler,1>::install(RE::VTABLE_JumpHandler[0]);
-        InputGuard<RE::SneakHandler,2>::install(RE::VTABLE_SneakHandler[0]);
-        InputGuard<RE::SprintHandler,3>::install(RE::VTABLE_SprintHandler[0]);
-        InputGuard<RE::ReadyWeaponHandler,4>::install(RE::VTABLE_ReadyWeaponHandler[0]);
-        InputGuard<RE::AttackBlockHandler,5>::install(RE::VTABLE_AttackBlockHandler[0]);
-        InputGuard<RE::ActivateHandler,6>::install(RE::VTABLE_ActivateHandler[0]);
-        InputGuard<RE::TogglePOVHandler,7>::install(RE::VTABLE_TogglePOVHandler[0]);
-        InputGuard<RE::ShoutHandler,8>::install(RE::VTABLE_ShoutHandler[0]);
-        InputGuard<RE::AutoMoveHandler,9>::install(RE::VTABLE_AutoMoveHandler[0]);
-        InputGuard<RE::RunHandler,11>::install(RE::VTABLE_RunHandler[0]);
-        InputGuard<RE::ToggleRunHandler,12>::install(RE::VTABLE_ToggleRunHandler[0]);
+        if(!InputGuard<RE::MovementHandler,0>::install(RE::VTABLE_MovementHandler[0])||
+            !InputGuard<RE::JumpHandler,1>::install(RE::VTABLE_JumpHandler[0])||
+            !InputGuard<RE::SneakHandler,2>::install(RE::VTABLE_SneakHandler[0])||
+            !InputGuard<RE::SprintHandler,3>::install(RE::VTABLE_SprintHandler[0])||
+            !InputGuard<RE::ReadyWeaponHandler,4>::install(RE::VTABLE_ReadyWeaponHandler[0])||
+            !InputGuard<RE::AttackBlockHandler,5>::install(RE::VTABLE_AttackBlockHandler[0])||
+            !InputGuard<RE::ActivateHandler,6>::install(RE::VTABLE_ActivateHandler[0])||
+            !InputGuard<RE::TogglePOVHandler,7>::install(RE::VTABLE_TogglePOVHandler[0])||
+            !InputGuard<RE::ShoutHandler,8>::install(RE::VTABLE_ShoutHandler[0])||
+            !InputGuard<RE::AutoMoveHandler,9>::install(RE::VTABLE_AutoMoveHandler[0])||
+            !InputGuard<RE::RunHandler,11>::install(RE::VTABLE_RunHandler[0])||
+            !InputGuard<RE::ToggleRunHandler,12>::install(RE::VTABLE_ToggleRunHandler[0])) {
+            SKSE::log::error("Native input guard hook unavailable; climbing disabled");return;
+        }
         RE::UI::GetSingleton()->AddEventSink(&menuListener);
-        ready=true;settingsStatus="ready";settingsError.clear();refreshMenuSnapshot();SKSE::log::info("Hooks installed; data ready");
+        settingsStatus="ready";settingsError.clear();ready=true;refreshMenuSnapshot();SKSE::log::info("Hooks installed; data ready");
 }
 
 void onMessage(SKSE::MessagingInterface::Message* m) {

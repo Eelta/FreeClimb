@@ -17,7 +17,7 @@ class TraversalCapture {
 public:
     static constexpr std::size_t capacity=8192;
     static constexpr std::size_t maxTextBytes=4*1024*1024;
-    static constexpr std::string_view coreVersion="active35-5";
+    static constexpr std::string_view coreVersion="active35-6";
     enum class Kind {ray,body};
     struct Call {
         Kind kind=Kind::ray;

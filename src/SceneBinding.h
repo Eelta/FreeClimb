@@ -29,8 +29,23 @@ inline bool engineOwnedEquipmentName(std::string_view name,std::span<const std::
     return false;
 }
 
+inline bool engineOwnedMagicTrack(std::size_t i,std::span<const std::string> names,std::span<const int> parents) {
+    struct Leaf {std::size_t index;std::string_view name;int parent;};
+    constexpr std::array<Leaf,4> magic={Leaf{46,"MagicEffectsNode",24},{47,"NPC L MagicNode [LMag]",38},
+        {48,"NPC R MagicNode [RMag]",39},{49,"NPC Head MagicNode [Hmag]",36}};
+    if(names.size()!=99||parents.size()!=99||i>=99||std::find(parents.begin(),parents.end(),int(i))!=parents.end())return false;
+    return std::any_of(magic.begin(),magic.end(),[&](const Leaf& leaf){return i==leaf.index&&names[i]==leaf.name&&parents[i]==leaf.parent;});
+}
+
+inline bool engineOwnedAttachmentName(std::string_view name,std::span<const std::string> names,std::span<const int> parents) {
+    if(names.size()!=99||parents.size()!=99)return false;
+    for(std::size_t i=0;i<names.size();++i)
+        if(name==names[i]&&(engineOwnedEquipmentTrack(i,names,parents)||engineOwnedMagicTrack(i,names,parents)))return true;
+    return false;
+}
+
 inline bool engineOwnedTrack(std::size_t i,std::span<const std::string> names,std::span<const int> parents) {
-    return engineOwnedCameraTrack(i,names,parents)||engineOwnedEquipmentTrack(i,names,parents);
+    return engineOwnedCameraTrack(i,names,parents)||engineOwnedEquipmentTrack(i,names,parents)||engineOwnedMagicTrack(i,names,parents);
 }
 
 inline bool animationOnlyLeaf(std::size_t i,std::span<const std::string> names,std::span<const int> parents) {

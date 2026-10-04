@@ -1,42 +1,27 @@
 #pragma once
 #include "Pose.h"
+#include "PoseBlendEnvelope.h"
 
 namespace fc {
-inline float topRecoveryBegin(float seconds) {
-    return std::isfinite(seconds)&&seconds>0?std::max(.72f,1.f-.24f/seconds):1.f;
-}
-inline float topRecovery(Motion motion,float progress,float seconds) {
-    const float begin=topRecoveryBegin(seconds);
-    if(motion!=Motion::contextMantle||!std::isfinite(progress)||begin>=1.f||progress<=begin)return 0.f;
-    if(progress>=1.f)return 1.f;
-    return std::clamp(smooth((progress-begin)/(1.f-begin)),0.f,1.f);
-}
-
-class TopRecoveryGate {
-    bool attempted{},accepted{};
-    float seconds{};
-public:
-    void clear() {*this={};}
-    bool request(State state,float progress,float duration) {
-        const float begin=topRecoveryBegin(duration);
-        if(attempted||state!=State::mantle||!std::isfinite(progress)||begin>=1.f||progress<begin)return false;
-        seconds=duration;attempted=true;return true;
-    }
-    void resolve(bool success) {if(attempted)accepted=success;}
-    bool ready() const {return accepted;}
-    float weight(Motion motion,float progress) const {return accepted?topRecovery(motion,progress,seconds):0.f;}
-};
-
 class PoseHandoff {
     Pose entry,displayed,olderDisplayed,displayedSource,olderSource,exitSource,nativeExitSource;
-    PoseContinuation exitContinuation,nativeExitContinuation;
+    PoseContinuation entryContinuation,exitContinuation,nativeExitContinuation;
     float displayedTime{},olderTime{};
     float displayedRecovery{},exitWeight=1;
     std::uint64_t revision{};
-    bool exiting{},movingExit{},nativeExit{};
-    float nativeExitAge{};
+    bool exiting{},movingExit{},nativeExit{},seededEntry{},entryClockStarted{},nativeExitGuardReady{};
+    float nativeExitAge{},entryOrigin{},entryElapsed{};
+    std::array<bool,2> entryArmGuard{},nativeExitArmGuard{};
+    static bool finitePose(const Pose& pose) {
+        if(pose.size()!=99)return false;
+        for(const auto& bone:pose) {
+            const float norm=bone.q.dot(bone.q);
+            if(!bone.t.finite()||!bone.s.finite()||!std::isfinite(norm)||std::abs(norm-1.f)>.01f)return false;
+        }
+        return true;
+    }
 public:
-    static constexpr float nativeExitSeconds=.12f;
+    static constexpr float nativeExitSeconds=.24f;
     struct Output {
         Pose pose,source;
         float recovery{};
@@ -44,6 +29,29 @@ public:
         float sampleTime{};
     };
     void clear() {const auto next=revision+1;*this={};revision=next;}
+    void beginEntry(const Pose& current,const Pose& older,float interval) {
+        clear();
+        if(!finitePose(current))return;
+        entry=current;seededEntry=true;
+        if(older.size()==current.size()&&finitePose(older)&&std::isfinite(interval)&&interval>0)
+            entryContinuation.begin(current,older,interval);
+        else entryContinuation.begin(current,{},0);
+    }
+    void advanceEntrySource(float elapsed,const Library& library) {
+        if(!seededEntry||exiting||!std::isfinite(elapsed)||elapsed<0)return;
+        if(!entryClockStarted) {
+            entryOrigin=elapsed;entryClockStarted=true;
+            for(int hand=0;hand<2;++hand)entryArmGuard[hand]=library.armBendValid(entry,hand);
+            return;
+        }
+        const float age=elapsed-entryOrigin;
+        if(age<=entryElapsed)return;
+        auto candidate=entryContinuation.sample(age);
+        if(!finitePose(candidate))return;
+        for(int hand=0;hand<2;++hand)if(entryArmGuard[hand])library.guardArmBend(candidate,hand);
+        if(!finitePose(candidate))return;
+        entry=std::move(candidate);entryElapsed=age;
+    }
     bool hasOutput() const {return !displayed.empty();}
     float exitContribution() const {return exitWeight;}
     bool nativeExitActive() const {return nativeExit&&nativeExitAge<nativeExitSeconds;}
@@ -54,26 +62,31 @@ public:
         movingExit=continueMotion;
         if(movingExit)exitContinuation.begin(displayedSource,olderSource,displayedTime-olderTime);
 
-        nativeExit=smoothNativeTakeover&&!continueMotion;nativeExitAge=0;
+        nativeExit=smoothNativeTakeover&&!continueMotion;nativeExitAge=0;nativeExitGuardReady=false;nativeExitArmGuard={};
         if(nativeExit) {
             nativeExitSource=displayed;
             nativeExitContinuation.begin(displayed,olderDisplayed,displayedTime-olderTime);
         }
 
-        ++revision;exiting=true;return true;
+        ++revision;exiting=true;seededEntry=false;return true;
     }
-    void advanceExitSource(float elapsed,const Library& library,float acknowledgedNativeElapsed=-1) {
-        if(!exiting)return;
+    void advanceExitSource(float elapsed,const Library& library,float acknowledgedElapsed=-1) {
+        if(!exiting||!std::isfinite(acknowledgedElapsed))return;
+        const float outputElapsed=acknowledgedElapsed>=0?acknowledgedElapsed:elapsed;
+        if(!std::isfinite(outputElapsed)||outputElapsed<0)return;
         if(movingExit) {
-            exitSource=exitContinuation.sample(elapsed);
+            exitSource=exitContinuation.sample(outputElapsed);
             library.guardArmBends(exitSource);
         }
-        const float nativeElapsed=acknowledgedNativeElapsed>=0?acknowledgedNativeElapsed:elapsed;
-        if(nativeExit&&std::isfinite(nativeElapsed)) {
-            nativeExitAge=std::max(nativeExitAge,std::max(0.f,nativeElapsed));
+        if(nativeExit) {
+            if(!nativeExitGuardReady) {
+                for(int hand=0;hand<2;++hand)nativeExitArmGuard[hand]=library.armBendValid(nativeExitSource,hand);
+                nativeExitGuardReady=true;
+            }
+            nativeExitAge=std::max(nativeExitAge,std::max(0.f,outputElapsed));
             if(nativeExitAge<nativeExitSeconds) {
                 nativeExitSource=nativeExitContinuation.sample(nativeExitAge);
-                if(nativeExitAge>0)library.guardArmBends(nativeExitSource);
+                if(nativeExitAge>0)for(int hand=0;hand<2;++hand)if(nativeExitArmGuard[hand])library.guardArmBend(nativeExitSource,hand);
             }
         }
     }
@@ -81,14 +94,14 @@ public:
         if(native.size()!=authored.size())return {};
         weight=std::clamp(weight,0.f,1.f);recovery=std::clamp(recovery,0.f,1.f);
         if(entry.empty())entry=native;
+        if(weight>=1.f)seededEntry=false;
         Output result;result.source=native;result.pose=native;
         result.revision=revision;
         result.sampleTime=sampleTime;
-        result.recovery=exiting?1-weight*exitWeight:recovery;
+        result.recovery=nativeExit?PoseBlendEnvelope::exitRecovery(nativeExitAge/nativeExitSeconds):exiting?1-weight*exitWeight:recovery;
         for(std::size_t i=0;i<native.size();++i) {
-            result.source[i]=exiting?exitSource[i]:blend(entry[i],authored[i],weight);
+            result.source[i]=nativeExit?nativeExitSource[i]:exiting?exitSource[i]:blend(entry[i],authored[i],weight);
             result.pose[i]=blend(result.source[i],native[i],result.recovery);
-            if(nativeExitActive())result.pose[i]=blend(nativeExitSource[i],result.pose[i],smooth(nativeExitAge/nativeExitSeconds));
         }
         return result;
     }

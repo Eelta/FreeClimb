@@ -4,19 +4,26 @@
 #include "TrackView.h"
 #include "SceneBinding.h"
 #include "AnimationSkeletonBinding.h"
+#include "AnimationSkeletonLayout.h"
 #include "PoseHealth.h"
 #include "PoseBlendEnvelope.h"
+#include "PoseFrameClock.h"
+#include "ExitPoseTrace.h"
 #include "PoseHandoff.h"
+#include "NativePoseHistory.h"
 #include "YawFrame.h"
 #include "FlatSkeleton.h"
 #include "ScenePropagation.h"
 #include "LateWorldUpdate.h"
+#include "HookPublication.h"
 #include <type_traits>
 #include "SkinAuditBudget.h"
 #include <mutex>
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <format>
+#include <iterator>
 #include <intrin.h>
 
 namespace fc {
@@ -74,10 +81,7 @@ private:
         std::shared_ptr<const OutputRig> outputRig;
         RE::NiPointer<RE::NiAVObject> actorRoot;
         RE::hkRefPtr<const RE::hkaSkeleton> skeleton;
-        const RE::hkaBone* bones{};
-        const std::int16_t* parents{};
-        const RE::hkQsTransform* references{};
-        int boneCount{};
+        AnimationSkeletonLayout<RE::hkaBone,RE::hkQsTransform> skeletonData;
         AnimationSkeletonBinding animation;
         FlatBoneEntry* flatData{};
         std::size_t flatCount{};
@@ -103,8 +107,13 @@ private:
     std::uint32_t reusedBindings{};
     Pose published;
     PoseHandoff handoff;
-    TopRecoveryGate topEndpoint;
-    float recovery{},exitAge{},sampleTime{};
+    NativePoseHistory nativeHistory;
+    bool entryPending{};
+    std::uint64_t nativeFrame{};
+    std::uint32_t pendingScenePasses{};
+    float exitAge{},sampleTime{};
+    std::uint64_t exitStartedAt{};
+    std::uint32_t exitAppliedBase{},exitTicks{},exitSteps{};
     float publishedYaw{},displayedYaw{};
     bool hasWallFrame{},hasDisplayedYaw{};
     Orientation orientation;
@@ -112,9 +121,13 @@ private:
     Motion publishedMotion=Motion::none;
     std::uint64_t generation{},lastSuccessfulOutput{};
     PoseBlendEnvelope envelope;
+    PoseFrameClock exitClock;
+    ExitPoseTrace exitTrace;
+    const RE::BSTimer* frameTimer{};
     bool fading{},ownsPose{},nativeFootIK{};
     std::atomic<std::uint64_t> lastCallback{};
-    static inline PoseRuntime* instance{};
+    static inline std::atomic<PoseRuntime*> instance{};
+    static inline std::mutex installMutex;
     static inline thread_local bool inside{};
     std::atomic<const RE::NiAVObject*> target{};
     static bool preflightHookSites() {
@@ -126,7 +139,7 @@ private:
             for(const auto slot:slots) {
                 if(tableIndex==3&&slot!=sceneWorldSlot())continue;
                 if(!runtime::hookSite(table.address(),slot)) {
-                    SKSE::log::error("Pose virtual hook preflight failed: table={} slot={}; no pose hooks installed",tableIndex,slot);return false;
+                    SKSE::log::error("Pose virtual hook preflight failed: table={} slot={}; pose output remains disabled",tableIndex,slot);return false;
                 }
             }
         }
@@ -134,59 +147,66 @@ private:
     }
     using Downward=void(*)(RE::NiNode*,RE::NiUpdateData&,std::uint32_t);
     template<int Table,int Pass> struct Hook {
-        static inline REL::Relocation<Downward> original;
+        static inline HookPublication<Downward> original;
         static void call(RE::NiNode* node,RE::NiUpdateData& data,std::uint32_t flags) {
-            auto* self=instance;
-            if(!self||self->target.load()!=node||inside){original(node,data,flags);return;}
+            const auto prior=original.get();if(!prior)return;
+            auto* self=instance.load(std::memory_order_acquire);
+            if(!self||self->target.load()!=node||inside){prior(node,data,flags);return;}
             inside=true;
-            self->apply(node,data,static_cast<ScenePass>(Pass),[&](RE::NiUpdateData& update){original(node,update,flags);});inside=false;
+            self->apply(node,data,static_cast<ScenePass>(Pass),[&](RE::NiUpdateData& update){prior(node,update,flags);});inside=false;
         }
-        static void install() {
-
+        static bool install() {
             REL::Relocation<std::uintptr_t> table{Table==0?RE::VTABLE_NiNode[0]:
                 Table==1?RE::VTABLE_BSFadeNode[0]:RE::VTABLE_BSFlattenedBoneTree[0]};
-            original=table.write_vfunc(scenePassSlot(static_cast<ScenePass>(Pass)),call);
+            return runtime::installVfunc(table.address(),scenePassSlot(static_cast<ScenePass>(Pass)),call,original);
         }
     };
     using TransformOnly=void(*)(RE::NiNode*,RE::NiUpdateData&);
     template<int Table> struct TransformHook {
-        static inline REL::Relocation<TransformOnly> original;
+        static inline HookPublication<TransformOnly> original;
         static void call(RE::NiNode* node,RE::NiUpdateData& data) {
-            auto* self=instance;
-            if(!self||self->target.load()!=node||inside){original(node,data);return;}
+            const auto prior=original.get();if(!prior)return;
+            auto* self=instance.load(std::memory_order_acquire);
+            if(!self||self->target.load()!=node||inside){prior(node,data);return;}
             inside=true;
-            self->apply(node,data,ScenePass::transformOnly,[&](RE::NiUpdateData& update){original(node,update);});inside=false;
+            self->apply(node,data,ScenePass::transformOnly,[&](RE::NiUpdateData& update){prior(node,update);});inside=false;
         }
-        static void install() {
+        static bool install() {
             REL::Relocation<std::uintptr_t> table{Table==0?RE::VTABLE_NiNode[0]:
                 Table==1?RE::VTABLE_BSFadeNode[0]:RE::VTABLE_BSFlattenedBoneTree[0]};
-            original=table.write_vfunc(scenePassSlot(ScenePass::transformOnly),call);
+            return runtime::installVfunc(table.address(),scenePassSlot(ScenePass::transformOnly),call,original);
         }
     };
     using WorldData=void(*)(RE::NiAVObject*,RE::NiUpdateData*);
     template<int Table> struct WorldHook {
-        static inline REL::Relocation<WorldData> original;
+        static inline HookPublication<WorldData> original;
         static void call(RE::NiAVObject* node,RE::NiUpdateData* data) {
-            auto* self=instance;
-            if(!self||inside||!self->target.load()){original(node,data);return;}
-            self->lateWorld(node,data,original.get(),_ReturnAddress());
+            const auto prior=original.get();if(!prior)return;
+            auto* self=instance.load(std::memory_order_acquire);
+            if(!self||inside||!self->target.load()){prior(node,data);return;}
+            self->lateWorld(node,data,prior,_ReturnAddress());
         }
-        static void install() {
+        static bool install() {
             REL::Relocation<std::uintptr_t> table{Table==0?RE::VTABLE_NiNode[0]:
                 Table==1?RE::VTABLE_BSFadeNode[0]:Table==2?RE::VTABLE_BSFlattenedBoneTree[0]:RE::VTABLE_NiAVObject[0]};
-            original=table.write_vfunc(sceneWorldSlot(),call);
+            return runtime::installVfunc(table.address(),sceneWorldSlot(),call,original);
         }
     };
     using SkinGenerator=void(*)(RE::NiSkinInstance*,const RE::NiTransform*);
     struct SkinHook {
-        static inline REL::Relocation<SkinGenerator> original;
+        static inline std::atomic<SkinGenerator> original{};
         static inline const std::uint32_t* frame{};
+        static inline std::mutex mutex;
+        static inline bool installed{};
         static void call(RE::NiSkinInstance* skin,const RE::NiTransform* geometryWorld) {
-            auto* self=instance;
-            if(!self){original(skin,geometryWorld);return;}
-            self->observeSkin(skin,geometryWorld,original.get(),*frame);
+            const auto prior=original.load(std::memory_order_acquire);if(!prior)return;
+            auto* self=instance.load(std::memory_order_acquire);
+            if(!self){prior(skin,geometryWorld);return;}
+            self->observeSkin(skin,geometryWorld,prior,*frame);
         }
         static bool install() {
+            std::scoped_lock lock(mutex);
+            if(installed)return true;
             if(!runtime::isSE()) {
                 SKSE::log::info("Final skin observer disabled for this runtime; scene output and late-world protection remain active");return false;
             }
@@ -204,7 +224,9 @@ private:
             }
             frame=reinterpret_cast<const std::uint32_t*>(frameAddress);
             SKSE::AllocTrampoline(32);
-            original=SKSE::GetTrampoline().write_call<5>(callsite,call);
+            original.store(reinterpret_cast<SkinGenerator>(function),std::memory_order_release);
+            SKSE::GetTrampoline().write_call<5>(callsite,call);
+            installed=true;
             return true;
         }
     };
@@ -245,18 +267,18 @@ private:
         binding.reference=library.rig.source().empty()?library.rest:library.rig.source();
         binding.animationReference=binding.reference;
         for(std::size_t i=0;i<99;++i)if(binding.animation.indices[i]>=0)
-            binding.animationReference[i]=read(binding.references[binding.animation.indices[i]]);
-        const auto equipment=[&](const RE::BSFixedString& name) {
-            return name.c_str()&&engineOwnedEquipmentName(name.c_str(),library.names,library.parents);
+            binding.animationReference[i]=read(binding.skeletonData.references[binding.animation.indices[i]]);
+        const auto attachment=[&](const RE::BSFixedString& name) {
+            return name.c_str()&&engineOwnedAttachmentName(name.c_str(),library.names,library.parents);
         };
         bool valid=true;int failed=-1;const char* reason="unsupported structural transform";
         const auto fail=[&](std::size_t i,const char* message){valid=false;failed=int(i);reason=message;};
         binding.scene.each([&](std::size_t i,const auto& slot) {
             if(!valid)return;
             const int index=binding.animation.indices[i];
-            if(index<0||index>=binding.boneCount){fail(i,"scene bone has no animation mapping");return;}
-            binding.selected[i]=true;binding.locked[i]=binding.bones[index].lockTranslation;
-            binding.reference[i]=PoseRig<Pose>::structuralReference(i,read(slot.local()),read(binding.references[index]),binding.locked[i]);
+            if(index<0||index>=binding.skeletonData.boneCount){fail(i,"scene bone has no animation mapping");return;}
+            binding.selected[i]=true;binding.locked[i]=binding.skeletonData.bones[index].lockTranslation;
+            binding.reference[i]=PoseRig<Pose>::structuralReference(i,read(slot.local()),read(binding.skeletonData.references[index]),binding.locked[i]);
             binding.nodeParents[i]=slot.node?slot.node->parent:nullptr;
             if(slot.flat)for(std::size_t j=0;j<entries->size();++j)if(&(*entries)[j].local==slot.flat) {
                 binding.flatIndices[i]=int(j);binding.flatParents[i]=(*entries)[j].parentIndex;break;
@@ -271,7 +293,7 @@ private:
                 auto* ancestor=slot.node->parent;
                 for(unsigned depth=0;ancestor&&ancestor!=parent.node.get()&&depth<128;++depth) {
                     if(ancestor==binding.root.get()){fail(i,"mapped parent is not an actual ancestor");return;}
-                    if(equipment(ancestor->name)){fail(i,"equipment attachment is an ancestor of a body bone");return;}
+                    if(attachment(ancestor->name)){fail(i,"engine-owned attachment is an ancestor of a body bone");return;}
                     bool mapped=false;
                     binding.scene.each([&](std::size_t,const auto& entry){mapped|=entry.node.get()==ancestor;});
                     if(mapped){fail(i,"actual ancestor order differs from animation hierarchy");return;}
@@ -284,8 +306,8 @@ private:
                     if(index<0){found=parent.node==binding.root;break;}
                     if(std::size_t(index)>=entries->size()){fail(i,"flattened parent index is invalid");return;}
                     auto& entry=(*entries)[index];
-                    if(equipment(entry.nodeName)||(entry.node&&equipment(entry.node->name))) {
-                        fail(i,"equipment attachment is an ancestor of a body bone");return;
+                    if(attachment(entry.nodeName)||(entry.node&&attachment(entry.node->name))) {
+                        fail(i,"engine-owned attachment is an ancestor of a body bone");return;
                     }
                     if((entry.node&&entry.node==parent.node.get())||&entry.local==parent.flat){found=true;break;}
                     path.push_back(entry.node?SceneSlot{RE::NiPointer<RE::NiAVObject>(entry.node),nullptr}:
@@ -313,9 +335,7 @@ private:
     bool currentRig(const Binding& binding,bool verifyMembers=false) {
         if(!binding.graph->characterInstance.setup||binding.graph->characterInstance.setup->animationSkeleton.get()!=binding.skeleton.get())return rejectRig(RigIssue::graph);
         const auto* skeleton=binding.skeleton.get();
-        if(skeleton->bones.data()!=binding.bones||skeleton->bones.size()!=binding.boneCount||
-            skeleton->parentIndices.data()!=binding.parents||skeleton->parentIndices.size()!=binding.boneCount||
-            skeleton->referencePose.data()!=binding.references||skeleton->referencePose.size()!=binding.boneCount)return rejectRig(RigIssue::arrays);
+        if(animationSkeletonLayout(*skeleton)!=binding.skeletonData)return rejectRig(RigIssue::arrays);
         if(!sameFlatStorage(binding.root.get(),binding.flatData,binding.flatCount))return rejectRig(RigIssue::storage);
         if(auto* player=RE::PlayerCharacter::GetSingleton();!player||player->Get3D(false)!=binding.actorRoot.get())return rejectRig(RigIssue::model);
         auto* ancestor=binding.root.get();
@@ -334,10 +354,10 @@ private:
             if(!valid)return;
             const auto fail=[&](RigIssue issue){valid=rejectRig(issue,int(i));};
             const int index=binding.animation.indices[i];
-            if(index<0||index>=binding.boneCount||binding.parents[index]!=binding.animation.parents[i]||
-                binding.bones[index].lockTranslation!=binding.locked[i]){fail(RigIssue::hierarchy);return;}
-            if(verifyMembers&&(!binding.bones[index].name.c_str()||
-                !binding.animation.current(i,{binding.bones[index].name.c_str(),binding.parents[index]}))){fail(RigIssue::hierarchy);return;}
+            if(index<0||index>=binding.skeletonData.boneCount||binding.skeletonData.parents[index]!=binding.animation.parents[i]||
+                binding.skeletonData.bones[index].lockTranslation!=binding.locked[i]){fail(RigIssue::hierarchy);return;}
+            if(verifyMembers&&(!binding.skeletonData.bones[index].name.c_str()||
+                !binding.animation.current(i,{binding.skeletonData.bones[index].name.c_str(),binding.skeletonData.parents[index]}))){fail(RigIssue::hierarchy);return;}
             if(slot.node) {
                 if(slot.node->parent!=binding.nodeParents[i]){fail(RigIssue::hierarchy);return;}
                 if(verifyMembers&&slot.node->parent) {
@@ -347,7 +367,7 @@ private:
                 }
             } else if(binding.flatIndices[i]<0||binding.flatData[binding.flatIndices[i]].parentIndex!=binding.flatParents[i]){fail(RigIssue::hierarchy);return;}
             if(!validSceneTransform(slot.local())){fail(RigIssue::transform);return;}
-            if(!PoseRig<Pose>::currentStructure(read(slot.local()),read(binding.references[index]),binding.animationReference[i]))fail(RigIssue::reference);
+            if(!PoseRig<Pose>::currentStructure(read(slot.local()),read(binding.skeletonData.references[index]),binding.animationReference[i]))fail(RigIssue::reference);
         });
         return valid;
     }
@@ -511,9 +531,43 @@ private:
         if(rigInvalidated.load()||!currentRig(bindings[0])) {
             invalidateRig();lock.unlock();original(data);return;
         }
+        const bool preparing=!ownsPose&&!fading;
+        if(preparing) {
+            const auto epoch=generation;
+            const auto frame=nativeFrame;
+            const auto sceneRoot=bindings[0].root;
+            lock.unlock();original(data);lock.lock();
+            if(epoch!=generation||bindings.empty()||bindings[0].root!=sceneRoot){++retiredOutputs;return;}
+            if(rigInvalidated.load()||!currentRig(bindings[0])){invalidateRig();return;}
+            const auto now=GetTickCount64();
+            Pose native=library.rest;
+            bindings[0].scene.each([&](std::size_t i,const auto& bone){native[i]=library.rig.toEffective(i,read(bone.local()));});
+            const auto parentRotation=node->parent?read(node->parent->world).q:Quat{};
+            if(nativeHistory.capture(native,parentRotation,now,frame))lastCallback=now;
+            return;
+        }
         lastCallback=GetTickCount64();
+        if(!overlaysPose(pass,(ownsPose||fading)&&published.size()==99)){lock.unlock();original(data);return;}
+        ExitPoseTrace::Frame traceFrame;
+        traceFrame.timer=frameTimer!=nullptr;
+        if(fading&&frameTimer) {
+            const volatile auto* timer=frameTimer;
+            const auto stamp=timer->runTimeMS;
+            const auto delta=timer->delta,realDelta=timer->realTimeDelta;
+            const bool paused=timer->pauseCount!=0;
+            const bool stable=stamp==timer->runTimeMS;
+            traceFrame.stamp=stamp;traceFrame.delta=delta;traceFrame.realDelta=realDelta;
+            traceFrame.paused=paused;traceFrame.stable=stable;
+            if(stable) {
+                const auto before=envelope.elapsedExitSeconds();
+                traceFrame.clockDt=exitClock.sample(stamp,delta,realDelta,paused);
+                envelope.advanceExit(applied.load(),traceFrame.clockDt);
+                if(envelope.elapsedExitSeconds()>before)++exitSteps;
+                handoff.advanceExitSource(exitAge,library,envelope.elapsedExitSeconds());
+            }
+        }
         const float weight=envelope.weight();
-        if(!overlaysPose(pass,weight>0&&published.size()==99)){lock.unlock();original(data);return;}
+        const bool terminal=fading&&weight<=0;
         auto& binding=bindings[0];++matched;
         std::array<RE::NiTransform,99> saved;
         std::array<RE::NiTransform,99> written;
@@ -535,15 +589,26 @@ private:
         const WallYawFrame frame(parentRotation,outputYaw);
 
         if(outputHasWallFrame)native[0]=frame.toWall(native[0]);
-        const auto output=handoff.evaluate(native,published,weight,recovery,sampleTime);
+        if(entryPending) {
+            if(outputHasWallFrame)if(const auto seed=nativeHistory.seed(outputYaw,GetTickCount64()))
+                handoff.beginEntry(seed->current,seed->older,seed->seconds);
+            entryPending=false;nativeHistory.clear();
+        }
+        handoff.advanceEntrySource(sampleTime,library);
+        const auto output=handoff.evaluate(native,published,weight,0,sampleTime);
         const auto outputMotion=publishedMotion;
         const auto& desired=output.pose;
+        traceFrame.wallMs=lastCallback.load()-exitStartedAt;traceFrame.nativeFrame=nativeFrame;
+        traceFrame.applied=applied.load();traceFrame.seconds=envelope.elapsedExitSeconds();
+        traceFrame.weight=weight;traceFrame.recovery=output.recovery;
+        traceFrame.pass=unsigned(pass);traceFrame.terminal=terminal;
+        auto traceSample=traceOutput&&fading?exitTrace.capture(traceFrame,native,desired):ExitPoseTrace::Snapshot{};
         const std::array<float,2> outputUpperRoll{
             sideRunUpperRoll(library,desired,0)*57.2957795f,
             sideRunUpperRoll(library,desired,1)*57.2957795f};
         binding.scene.each([&](std::size_t i,const auto& bone) {
             const auto local=library.rig.toLocal(i,desired[i]);
-            write(bone.local(),i==0&&outputHasWallFrame?frame.toParent(local):local);
+            if(!terminal)write(bone.local(),i==0&&outputHasWallFrame?frame.toParent(local):local);
             written[i]=bone.local();
             if(bone.node) {
                 bone.node->GetFlags()=static_cast<RE::NiAVObject::Flag>(ownedSceneNodeFlags(bone.node->GetFlags().underlying()));
@@ -562,6 +627,8 @@ private:
         const auto outputGeneration=generation;
 
         const auto sceneRoot=binding.root;
+        if(terminal)acceptedScene.store(nullptr);
+        ++pendingScenePasses;
         lock.unlock();
         const auto propagationStarted=std::chrono::steady_clock::now();
 
@@ -570,21 +637,28 @@ private:
         const bool repairedSelectedFlag=update.flags!=data.flags;
         original(update);
         if(!sameFlatStorage(sceneRoot.get(),outputRig->flatData,outputRig->flatCount)) {
-            scene.each([&](std::size_t i,const auto& bone){if(bone.node){bone.node->local=saved[i];bone.node->GetFlags()=savedFlags[i];}});
+            scene.each([&](std::size_t i,const auto& bone){if(bone.node){if(!terminal)bone.node->local=saved[i];bone.node->GetFlags()=savedFlags[i];}});
             for(std::size_t i=0;i<bridges.size();++i)bridges[i]->GetFlags()=bridgeFlags[i];
-            lock.lock();if(outputGeneration==generation){rejectRig(RigIssue::storage);invalidateRig();}else ++retiredOutputs;
+            lock.lock();--pendingScenePasses;
+            if(outputGeneration==generation){rejectRig(RigIssue::storage);invalidateRig();}else ++retiredOutputs;
             return;
         }
 
         const bool flatRefreshed=!refreshFlatAfterPass(pass,true)||refreshFlatWorld(sceneRoot.get());
+        if(terminal)scene.each([&](std::size_t i,const auto& bone){written[i]=bone.local();});
         OutputAudit audit;
         if(!flatRefreshed){audit.worldMismatches=1;audit.firstWorldMismatch=0;}
         audit.pass=pass;
         audit.motion=outputMotion;audit.layerWeight=weight;audit.nativeRecovery=output.recovery;
         audit.upperRollDegrees=outputUpperRoll;
         audit.propagationMs=std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-propagationStarted).count();
-        if(traceOutput)scene.each([&](std::size_t i,const auto& bone) {
+        const bool traceAudit=traceOutput;
+        if(!traceAudit)traceSample.valid=false;
+        if(traceAudit)scene.each([&](std::size_t i,const auto& bone) {
             const auto& expected=written[i];const auto& actual=bone.local();
+            if(traceSample.valid)if(const auto slot=std::find(ExitPoseTrace::tracks.begin(),ExitPoseTrace::tracks.end(),i);slot!=ExitPoseTrace::tracks.end()) {
+                traceSample.output[std::size_t(slot-ExitPoseTrace::tracks.begin())]=read(actual);
+            }
             float matrixDelta=0;
             for(int row=0;row<3;++row)for(int column=0;column<3;++column)
                 matrixDelta=std::max(matrixDelta,std::abs(expected.rotate.entry[row][column]-actual.rotate.entry[row][column]));
@@ -636,12 +710,24 @@ private:
                     if((actual-expected).length()>.002f&&(actual-previous).length()>.002f)restored.translate=current.translate;
                 }
             }
-            bone.local()=restored;if(bone.node)bone.node->GetFlags()=savedFlags[i];
+            if(!terminal)bone.local()=restored;
+            if(bone.node)bone.node->GetFlags()=savedFlags[i];
         });
         for(std::size_t i=0;i<bridges.size();++i)bridges[i]->GetFlags()=bridgeFlags[i];
         lock.lock();
+        --pendingScenePasses;
 
         if(outputGeneration!=generation){++retiredOutputs;return;}
+        if(traceOutput&&traceSample.valid) {
+            for(std::size_t i=0;i<ExitPoseTrace::tracks.size();++i) {
+                const auto track=ExitPoseTrace::tracks[i];
+                const auto local=library.rig.toEffective(track,traceSample.output[i]);
+                traceSample.output[i]=track==0&&outputHasWallFrame?frame.toWall(local):local;
+            }
+            exitTrace.commit(traceSample,audit.overwrittenBones,audit.worldMismatches,
+                audit.overwrittenAngle,audit.overwrittenDistance,audit.worldAngle,audit.worldDistance);
+        }
+        envelope.acknowledgeExit(false);
         if(structureChanged||rigInvalidated.load()){invalidateRig();return;}
         audit.worldMismatchFrames=outputAudit.worldMismatchFrames+(audit.worldMismatches?1:0);
         audit.transformPasses=outputAudit.transformPasses+(pass==ScenePass::transformOnly?1:0);
@@ -657,11 +743,18 @@ private:
                 unsigned(pass),audit.worldMismatches,audit.firstWorldMismatch,audit.worldAngle,audit.worldDistance);
             ++rejected;outputAudit=audit;return;
         }
-        if(!handoff.consumed(output)){++retiredOutputs;return;}
-        auto accepted=std::make_shared<AcceptedScene>();
-        accepted->rig=outputRig;accepted->locals=written;accepted->wallRoot=desired[0];
-        accepted->yaw=outputYaw;accepted->wallFrame=outputHasWallFrame;accepted->epoch=outputGeneration;
-        acceptedScene.store(std::move(accepted));
+        if(terminal)envelope.acknowledgeExit(true);
+        if(!terminal&&fading&&envelope.weight()<=0) {
+            acceptedScene.store(nullptr);++retiredOutputs;return;
+        }
+        if(!terminal) {
+            if(!handoff.consumed(output)){++retiredOutputs;return;}
+            auto accepted=std::make_shared<AcceptedScene>();
+            accepted->rig=outputRig;accepted->locals=written;accepted->wallRoot=desired[0];
+            accepted->yaw=outputYaw;accepted->wallFrame=outputHasWallFrame;accepted->epoch=outputGeneration;
+            acceptedScene.store(std::move(accepted));
+        } else if(traceOutput&&!envelope.exitComplete(applied.load()))SKSE::log::info("Native pose handoff completed; playerSeconds={:.3f} blendSeconds={:.3f} wallMs={} ticks={} outputs={} steps={} clock={}; scene propagation verified before releasing binding",
+            exitAge,envelope.elapsedExitSeconds(),GetTickCount64()-exitStartedAt,exitTicks,applied.load()-exitAppliedBase+1,exitSteps,frameTimer?"scene":"player-fallback");
         displayedYaw=outputYaw;hasDisplayedYaw=outputHasWallFrame;
         lastSuccessfulOutput=GetTickCount64();
         audit.sampledAt=lastSuccessfulOutput;outputAudit=audit;
@@ -676,14 +769,36 @@ private:
         }
         nativeFootIK=true;
     }
-    void clearLocked() {
+    void finishExitTraceLocked(const char* reason) {
+        if(!traceOutput){exitTrace.reset();return;}
+        if(!exitTrace.finish())return;
+        std::string report;report.reserve(ExitPoseTrace::capacity*4096);
+        std::format_to(std::back_inserter(report),"Exit pose trace: reason={} samples={} observedFrames={} capacity={}; tracks=0,4,5,8,11,24,26,28,29,31,32,36,38,39; changes=track:nativeRadians/nativeLocalDistance/outputRadians/outputLocalDistance; same wall frame, no world solve",
+            reason,exitTrace.samples().size(),exitTrace.frames(),ExitPoseTrace::capacity);
+        for(const auto& record:exitTrace.samples()) {
+            const auto& f=record.frame;
+            std::format_to(std::back_inserter(report),"\nExit pose sample: wallMs={} previousMs={}/{} applied={} nativeFrame={} pass={} terminal={} timer={} stamp={} delta={:.6f} realDelta={:.6f} paused={} stable={} clockDt={:.6f} seconds={:.6f} weight={:.6f} recovery={:.6f}; overwrites={} angle={:.4f} distance={:.3f} worldMismatch={} angle={:.4f} distance={:.3f};",
+                f.wallMs,record.previousWallMs,record.previous,f.applied,f.nativeFrame,f.pass,f.terminal,f.timer,f.stamp,f.delta,f.realDelta,f.paused,f.stable,
+                f.clockDt,f.seconds,f.weight,f.recovery,record.overwritten,record.overwrittenAngle,record.overwrittenDistance,record.worldMismatches,record.worldAngle,record.worldDistance);
+            for(std::size_t i=0;i<ExitPoseTrace::tracks.size();++i) {
+                const auto& d=record.changes[i];
+                std::format_to(std::back_inserter(report)," {}:{:.4f}/{:.3f}/{:.4f}/{:.3f}",ExitPoseTrace::tracks[i],d.nativeAngle,d.nativeDistance,d.outputAngle,d.outputDistance);
+            }
+        }
+        SKSE::log::info("{}",report);
+    }
+    void clearLocked(const char* reason="binding cleared") {
+        finishExitTraceLocked(reason);
         acceptedScene.store(nullptr);
         ++generation;lastSuccessfulOutput=0;
         target=nullptr;
         restoreFootIKLocked();
-        bindings.clear();published.clear();handoff.clear();recovery=exitAge=sampleTime=0;reusedBindings=0;
+        bindings.clear();published.clear();handoff.clear();exitAge=sampleTime=0;reusedBindings=0;
+        nativeHistory.clear();entryPending=false;
+        exitTrace.reset();
+        exitStartedAt=0;exitAppliedBase=exitTicks=exitSteps=0;
         if(!library.rig.source().empty())library.clearRig();
-        topEndpoint.clear();
+        exitClock.clear();
         publishedYaw=displayedYaw=0;hasWallFrame=hasDisplayedYaw=false;orientation={};
         publishedMotion=Motion::none;outputAudit={};
         envelope.clear();fading=ownsPose=nativeFootIK=false;lastCallback=0;
@@ -700,18 +815,15 @@ private:
             if(std::string(g->projectName.c_str()).find("FirstPerson")!=std::string::npos)continue;
             auto* skeleton=g->characterInstance.setup->animationSkeleton.get();
             if(!skeleton||!runtime::readable(reinterpret_cast<std::uintptr_t>(skeleton),sizeof(*skeleton)))continue;
-            const auto* bones=skeleton->bones.data();
-            const int count=skeleton->bones.size();
-            const auto* parents=skeleton->parentIndices.data();
-            const auto* references=skeleton->referencePose.data();
-            if(!bones||!parents||!references||count<=0||count>1024||skeleton->parentIndices.size()!=count||skeleton->referencePose.size()!=count||
-                !runtime::readable(reinterpret_cast<std::uintptr_t>(bones),count*sizeof(*bones))||
-                !runtime::readable(reinterpret_cast<std::uintptr_t>(parents),count*sizeof(*parents))||
-                !runtime::readable(reinterpret_cast<std::uintptr_t>(references),count*sizeof(*references))) {
+            const auto layout=animationSkeletonLayout(*skeleton);
+            const auto* bones=layout.bones;
+            const int count=layout.boneCount;
+            const auto* parents=layout.parents;
+            if(!layout.valid(runtime::readable)) {
                 bindingFailure="invalid animation skeleton layout";
                 SKSE::log::warn("Pose binding rejected: {} (project={}, bones={}, parents={}, references={}, boneData={}, parentData={}, referenceData={})",
-                    bindingFailure,g->projectName.c_str(),count,skeleton->parentIndices.size(),skeleton->referencePose.size(),
-                    bool(bones),bool(parents),bool(references));continue;
+                    bindingFailure,g->projectName.c_str(),count,layout.parentCount,layout.referenceCount,
+                    bool(bones),bool(parents),bool(layout.references));continue;
             }
             if(!bindings.empty()&&bindings[0].graph==g&&bindings[0].actorRoot.get()==actorRoot&&
                 bindings[0].root.get()==existingNode(actorRoot,library.names[0])&&currentRig(bindings[0],true)) {
@@ -719,7 +831,7 @@ private:
             }
             if(ownsPose||fading){invalidateRig();bindingFailure="character rig changed during traversal";return false;}
             Binding next;next.graph=g;next.actorRoot=RE::NiPointer<RE::NiAVObject>(actorRoot);
-            next.skeleton=g->characterInstance.setup->animationSkeleton;next.bones=bones;next.parents=parents;next.references=references;next.boneCount=count;
+            next.skeleton=g->characterInstance.setup->animationSkeleton;next.skeletonData=layout;
             std::vector<AnimationSkeletonBone> animationBones;animationBones.reserve(count);
             for(int i=0;i<count;++i)animationBones.push_back({bones[i].name.c_str()?bones[i].name.c_str():"",parents[i]});
             next.animation=bindAnimationSkeleton(library.names,library.parents,animationBones);
@@ -763,9 +875,13 @@ private:
             orientation={};
             outputAudit={};
             target=nullptr;lastCallback=0;callbacks=0;
+            nativeHistory.clear();entryPending=false;
             bindings.clear();bindings.push_back(std::move(next));reusedBindings=0;
             rigIssue=0;target=bindings[0].root.get();
             if(changed)*changed=true;
+            if(layout.parentCount!=count||layout.referenceCount!=count)
+                SKSE::log::info("Animation skeleton bound by named bones: project={}, bones={}, parents={}, references={}; extra entries excluded from pose binding",
+                    g->projectName.c_str(),count,layout.parentCount,layout.referenceCount);
             if(traceOutput) {
                 SKSE::log::info("Final pose root bound: project={}, animationBones={}, mappedNodes={}, virtualLeaves={}, engineOwnedTracks={}, node={}",
                     g->projectName.c_str(),count,bindings[0].scene.count,bindings[0].scene.virtualLeaves,bindings[0].scene.unownedTracks,bindings[0].root->name.c_str());
@@ -837,15 +953,23 @@ public:
         return true;
     }
     bool install() {
+        std::scoped_lock lock(installMutex);
+        if(auto* active=instance.load(std::memory_order_acquire))return active==this;
         if(!reloadPack())return false;
         if(!initializeFlatWorldRefresh()||!preflightHookSites())return false;
-        instance=this;
-        Hook<0,0>::install();Hook<0,1>::install();Hook<0,2>::install();
-        Hook<1,0>::install();Hook<1,1>::install();Hook<1,2>::install();
-        Hook<2,0>::install();Hook<2,1>::install();Hook<2,2>::install();
-        TransformHook<0>::install();TransformHook<1>::install();TransformHook<2>::install();
-        WorldHook<0>::install();WorldHook<1>::install();WorldHook<2>::install();WorldHook<3>::install();
+        const auto* timer=RE::BSTimer::GetSingleton();
+        if(timer&&runtime::readable(reinterpret_cast<std::uintptr_t>(timer),sizeof(*timer)))frameTimer=timer;
+        SKSE::log::info("Pose exit clock: {}",frameTimer?"scene frames, game time scaled":"player update fallback");
+        if(!(Hook<0,0>::install()&&Hook<0,1>::install()&&Hook<0,2>::install()&&
+            Hook<1,0>::install()&&Hook<1,1>::install()&&Hook<1,2>::install()&&
+            Hook<2,0>::install()&&Hook<2,1>::install()&&Hook<2,2>::install()&&
+            TransformHook<0>::install()&&TransformHook<1>::install()&&TransformHook<2>::install()&&
+            WorldHook<0>::install()&&WorldHook<1>::install()&&WorldHook<2>::install()&&WorldHook<3>::install())) {
+            packReport.error="Pose hooks unavailable";
+            SKSE::log::error("Pose hooks unavailable; native scene updates retained");return false;
+        }
         const bool skinObserver=SkinHook::install();
+        instance.store(this,std::memory_order_release);
         SKSE::log::info("Single-bone world update protection installed; final skin observer={}",skinObserver);
         return true;
     }
@@ -872,8 +996,10 @@ public:
         skinBodyInputs=skinOwnedInputs=skinCacheHits=skinMismatchCalls=0;
         skinAuditSamples=skinAuditSkipped=skinAuditLockSkips=skinAuditInputs=skinAuditAncestors=skinAuditBudgetStops=0;
         skinBodyMismatches=skinBridgeMismatches=skinExtraMismatches=skinAuditMicros=skinAuditPeakMicros=0;
-        surface.reset();published.clear();handoff.clear();recovery=exitAge=sampleTime=0;
-        topEndpoint.clear();
+        surface.reset();published.clear();handoff.clear();exitAge=sampleTime=0;
+        entryPending=true;
+        exitTrace.reset();
+        exitClock.clear();
         publishedYaw=displayedYaw=0;hasWallFrame=hasDisplayedYaw=false;orientation={};
         publishedMotion=Motion::none;outputAudit={};
         applied=0;rejected=0;matched=0;retiredOutputs=0;envelope.beginEntry();
@@ -887,6 +1013,7 @@ public:
         bool changed=false;return bindLocked(player,&changed)&&changed;
     }
     void update(World& world,const Traversal& t,Motion motion,float dt,float actorScale) {
+        if(!isActiveMotion(motion))return;
         {
             std::scoped_lock lock(mutex);
             if(bindings.empty()||rigInvalidated.load())return;
@@ -899,24 +1026,13 @@ public:
         if(std::isfinite(dt)&&dt>0)sampleTime+=std::min(dt,.05f);
         publishedMotion=motion;
         if(const auto yaw=facingWallYaw(t.normal)){publishedYaw=*yaw;hasWallFrame=true;}
-        recovery=topEndpoint.weight(motion,t.progress());
         envelope.advanceEntry(applied.load(),dt);fading=false;
-    }
-    bool requestTopRecovery(State state,float progress,float seconds) {
-        std::scoped_lock lock(mutex);return ownsPose&&!fading&&topEndpoint.request(state,progress,seconds);
-    }
-    bool topRecoveryReady() {std::scoped_lock lock(mutex);return topEndpoint.ready();}
-    void resolveTopRecovery(bool accepted) {
-        std::scoped_lock lock(mutex);
-        topEndpoint.resolve(accepted);
-
-        if(topEndpoint.ready())restoreFootIKLocked();
     }
     void release(bool fade,bool physicalFall=false,bool completedTop=false) {
         std::scoped_lock lock(mutex);
         if(rigInvalidated.load()){clearLocked();return;}
         restoreFootIKLocked();
-        const bool nativeTakeover=completedTop&&topEndpoint.ready()&&!physicalFall;
+        const bool nativeTakeover=completedTop&&!physicalFall;
         if(fade&&envelope.weight()>0&&handoff.beginExit(physicalFall,nativeTakeover)) {
             const float remaining=handoff.exitContribution();
 
@@ -924,20 +1040,29 @@ public:
             const float seconds=nativeTakeover?PoseHandoff::nativeExitSeconds:
                 physicalFall?PoseBlendEnvelope::fallExitSeconds:PoseBlendEnvelope::exitSeconds;
             if(traceOutput)SKSE::log::info("Pose release: consumed recovery={:.6f}; remaining custom={:.6f}; live native continuation={}; physicalFall={}; fadeSeconds={:.2f}; consumedYaw={:.3f}; completedTopBridge={}",
-                1-remaining,remaining,remaining<1.f,physicalFall,seconds,publishedYaw,nativeTakeover);
+                1-remaining,remaining,nativeTakeover||remaining<1.f,physicalFall,seconds,publishedYaw,nativeTakeover);
             if(remaining<=0&&!handoff.nativeExitActive())clearLocked();
-            else {envelope.beginExit(applied.load(),seconds);exitAge=0;fading=true;}
+            else {
+                exitAppliedBase=applied.load();envelope.beginExit(exitAppliedBase,seconds,nativeTakeover||physicalFall);
+                exitClock.clear();
+                exitAge=0;exitTicks=exitSteps=0;exitStartedAt=GetTickCount64();fading=true;
+                finishExitTraceLocked("exit restarted");exitTrace.reset(traceOutput);
+            }
         } else clearLocked();
     }
     void tick(float dt) {
-        std::scoped_lock lock(mutex);if(!fading||rigInvalidated.load())return;
-        if(std::isfinite(dt)&&dt>0)exitAge+=std::min(dt,.05f);
+        std::scoped_lock lock(mutex);++nativeFrame;
+        if(!fading||rigInvalidated.load())return;
+        if(std::isfinite(dt)&&dt>0){exitAge+=std::min(dt,.05f);++exitTicks;}
 
-        if(exitAge>.75f&&!recentPoseCallback(GetTickCount64(),lastSuccessfulOutput)){clearLocked();return;}
-        envelope.advanceExit(applied.load(),dt);
-
-        handoff.advanceExitSource(exitAge,library,envelope.elapsedExitSeconds());
-        if(envelope.weight()<=0)clearLocked();
+        if(!pendingScenePasses&&exitAge>.75f&&!recentPoseCallback(GetTickCount64(),lastSuccessfulOutput)){clearLocked("callback timeout");return;}
+        if(!pendingScenePasses&&envelope.exitComplete(applied.load())){clearLocked("native handoff complete");return;}
+        if(!frameTimer) {
+            const auto before=envelope.elapsedExitSeconds();
+            envelope.advanceExit(applied.load(),dt);
+            if(envelope.elapsedExitSeconds()>before)++exitSteps;
+            handoff.advanceExitSource(exitAge,library,envelope.elapsedExitSeconds());
+        }
     }
 };
 }

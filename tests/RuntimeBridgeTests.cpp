@@ -1,5 +1,6 @@
 #include "PCH.h"
 #include "RuntimeSupport.h"
+#include "AnimationSkeletonLayout.h"
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -183,11 +184,78 @@ void skseRuntimeEncodingCases() {
     std::cout<<"SKSE LoadInterface GOG platform decoding and executable Address Library filenames PASS\n";
 }
 
+void animationSkeletonBridgeCase() {
+    static_assert(sizeof(RE::hkaSkeleton)==0x78&&sizeof(RE::hkaBone)==0x10&&sizeof(RE::hkQsTransform)==0x30);
+    Storage<RE::hkaSkeleton,0x78> storage;
+    Storage<RE::hkaBone,116*sizeof(RE::hkaBone)> bones;
+    std::array<std::int16_t,126> parents{};
+    Storage<RE::hkQsTransform,126*sizeof(RE::hkQsTransform)> references;
+    storage.put(0x18,parents.data());storage.put(0x20,std::int32_t{126});storage.put(0x24,std::uint32_t{0x8000007e});
+    storage.put(0x28,bones.object());storage.put(0x30,std::int32_t{116});storage.put(0x34,std::uint32_t{0x80000074});
+    storage.put(0x38,references.object());storage.put(0x40,std::int32_t{126});storage.put(0x44,std::uint32_t{0x8000007e});
+    const auto* skeleton=storage.object();const auto captured=fc::animationSkeletonLayout(*skeleton);
+    require(address(&skeleton->parentIndices)==storage.address()+0x18&&address(&skeleton->bones)==storage.address()+0x28&&
+        address(&skeleton->referencePose)==storage.address()+0x38,"typed hkaSkeleton arrays retain their verified Havok ABI offsets");
+    require(captured.bones==bones.object()&&captured.parents==parents.data()&&captured.references==references.object(),
+        "the production layout adapter reads all three actual typed array pointers");
+    require(captured.boneCount==116&&captured.parentCount==126&&captured.referenceCount==126,
+        "the production layout adapter preserves independent array lengths instead of capacity flags");
+    require(captured.valid(fc::runtime::readable),"real typed 116/126/126 storage passes native readability validation");
+    for(std::size_t sizeOffset:{0x20u,0x30u,0x40u}) {
+        const auto original=storage.get<std::int32_t>(sizeOffset);storage.put(sizeOffset,std::int32_t{-1});
+        const auto invalid=fc::animationSkeletonLayout(*skeleton);unsigned probes=0;
+        require(!invalid.valid([&](std::uintptr_t,std::size_t){++probes;return true;})&&probes==0,
+            "negative native hkArray lengths are rejected before unsigned byte counts or memory probes");
+        require(invalid!=captured,"a changed native array length invalidates the captured storage identity");
+        storage.put(sizeOffset,original);
+    }
+    for(std::size_t pointerOffset:{0x18u,0x28u,0x38u}) {
+        const auto original=storage.get<std::uintptr_t>(pointerOffset);storage.put(pointerOffset,std::uintptr_t{});
+        const auto invalid=fc::animationSkeletonLayout(*skeleton);
+        require(invalid!=captured&&!invalid.valid(fc::runtime::readable),"typed null array replacement invalidates the captured layout");
+        storage.put(pointerOffset,original);
+    }
+    require(fc::animationSkeletonLayout(*skeleton)==captured,"restoring native array headers restores the exact captured identity");
+}
+
+void animationSkeletonMemoryGuards() {
+    SYSTEM_INFO system{};GetSystemInfo(&system);const auto page=std::size_t(system.dwPageSize);
+    require(page*2>=116*sizeof(RE::hkQsTransform),"guard fixture has enough readable prefix pages for actual Havok poses");
+    auto* block=static_cast<std::byte*>(VirtualAlloc(nullptr,page*9,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE));
+    require(block!=nullptr,"allocate isolated native skeleton guard pages");
+    struct Release {void* p;~Release(){VirtualFree(p,0,MEM_RELEASE);}} release{block};
+    auto* bones=reinterpret_cast<RE::hkaBone*>(block+2*page-116*sizeof(RE::hkaBone));
+    auto* parents=reinterpret_cast<std::int16_t*>(block+5*page-116*sizeof(std::int16_t));
+    auto* references=reinterpret_cast<RE::hkQsTransform*>(block+8*page-116*sizeof(RE::hkQsTransform));
+    DWORD previous{};
+    for(std::size_t guard:{2u,5u,8u})require(VirtualProtect(block+guard*page,page,PAGE_NOACCESS,&previous)!=0,"protect each skeleton array boundary independently");
+    fc::AnimationSkeletonLayout<RE::hkaBone,RE::hkQsTransform> layout{bones,parents,references,116,116,116};
+    require(layout.valid(fc::runtime::readable),"exact declared ranges ending at inaccessible pages remain readable");
+    auto changed=layout;changed.parentCount=126;
+    require(!changed.valid(fc::runtime::readable),"declared trailing parent elements in an inaccessible page are rejected");
+    changed=layout;changed.referenceCount=126;
+    require(!changed.valid(fc::runtime::readable),"declared trailing reference poses in an inaccessible page are rejected");
+    changed=layout;changed.bones=bones+1;require(!changed.valid(fc::runtime::readable),"an inaccessible active bone suffix is rejected");
+    changed=layout;changed.parents=parents+1;require(!changed.valid(fc::runtime::readable),"an inaccessible active parent suffix is rejected");
+    changed=layout;changed.references=references+1;require(!changed.valid(fc::runtime::readable),"an inaccessible active reference suffix is rejected");
+    for(std::size_t guard:{5u,8u})require(VirtualProtect(block+guard*page,page,PAGE_READWRITE,&previous)!=0,"restore readable companion array tails");
+    for(int i=116;i<126;++i)parents[i]=std::numeric_limits<std::int16_t>::max();
+    std::memset(references+116,0xff,10*sizeof(RE::hkQsTransform));
+    layout.parentCount=126;layout.referenceCount=126;
+    require(layout.valid(fc::runtime::readable),"readable trailing storage contents do not become additional named bones or pose validation inputs");
+    require(VirtualProtect(block+8*page,page,PAGE_READWRITE|PAGE_GUARD,&previous)!=0,"guard a declared reference tail without reading it");
+    require(!layout.valid(fc::runtime::readable),"PAGE_GUARD in a declared tail is rejected without causing a guarded memory access");
+    MEMORY_BASIC_INFORMATION info{};
+    require(VirtualQuery(block+8*page,&info,sizeof(info))&&(info.Protect&PAGE_GUARD),"readability validation does not consume a trailing page guard by dereferencing it");
+    std::cout<<"animation skeleton declared ranges, asymmetric lengths and native guard pages PASS\n";
+}
+
 void runtimeCase(REL::Version version) {
     require(REL::Module::mock(version),"CommonLib mock initialization");
     require(REL::Module::get().version()==version,"real Module version selection");
     require(fc::runtime::supported(),"bridge runtime must be supported");
     gamepadBridgeCase();
+    animationSkeletonBridgeCase();
     const bool modern=version>=REL::Version(1,7,99,0);
     const bool shifted=version>=REL::Version(1,6,629,0);
     require(REL::Module::IsAE()==(version[1]>=6),"real SE/AE runtime family");
@@ -346,6 +414,62 @@ void addressLibraryCases() {
 
 void hookTarget() {}
 
+using GamepadPoll=void(*)(RE::BSPCGamepadDeviceHandler*,float);
+fc::HookPublication<GamepadPoll> publishedGamepadPoll,publishedOuterGamepadPoll;
+unsigned publishedGamepadCalls{},publishedOuterGamepadCalls{};
+void gamepadPublishedTarget(RE::BSPCGamepadDeviceHandler* handler,float elapsed) {
+    ++publishedGamepadCalls;
+    const auto original=publishedGamepadPoll.get();
+    require(original!=nullptr,"published gamepad original exists");original(handler,elapsed);
+}
+void gamepadPublishedOuter(RE::BSPCGamepadDeviceHandler* handler,float elapsed) {
+    ++publishedOuterGamepadCalls;
+    const auto original=publishedOuterGamepadPoll.get();
+    require(original!=nullptr,"published outer gamepad original exists");original(handler,elapsed);
+}
+
+void virtualHookPublication() {
+    SYSTEM_INFO system{};GetSystemInfo(&system);
+    auto* block=static_cast<std::uintptr_t*>(VirtualAlloc(nullptr,system.dwPageSize,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE));
+    require(block!=nullptr,"allocate independent virtual table fixture");
+    struct Release {void* p;~Release(){VirtualFree(p,0,MEM_RELEASE);}} release{block};
+    block[2]=address(&gamepadPollTarget);block[4]=address(&gamepadPublishedTarget);block[5]=address(block);
+    DWORD previous{};
+    require(VirtualProtect(block,system.dwPageSize,PAGE_READONLY,&previous)!=0,"protect fixture virtual table as read-only");
+    fc::HookPublication<GamepadPoll> rejected;
+    require(!fc::runtime::installVfunc(0,2,&gamepadPublishedTarget,rejected)&&
+        !fc::runtime::installVfunc(address(block)+1,2,&gamepadPublishedTarget,rejected)&&
+        !fc::runtime::installVfunc(address(block),0x1001,&gamepadPublishedTarget,rejected),
+        "virtual installer rejects null, misaligned and unbounded slots");
+    require(!fc::runtime::installVfunc(address(block),0,&gamepadPublishedTarget,rejected)&&
+        !fc::runtime::installVfunc(address(block),5,&gamepadPublishedTarget,rejected)&&
+        !fc::runtime::installVfunc(address(block),4,&gamepadPublishedTarget,rejected)&&
+        !fc::runtime::installVfunc(address(block),2,GamepadPoll{},rejected),
+        "virtual installer rejects null, non-executable, self and empty replacement targets");
+    require(rejected.get()==nullptr&&block[2]==address(&gamepadPollTarget),"rejected installation leaves original target intact");
+    require(fc::runtime::installVfunc(address(block),2,&gamepadPublishedTarget,publishedGamepadPoll),
+        "virtual installer publishes into a real read-only pointer slot");
+    MEMORY_BASIC_INFORMATION info{};
+    require(VirtualQuery(block,&info,sizeof(info))&&info.Protect==PAGE_READONLY,
+        "virtual installer restores the original page protection");
+    Storage<RE::BSPCGamepadDeviceHandler,0x20> handlerStorage;handlerStorage.put(0,block);
+    auto* handler=handlerStorage.object();
+    polledGamepadCalls=publishedGamepadCalls=publishedOuterGamepadCalls=0;
+    dispatchGamepadPoll(handler,.375f);
+    require(polledGamepadCalls==1&&publishedGamepadCalls==1&&polledGamepadHandler==handler&&polledGamepadDelta==.375f,
+        "real virtual dispatch preserves handler pointer, float delta and one original call");
+    require(fc::runtime::installVfunc(address(block),2,&gamepadPublishedOuter,publishedOuterGamepadPoll),
+        "second virtual hook chains the first");
+    require(fc::runtime::installVfunc(address(block),2,&gamepadPublishedTarget,publishedGamepadPoll)&&
+        block[2]==address(&gamepadPublishedOuter)&&publishedGamepadPoll.get()==&gamepadPollTarget&&
+        publishedOuterGamepadPoll.get()==&gamepadPublishedTarget,"repeated inner install preserves the external outer chain");
+    dispatchGamepadPoll(handler,.625f);
+    require(polledGamepadCalls==2&&publishedGamepadCalls==2&&publishedOuterGamepadCalls==1&&polledGamepadDelta==.625f,
+        "nested real virtual hooks avoid recursion and duplicate native polling");
+    require(VirtualQuery(block,&info,sizeof(info))&&info.Protect==PAGE_READONLY,"nested installs retain read-only page protection");
+    std::cout<<"real Windows virtual hook publication, restored protections and nested native dispatch PASS\n";
+}
+
 void memoryGuards() {
     SYSTEM_INFO system{};
     GetSystemInfo(&system);
@@ -391,6 +515,8 @@ int main() {
         skseRuntimeEncodingCases();
         for(const auto version:versions)runtimeCase(version);
         memoryGuards();
+        animationSkeletonMemoryGuards();
+        virtualHookPublication();
         addressLibraryCases();
         REL::Module::reset();
         std::cout<<"PASS runtime bridge: "<<versions.size()<<" real CommonLib runtime branches, "<<checks<<" checks\n";

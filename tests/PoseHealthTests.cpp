@@ -13,6 +13,57 @@ static void samePose(const Pose& a,const Pose& b,const char* reason) {
 static Pose mixPoses(const Pose& a,const Pose& b,float weight) {
     Pose out=a;for(std::size_t i=0;i<out.size();++i)out[i]=blend(a[i],b[i],weight);return out;
 }
+static void exitClockBoundaries(){
+    PoseBlendEnvelope e;e.beginExit(0);
+    for(int tick=0;tick<120;++tick)e.advanceExit(0,.01f);
+    check(e.elapsedExitSeconds()==0&&e.weight()==1,"waiting for the first callback accumulates no hidden exit time");
+    for(float dt:{0.f,-1.f,NAN,INFINITY})e.advanceExit(1,dt);
+    e.advanceExit(1,.01f);
+    check(std::abs(e.elapsedExitSeconds()-.01f)<.000001f,"first valid callback begins with only its current update after an arbitrarily long initial wait");
+    e.advanceExit(1,.01f);e.advanceExit(1,.01f);
+    check(std::abs(e.elapsedExitSeconds()-.01f)<.000001f,"updates without a new displayed frame cannot change the visible exit phase");
+    for(float dt:{0.f,-1.f,NAN,INFINITY})e.advanceExit(2,dt);
+    check(std::abs(e.elapsedExitSeconds()-.01f)<.000001f,"invalid updates cannot consume an acknowledgement or previously accumulated valid time");
+    e.advanceExit(2,.01f);
+    check(std::abs(e.elapsedExitSeconds()-.04f)<.000001f,"a resumed callback consumes the valid updates between ordinary rendered frames");
+    e.advanceExit(9,.01f);
+    check(std::abs(e.elapsedExitSeconds()-.05f)<.000001f,"seven scene callbacks in one update contribute one update of elapsed time");
+    const float beforeStall=e.elapsedExitSeconds();
+    for(int tick=0;tick<120;++tick)e.advanceExit(9,.02f);
+    check(e.elapsedExitSeconds()==beforeStall,"an extended render stall cannot advance an unseen fade");
+    for(float dt:{0.f,-1.f,NAN,INFINITY})e.advanceExit(10,dt);
+    check(e.elapsedExitSeconds()==beforeStall,"invalid resumption does not consume a full pending recovery interval");
+    e.advanceExit(10,.01f);
+    check(std::abs(e.elapsedExitSeconds()-beforeStall-.05f)<.000001f,"a long render stall recovers by at most fifty milliseconds on its next confirmed frame");
+    e.advanceExit(11,.01f);
+    check(std::abs(e.elapsedExitSeconds()-beforeStall-.06f)<.000001f,"time beyond the recovery cap is discarded instead of leaking into later frames");
+    for(int tick=0;tick<120;++tick)e.advanceExit(11,.02f);
+    e.beginExit(11);
+    for(int tick=0;tick<120;++tick)e.advanceExit(11,.01f);
+    e.advanceExit(12,.01f);
+    check(std::abs(e.elapsedExitSeconds()-.01f)<.000001f,"a fresh exit discards both previous pending time and the previous callback-start state");
+    e.clear();e.beginExit(0xffffffffu);
+    for(int tick=0;tick<120;++tick)e.advanceExit(0xffffffffu,.01f);
+    e.advanceExit(0,.01f);
+    check(std::abs(e.elapsedExitSeconds()-.01f)<.000001f,"counter rollover to zero is a valid first callback without inheriting initial wait time");
+    e.advanceExit(0,.01f);e.advanceExit(1,.5f);
+    check(std::abs(e.elapsedExitSeconds()-.06f)<.000001f,"a long individual update and pending time share the same fifty-millisecond output cap");
+}
+static unsigned exitClockCadence(int fps,unsigned interval,unsigned passes,float seconds){
+    const float dt=1.f/fps;PoseBlendEnvelope e;e.beginExit(0,seconds);std::uint32_t applied=0;
+    for(unsigned frame=1;frame<=unsigned(fps);++frame){
+        const bool rendered=(frame-1)%interval==0;const float before=e.elapsedExitSeconds();
+        if(rendered)applied+=passes;
+        e.advanceExit(applied,dt);
+        if(rendered)check(std::abs(e.elapsedExitSeconds()-std::min(frame*dt,seconds))<.000001f,"ordinary sparse callbacks preserve elapsed simulation time rather than counting render frames");
+        else check(e.elapsedExitSeconds()==before,"player updates alone do not publish a later fade phase");
+        if(e.weight()==0){
+            check(frame*dt>=seconds&&frame*dt<=seconds+interval*dt+.000001f,"normal callback spacing adds at most one render interval to the configured fade");
+            check(!e.exitComplete(applied),"a sparse final weighted acknowledgement cannot prove a pure native terminal frame");return frame;
+        }
+    }
+    check(false,"ordinary sparse rendering must finish the configured exit within one second");return 0;
+}
 static void renderedPoseHandoffs() {
     Pose nativeA(99),nativeB(99),custom(99);
     for(int i=0;i<99;++i) {
@@ -89,55 +140,6 @@ static void renderedPoseHandoffs() {
     check(envelope.weight()==0,"newly consumed exit frames eventually release the layer completely");
 }
 int main(){try {
-    {
-        TopRecoveryGate gate;
-        gate.resolve(true);
-        check(!gate.ready()&&gate.weight(Motion::contextMantle,1)==0,"an unsolicited endpoint result cannot enable native recovery");
-        check(!gate.request(State::wall,1,.8f)&&!gate.request(State::mantle,.71f,.8f),"ordinary climbing and the grip phase cannot request a native standing endpoint");
-        check(gate.request(State::mantle,.73f,.8f),"late top-out requests the endpoint once");
-        gate.resolve(false);
-        check(!gate.ready()&&gate.weight(Motion::contextMantle,1)==0,"a rejected standing event retains the authored top-out instead of blending to an unprepared native pose");
-        check(!gate.request(State::mantle,.8f,.8f)&&!gate.request(State::mantle,1,.8f),"an unrecognized graph event is not retried every frame");
-        gate.clear();
-        check(gate.request(State::mantle,.73f,.8f),"a later climb gets its own endpoint attempt");
-        gate.resolve(true);
-        check(gate.ready()&&gate.weight(Motion::contextMantle,.85f)>0&&gate.weight(Motion::contextMantle,.85f)<1,
-            "an accepted standing endpoint enables gradual native recovery");
-        check(gate.weight(Motion::contextMantle,1)==1&&gate.weight(Motion::up,1)==0&&gate.weight(Motion(6),1)==0&&gate.weight(Motion(7),1)==0,
-            "accepted recovery reaches native only for top-out motions, never for ordinary climbing");
-        check(gate.weight(Motion::contextMantle,.72f)==0&&gate.weight(Motion::contextMantle,.85f)>0&&
-            gate.weight(Motion::contextMantle,1)==1&&gate.weight(Motion::contextHang,1)==0&&
-            gate.weight(Motion::contextHopLeft,1)==0&&gate.weight(Motion::contextHopRight,1)==0,
-            "Threepeat mantle recovers the live native endpoint; hanging and leaps never recover to standing");
-        check(gate.weight(Motion::contextMantle,1.01f)==1&&gate.weight(Motion::contextMantle,.72f)==0,
-            "native recovery clamps both endpoints exactly even when progress slightly exceeds completion");
-        for(int i=0;i<=1000;++i) {
-            const float weight=gate.weight(Motion::contextMantle,.72f+.28f*float(i)/1000.f);
-            check(weight>=0&&weight<=1,"quintic rounding cannot extrapolate beyond the native endpoint");
-        }
-        check(!gate.request(State::mantle,1,.8f),"accepted top-out does not issue a second standing reset");
-    }
-    for(float duration:{.5f,.817f,1.867f,3.f,8.f}) {
-        TopRecoveryGate gate;
-        const float start=topRecoveryBegin(duration);
-        check(start>=.72f&&(1-start)*duration<=.24001f,"native standing cannot replace the authored finish more than .24 seconds before release");
-        check(!gate.request(State::mantle,start-.001f,duration),"no native standing request before the timed transition");
-        check(gate.request(State::mantle,start,duration),"native request begins at the same boundary as recovery");
-        gate.resolve(true);
-        check(gate.weight(Motion::contextMantle,start)==0,"the native endpoint starts with no pose jump");
-        float previous=0;
-        for(int i=0;i<=1000;++i) {
-            const float phase=start+(1-start)*float(i)/1000.f;
-            const float weight=gate.weight(Motion::contextMantle,phase);
-            check(weight>=previous-1e-6f&&weight<=1,"timed native transition remains monotonic and bounded");previous=weight;
-        }
-        check(gate.weight(Motion::contextMantle,1)==1,"timed native transition completes without holding the authored last pose");
-        check(!gate.request(State::mantle,1,duration),"timed native transition never resets the graph twice");
-    }
-    for(float duration:{0.f,-1.f,NAN,INFINITY}) {
-        TopRecoveryGate gate;
-        check(!gate.request(State::mantle,1,duration)&&topRecovery(Motion::contextMantle,1,duration)==0,"invalid duration cannot enable a native endpoint");
-    }
     check(!recentPoseCallback(1000,0),"binding is not an observed callback");
     check(recentPoseCallback(1000,950),"recent render observation allows preflight");
     check(!recentPoseCallback(1000,700),"stale previous binding cannot authorize control");
@@ -158,7 +160,7 @@ int main(){try {
         PoseBlendEnvelope blend;
         check(blend.weight()==0,"unused pose layer has no contribution");
         blend.beginEntry();const float first=blend.weight();
-        check(first>0&&first<=.02f,"first pose has a small nonzero weight so its callback cannot deadlock");
+        check(first==0,"entry starts at the exact observed native pose before its first acknowledged callback");
         for(int i=0;i<60;++i)blend.advanceEntry(0,1.f/60);
         check(blend.weight()==first,"a delayed first callback cannot complete the entry blend invisibly");
         blend.advanceEntry(1,1.f/60);const float observed=blend.weight();
@@ -191,6 +193,10 @@ int main(){try {
         check(blend.weight()==0&&firstDelta<.003f&&lastDelta<.003f,"smooth exit eases both ends and restores native output within 0.28 seconds");
         blend.beginEntry();check(blend.weight()==first,"reattachment starts a fresh acknowledged entry");
     }
+    exitClockBoundaries();
+    for(int fps:{40,60,120})for(unsigned interval:{2u,3u,4u})if(float(interval)/fps<=.050001f)
+        for(float seconds:{PoseHandoff::nativeExitSeconds,PoseBlendEnvelope::fallExitSeconds,PoseBlendEnvelope::exitSeconds})
+            check(exitClockCadence(fps,interval,1,seconds)==exitClockCadence(fps,interval,7,seconds),"duplicate scene callbacks do not change any configured exit duration");
     renderedPoseHandoffs();
     std::cout<<"PASS: observed preflight, missing output timeout, brief gap recovery, replacement invalidation, consumed pose handoffs\n";
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

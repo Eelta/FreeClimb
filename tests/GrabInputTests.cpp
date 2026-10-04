@@ -199,7 +199,7 @@ static void nativeJumpWindow() {
     }
 }
 static void preparationGrace() {
-    for(int fps:{30,60,120})for(bool gamepad:{false,true}) {
+    for(int fps:{10,12,15,30,60,120})for(bool gamepad:{false,true}) {
         const float dt=1.f/fps;EntryPreparationGrace grace;const Keys released;
         for(int frame=0;frame<fps;++frame) {
             check(!grace.sample(dt,gamepad,released),"unarmed background frames cannot create a deferred catch");
@@ -216,7 +216,7 @@ static void preparationGrace() {
             const auto movement=wallInput(released,false);
             check(!movement.hop&&!movement.run&&!movement.release&&movement.x==0&&movement.y==0,"retaining verified preparation does not fabricate direction jump or run input");
         }
-        check(expired&&expiry>=.15f-.0001f&&expiry<=.15f+dt+.0001f,"grace deadlines remain bounded at30,60and120fps");
+        check(expired&&expiry>=.15f-.0001f&&expiry<=.15f+dt+.0001f,"grace deadlines remain bounded across low and high frame rates");
         for(int frame=0;frame<fps;++frame)check(!grace.sample(dt,gamepad,grabKeys()),"pressing keys cannot revive expired grace without new verified arming");
         for(int cancelKind=0;cancelKind<4;++cancelKind) {
             grace.arm(gamepad);check(grace.sample(dt,gamepad,released),"cancellation fixture starts with live preparation grace");
@@ -247,8 +247,76 @@ static void preparationGrace() {
         gate.cancel();check(!gate.pending()&&!gate.explicitAirCatch(falling),"expiration can fully retire the pending physical preflight");
     }
 }
+struct PreparedProbeResult {bool armed{},attached{};unsigned probes{};float completedAt{};};
+static PreparedProbeResult preparedProbeRetry(int fps,bool oldCooldown,bool initialWall,bool currentWall,unsigned cancellation=0) {
+    const float dt=1.f/fps;
+    ClimbEntryIntent intent;EntryPreparationGrace grace;float cooldown{};PreparedProbeResult result;
+    const auto request=intent.sample(grabKeys(),false,false,dt,true);
+    check(request.requested&&entryProbeReady(cooldown,dt,request.fresh),"complete entry gets its immediate initial probe");
+    CatchWall world;world.present=initialWall;
+    Traversal initial;
+    if(initial.attach(world,{0,-30,300},{0,1,0},100,35,true)) {
+        grace.arm(true);result.armed=true;
+    }
+    world.present=currentWall;
+    for(int frame=1;frame<=fps/3+2;++frame) {
+        Keys released;
+        if(cancellation==1)grace.cancel();
+        if(cancellation==3)released.letGo=true;
+        if(cancellation==5)released.s=true;
+        const float elapsed=cancellation==4?.2f:dt;
+        const bool prepared=grace.sample(elapsed,cancellation!=2,released);
+        const auto held=intent.sample(released,false,cancellation==1,elapsed,true);
+        if(!held.requested&&!prepared)break;
+        bool probe{};
+        if(oldCooldown) {
+            cooldown=std::max(0.f,cooldown-std::min(elapsed,.05f));
+            probe=cooldown<=0;if(probe)cooldown=.08f;
+        } else probe=entryProbeReady(cooldown,elapsed,held.fresh);
+        if(!probe)continue;
+        ++result.probes;
+        Traversal current;
+        if(current.attach(world,{0,-30,300},{0,1,0},100,35,true)) {
+            result.attached=true;result.completedAt=frame*dt;break;
+        }
+        grace.cancel();
+    }
+    return result;
+}
+static void preparationProbeCadence() {
+    for(int fps:{10,12,15,30,60,120}) {
+        const auto old=preparedProbeRetry(fps,true,true,true);
+        const auto current=preparedProbeRetry(fps,false,true,true);
+        check(old.armed&&current.armed,"both cadence fixtures begin with actual validated wall geometry");
+        check(old.attached==(fps>=15),"old capped cooldown loses the released prepared entry at10and12fps");
+        check(current.attached&&current.probes==1&&current.completedAt>=.08f-.00001f&&current.completedAt<.15f,
+            "real elapsed cooldown permits one current-geometry retry within the unchanged150ms grace");
+        const auto absent=preparedProbeRetry(fps,false,false,true);
+        check(!absent.armed&&!absent.attached&&absent.probes==0,"released input cannot arm grace from a later wall without validated initial geometry");
+        const auto disappeared=preparedProbeRetry(fps,false,true,false);
+        check(disappeared.armed&&!disappeared.attached&&disappeared.probes==1,"prepared retry rechecks the live wall and rejects support that disappeared");
+        for(unsigned cancellation=1;cancellation<=5;++cancellation) {
+            const auto canceled=preparedProbeRetry(fps,false,true,true,cancellation);
+            check(canceled.armed&&!canceled.attached&&canceled.probes==0,"menu device switch drop expiration and backward cancel before retry");
+        }
+    }
+    for(bool fresh:{false,true})for(float dt:{0.f,-1.f,std::numeric_limits<float>::quiet_NaN(),std::numeric_limits<float>::infinity()}) {
+        float remaining=.063f;
+        check(!entryProbeReady(remaining,dt,fresh)&&remaining==.063f,"invalid elapsed time cannot advance or reset a probe cooldown even for fresh input");
+    }
+    float remaining=.063f;
+    check(entryProbeReady(remaining,.001f,true)&&remaining==.08f,"genuinely fresh complete chord gets one immediate probe");
+    check(!entryProbeReady(remaining,.025f,false)&&std::abs(remaining-.055f)<.000001f,"ordinary held requests retain their real-time throttle");
+    check(entryProbeReady(remaining,.1f,false)&&remaining==.08f,"elapsed frame time is not capped before consuming the probe cooldown");
+    Keys drop=grabKeys();drop.letGo=true;ClimbEntryIntent intent;
+    check(!approachIntent(drop)&&!intent.sample(drop).requested&&intent.waitingForRelease(),"explicit let-go vetoes both approach and entry recognition");
+    drop.letGo=false;
+    check(!intent.sample(drop).requested,"removing only the drop request does not rearm a still-held entry chord");
+    drop.space=false;intent.sample(drop);drop.space=true;
+    check(intent.sample(drop).fresh,"release and repress of an entry member rearms after explicit drop");
+}
 int main(){try {
     chordTruthTableAndNativeSpace();heldApproachAndReleaseRearming();flightClassificationAndFreshAirBypass();
-    currentPositionCatchAndDistantHold();wallRunSpaceRoutingAndEntryGate();nativeJumpWindow();preparationGrace();
+    currentPositionCatchAndDistantHold();wallRunSpaceRoutingAndEntryGate();nativeJumpWindow();preparationGrace();preparationProbeCadence();
     std::cout<<"PASS: full configurable climb chord, all 24 key orders, held retry and release rearm, physical-air provenance, native jump expiry, bounded verified preparation grace and attached run gate\n";
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

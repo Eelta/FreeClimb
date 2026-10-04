@@ -311,6 +311,40 @@ static void eventOwnership() {
     check(!ownership.startedNativeJump(10)&&!ownership.filter(10,false,true,false,state,state,bindings),"disconnect can fully clear native ownership history");
     check(!ownership.filter(99,true,false,true,state,state,bindings)&&!ownership.startedNativeJump(99),"unknown events never claim native ownership");
 }
+static void entryWithHeldStickAndExtraButtons() {
+    const GamepadSettings settings;
+    for(std::int16_t x:{std::int16_t{-32768},std::int16_t{0},std::int16_t{32767}})
+        for(std::int16_t y:{std::int16_t{0},std::int16_t{32767}})
+            for(unsigned extra:{0u,1u,2u,3u,6u,7u,9u,10u,12u,14u,15u,16u}) {
+        GamepadState state;ClimbEntryIntent intent;state.reset();
+        state.sampleXInput(0,0,0,x,y,settings);
+        check(state.resumeIfButtonsReleased(),"complete released snapshot rearms with a forward or side stick held");
+        auto bits=std::uint16_t{0x8100};
+        if(extra<14)bits=static_cast<std::uint16_t>(bits|(1u<<(extra<10?extra:extra+2)));
+        state.sampleXInput(bits,extra==14?255:0,extra==15?255:0,x,y,settings);
+        const auto keys=state.keys(settings.bindings);
+        const auto request=intent.sample(keys);
+        check(keys.entry&&!keys.s&&!keys.letGo&&approachIntent(keys)&&request.requested&&request.began,
+            "snapshot alone starts LB+Y with non-cancel extra buttons or triggers and moving stick without native events");
+        for(int frame=0;frame<4;++frame) {
+            const auto held=intent.sample(state.keys(settings.bindings));
+            check(held.requested&&!held.fresh,"held snapshot retries without requiring button edges or stick neutrality");
+        }
+    }
+    for(bool backward:{false,true}) {
+        GamepadState state;ClimbEntryIntent intent;
+        state.sampleXInput(backward?0x8100:0xA100,0,0,16000,backward?-32768:32767,settings);
+        const auto blocked=state.keys(settings.bindings);
+        check(!approachIntent(blocked)&&!intent.sample(blocked).requested&&intent.waitingForRelease(),
+            "backward movement or independent B drop prevents a grab-and-immediate-release cycle");
+        state.sampleXInput(0x8100,0,0,16000,32767,settings);
+        check(!intent.sample(state.keys(settings.bindings)).requested,"clearing only backward or B does not silently rearm the held chord");
+        state.sampleXInput(0x0100,0,0,16000,32767,settings);
+        check(!intent.sample(state.keys(settings.bindings)).requested&&!intent.waitingForRelease(),"releasing Y rearms with LB and moving stick retained");
+        state.sampleXInput(0x8100,0,0,16000,32767,settings);
+        check(intent.sample(state.keys(settings.bindings)).fresh,"fresh LB+Y works after deliberate rearming without centering the stick");
+    }
+}
 static void wallActionPriority() {
     GamepadBindings bindings;
     for(unsigned mask=0;mask<32;++mask)for(int x=-1;x<=1;++x)for(int y=-1;y<=1;++y) {
@@ -332,6 +366,6 @@ static void wallActionPriority() {
     }
 }
 int main(){try {
-    parsingAndBindings();completeChordsAndRearming();stickAndTriggerFiltering();completeXInputSnapshots();suspensionAndDisconnect();rearmWithHeldMovement();eventOwnership();wallActionPriority();
+    parsingAndBindings();completeChordsAndRearming();stickAndTriggerFiltering();completeXInputSnapshots();suspensionAndDisconnect();rearmWithHeldMovement();eventOwnership();entryWithHeldStickAndExtraButtons();wallActionPriority();
     std::cout<<"PASS: "<<checks<<" synthetic gamepad binding, direction, suspension, ownership and wall action checks\n";
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

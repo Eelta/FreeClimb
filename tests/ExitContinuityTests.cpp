@@ -8,8 +8,38 @@ static float distance(const Pose& a,const Pose& b) {
     for(std::size_t i=0;i<a.size();++i)value=std::max(value,(a[i].t-b[i].t).length()+angleBetween(a[i].q,b[i].q));
     return value;
 }
+struct InterruptedExitWall:World {
+    Vec outward{0,-1,0};std::optional<float> rearDistance;
+    std::optional<Hit> ray(Vec from,Vec to) override {
+        const float a=from.dot(outward),b=to.dot(outward);
+        if(a>0&&b<=0){const float t=a/(a-b);return Hit{from+(to-from)*t,outward,true};}
+        if(rearDistance&&a<*rearDistance&&b>=*rearDistance){const float t=(*rearDistance-a)/(b-a);return Hit{from+(to-from)*t,outward*-1,false};}
+        return {};
+    }
+    bool actionBodyClear(Motion motion,Vec,Vec,float begin,float end,Vec) override {
+        return motion==Motion::backFlipOut&&begin>=0&&end>=begin&&end<=1;
+    }
+};
+static void interruptedDepartureMotion(int fps,bool flip,float yaw){
+    InterruptedExitWall wall;wall.outward={std::sin(yaw),-std::cos(yaw),0};Traversal traversal;
+    traversal.cfg.approachSeconds=0;traversal.cfg.fancyJumps=flip;
+    check(traversal.attach(wall,wall.outward*30+Vec{0,0,1000},wall.outward*-1,100),"interrupt fixture attaches to a real wall plane");
+    const float dt=1.f/fps;const Motion expected=flip?Motion::backFlipOut:Motion::dropBack;
+    auto result=traversal.update(wall,{0,-1,true,false,false,true},dt,100);
+    while(traversal.active()&&traversal.actionProgress()<.35f)result=traversal.update(wall,{},dt,100);
+    check(traversal.active()&&result.motion==expected,"obstacle appears only after the checked departure is underway");
+    const auto before=traversal.position;const float phase=traversal.actionProgress();
+    wall.rearDistance=before.dot(wall.outward)+traversal.cfg.radius+.05f;
+    result=traversal.update(wall,{},dt,100);
+    std::cout<<"INTERRUPTED_DEPARTURE fps="<<fps<<" flip="<<flip<<" yaw="<<yaw<<" beforeMotion="<<int(expected)<<" releasedMotion="<<int(result.motion)<<'\n';
+    check(result.released&&!result.completed&&!traversal.active()&&std::string(result.reason)=="jump path changed","new obstacle aborts the departure through the existing collision failure");
+    check((traversal.position-before).length()<.00001f&&traversal.actionProgress()==phase,"interruption commits no unchecked root movement or animation phase");
+    check(result.releaseVelocity.length()==0,"blocking departure cannot add an unchecked outward impulse");
+    check(result.motion==expected&&isActiveMotion(result.motion),"interrupted departure retains its actual action instead of publishing none and falling back to hang");
+}
 int main(int argc,char** argv) {try {
     Library lib;check(argc==2&&lib.load(argv[1]),"load actual motion resource");
+    for(int fps:{20,30,48,60,120})for(bool flip:{false,true})for(float yaw:{0.f,.8f,2.2f})interruptedDepartureMotion(fps,flip,yaw);
     for(float fps:{20.f,30.f,48.f,60.f,120.f}) {
         const float dt=1/fps;
         PoseHandoff handoff;

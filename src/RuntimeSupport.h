@@ -1,5 +1,6 @@
 #pragma once
 #include "RuntimeVersion.h"
+#include "HookPublication.h"
 #include <cstring>
 #include <limits>
 
@@ -42,5 +43,24 @@ inline bool hookSite(std::uintptr_t table,std::size_t slot) {
     std::uintptr_t target{};
     std::memcpy(&target,reinterpret_cast<const void*>(table+slot*sizeof(target)),sizeof(target));
     return callable(target);
+}
+template<class Fn> bool installVfunc(std::uintptr_t table,std::size_t slot,Fn replacement,HookPublication<Fn>& publication) {
+    if(slot>0x1000||table%alignof(void*)||!readable(table,(slot+1)*sizeof(void*))||
+        !callable(reinterpret_cast<std::uintptr_t>(replacement)))return false;
+    const auto address=table+slot*sizeof(void*);
+    Fn expected{};
+    std::memcpy(&expected,reinterpret_cast<const void*>(address),sizeof(expected));
+    if(!callable(reinterpret_cast<std::uintptr_t>(expected)))return false;
+    return publication.install(expected,replacement,[address](Fn prior,Fn next) {
+        auto* location=reinterpret_cast<void* volatile*>(address);
+        DWORD protection{};
+        if(!VirtualProtect(reinterpret_cast<void*>(address),sizeof(void*),PAGE_EXECUTE_READWRITE,&protection))return false;
+        const bool installed=InterlockedCompareExchangePointer(location,reinterpret_cast<void*>(next),
+            reinterpret_cast<void*>(prior))==reinterpret_cast<void*>(prior);
+        DWORD discarded{};
+        if(!VirtualProtect(reinterpret_cast<void*>(address),sizeof(void*),protection,&discarded))
+            SKSE::log::error("Virtual hook protection restore failed: slot={:X}, installed={}",address,installed);
+        return installed;
+    });
 }
 }

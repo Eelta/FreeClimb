@@ -427,7 +427,7 @@ public:
 
 
         if(state==State::action) {
-
+            out.motion=actionMotion;
             const float rawNextTime=actionTime+dt/actionSeconds;
             const float nextTime=std::min(1.f,rawNextTime);
             Vec target=position,previous=position;float previousPhase=actionTime;
@@ -466,7 +466,6 @@ public:
 
                 const bool exitMotion=actionMotion==Motion::dropBack||actionMotion==Motion::backFlipOut;
                 target=actionPoint(exitMotion&&phase>=1?rawNextTime:phase);
-                if(actionMotion==Motion::backFlipOut)out.motion=actionMotion;
                 if(!clearPath(w,previous,target)||(roofTransfer&&!roofPathClear(w,previous,target))) {
                     if(actionMotion==Motion::backFlipOut)out.releaseVelocity=checkedBackFlipAbortVelocity(w);
                     if(edgeAction){out.motion=actionMotion;out.releaseVelocity={0,0,-30};edgeAction=false;}
@@ -566,7 +565,15 @@ public:
             return out;
         }
         if(state==State::mantle) {
-            const float next=std::min(1.0f,mantleTime+dt/topSeconds());
+            float next=std::min(1.0f,mantleTime+dt/topSeconds());
+            const float release=std::max(cfg.threepeatProfile.mantleRelease[0][1],cfg.threepeatProfile.mantleRelease[1][1]);
+            const bool tail=cfg.threepeatMantleSeconds>0&&!lowTopStep()&&!mantleCrest&&topSamplePhase(next)>release;
+            if(tail) {
+                auto rate=[&](float phase){return 1.f+ease((topSamplePhase(phase)-release)/.14f);};
+                const float step=dt/(8.f*topSeconds());next=mantleTime;
+                for(int sample=0;sample<8;++sample)next+=step*rate(next+step*.5f*rate(next));
+                next=std::min(1.f,next);
+            }
             if(threepeatMantle&&((mantleTime<0&&(!support(w,position,normal*-1)||!edgeFeetSupported(w,position,normal)))||!threepeatTopStillValid(w,next))) {
                 out.motion=topMotion();out.releaseVelocity={0,0,-30};
                 stop();out.released=true;out.reason="new mantle support changed";return out;
@@ -582,8 +589,14 @@ public:
                 }
             }
 
-            const Vec target=topPathPoint(next);
-            if(!clearPath(w,position,target,true)) { stop(); out.released=true;out.reason="top-out path changed";return out; }
+            Vec target=position;float phase=std::max(0.f,mantleTime);
+            do {
+                float point=tail?std::min(next,phase+1.f/32.f):next;
+                if(tail)for(float knot:{.60f,.88f})if(phase<knot&&point>knot)point=knot;
+                const Vec checked=topPathPoint(point);
+                if(!clearPath(w,target,checked,true)) {stop();out.released=true;out.reason="top-out path changed";return out;}
+                target=checked;phase=point;
+            }while(phase<next);
             position=target; mantleTime=next; out.motion=topMotion();
             if(next>=1) { stop(); out.released=true; out.completed=true;out.reason=mantleCrest?"roof crest reached":"top-out complete"; }
             return out;
@@ -630,10 +643,12 @@ public:
             }
 
             const bool verticalFallback=std::abs(rise)>.00001f&&!verticalStep&&std::abs(input.x)<.1f;
-            auto step=verticalFallback?std::optional<CornerStep>{}:advanceCornerRoute(w,cfg,trial,travel,clear);
+            const bool checkedVertical=verticalStep&&travel==0.f&&std::isfinite(trial.distance)&&
+                trial.distance>.001f&&trial.distance<trial.length-.001f;
+            auto step=verticalFallback?std::optional<CornerStep>{}:checkedVertical?verticalStep:advanceCornerRoute(w,cfg,trial,travel,clear);
             bool shifted=verticalStep.has_value();
             bool lateral=step&&std::abs(trial.distance-cornerRoute.distance)>.00001f;
-            if(step&&shifted&&lateral&&(!clearPath(w,position,step->position)||!cornerBodyClear(w,cfg,position,step->position,inclinedCorner))) {
+            if(step&&shifted&&lateral&&(!clearPath(w,position,step->position)||!cornerBodyClear(w,cfg,position,step->position,inclinedCorner,true))) {
 
                 if(std::abs(input.y)>std::abs(input.x)) {
                     trial=verticalRoute;step=verticalStep;lateral=false;
@@ -1964,4 +1979,5 @@ private:
     }
 };
 }
+
 

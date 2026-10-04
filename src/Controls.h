@@ -10,7 +10,7 @@ inline Input wallInput(Keys k,bool spacePressed,bool autoMantle=true,bool justAt
         autoMantle&&k.w,spacePressed&&!k.s&&!k.shift&&!wasWallRunning,k.s,k.shift&&!k.s};
 }
 inline bool entryChord(Keys k) {return k.bindingsMapped?k.entry:k.w&&k.a&&k.d&&k.space;}
-inline bool approachIntent(Keys k) {return entryChord(k)&&!k.s;}
+inline bool approachIntent(Keys k) {return entryChord(k)&&!k.s&&!k.letGo;}
 class WallRunEntryGate {
     bool heldAtEntry{};
 public:
@@ -36,7 +36,7 @@ public:
         if(attached||suspended){blockUntilRelease();return {};}
         const bool chord=entryChord(k);
         if(blocked){if(!chord)blocked=false;return {};}
-        if(k.s){blockUntilRelease();return {};}
+        if(k.s||k.letGo){blockUntilRelease();return {};}
         if(!chord){gesture=originAirborne=false;return {};}
         const bool began=!gesture;
         if(began){gesture=true;originAirborne=confirmedAirborne;}
@@ -44,6 +44,12 @@ public:
     }
     bool waitingForRelease()const{return blocked;}
 };
+inline bool entryProbeReady(float& remaining,float dt,bool fresh) {
+    if(!std::isfinite(dt)||dt<=0)return false;
+    remaining=std::max(0.f,remaining-dt);
+    if(remaining>0&&!fresh)return false;
+    remaining=.08f;return true;
+}
 class EntryPreparationGrace {
     float remaining{};
     bool gamepad{};

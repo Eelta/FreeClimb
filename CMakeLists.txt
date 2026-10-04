@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(FreeClimb VERSION 0.2.30 LANGUAGES CXX)
+project(FreeClimb VERSION 0.2.43 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(FREECLIMB_PLUGIN "Build the Windows SKSE plugin" ON)
