@@ -287,7 +287,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--runtime-assets", type=Path, default=ROOT / "runtime")
     parser.add_argument("--dll", type=Path, default=ROOT / "build-multiruntime/Release/FreeClimb.dll")
+    parser.add_argument("--no-sneak-dll", type=Path)
     arguments = parser.parse_args()
+    no_sneak_dll = arguments.no_sneak_dll.resolve() if arguments.no_sneak_dll else None
+    if no_sneak_dll and (not regular_file(no_sneak_dll, ROOT) or
+                         b"Build variant: no-climb-sneak; automatic traversal sneak state disabled" not in no_sneak_dll.read_bytes()):
+        raise ValueError("Expected a no-climb-sneak DLL built inside the project")
     release_version = version()
     files = runtime_files(arguments.runtime_assets.resolve(), arguments.dll.resolve())
     sources = {p.relative_to(ROOT).as_posix(): p for p in source_files()}
@@ -318,6 +323,9 @@ def main():
     complete_sources = {**sources, **dependency_sources, "DEPENDENCY-SOURCES.json": dependency_manifest_path}
     complete_zip = release / policy['source_archive']
     make_zip(complete_zip, complete_sources)
+    optional_zip = release / 'FreeClimb-No-Climb-Sneak.zip'
+    if no_sneak_dll:
+        make_zip(optional_zip, {'SKSE/Plugins/FreeClimb.dll': no_sneak_dll})
     report = {
         "version": release_version,
         "runtime_files": len(files), "source_files": len(sources),
@@ -327,6 +335,9 @@ def main():
         "dll_sha256": hashes["SKSE/Plugins/FreeClimb.dll"],
         "manifest": str(diagnostics / "SHA256.json"),
     }
+    if no_sneak_dll:
+        report['optional_no_sneak'] = {'path': str(optional_zip), 'sha256': sha256(optional_zip),
+                                      'dll_sha256': sha256(no_sneak_dll)}
     (diagnostics / "package.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))
 

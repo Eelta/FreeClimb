@@ -1,4 +1,5 @@
 #pragma once
+#include "SceneBoneName.h"
 #include <algorithm>
 #include <array>
 #include <span>
@@ -25,7 +26,7 @@ inline bool engineOwnedEquipmentTrack(std::size_t i,std::span<const std::string>
 inline bool engineOwnedEquipmentName(std::string_view name,std::span<const std::string> names,std::span<const int> parents) {
     if(names.size()!=99||parents.size()!=99)return false;
     for(std::size_t i=0;i<names.size();++i)
-        if(name==names[i]&&engineOwnedEquipmentTrack(i,names,parents))return true;
+        if(sameSceneBoneName(name,names[i])&&engineOwnedEquipmentTrack(i,names,parents))return true;
     return false;
 }
 
@@ -40,7 +41,7 @@ inline bool engineOwnedMagicTrack(std::size_t i,std::span<const std::string> nam
 inline bool engineOwnedAttachmentName(std::string_view name,std::span<const std::string> names,std::span<const int> parents) {
     if(names.size()!=99||parents.size()!=99)return false;
     for(std::size_t i=0;i<names.size();++i)
-        if(name==names[i]&&(engineOwnedEquipmentTrack(i,names,parents)||engineOwnedMagicTrack(i,names,parents)))return true;
+        if(sameSceneBoneName(name,names[i])&&(engineOwnedEquipmentTrack(i,names,parents)||engineOwnedMagicTrack(i,names,parents)))return true;
     return false;
 }
 

@@ -1,6 +1,6 @@
 {
   "schema": 2,
-  "version": "0.2.55",
+  "version": "0.2.58",
   "pack": "meshes/actors/character/animations/FreeClimb/pack.json",
   "format": "SkyrimSE/hk_2010.2.0-r1/interleaved/64bitLE",
   "motions": 31,

@@ -43,7 +43,9 @@ GOG 1.6.1179 需要 GOG 专用的 SKSE64 2.2.6，以及包含 `Data/SKSE/Plugins
 
 启用耐力消耗时，墙跑每秒耗耐力为攀岩的 **2 倍**。
 
-攀岩使用游戏的潜行状态，不播放下蹲动作。墙跑、完成登顶、后蹬离墙和原地松手都会清除潜行状态，不恢复进墙前的潜行；离墙后可正常手动下蹲。
+“攀岩时启用潜行”默认关闭。可在设置菜单的“常规”页开启，也可在 `FreeClimb.ini` 的 `[General]` 中设置 `ClimbSneakEnabled=1`，使用游戏的潜行状态但不播放下蹲动作。菜单修改自动保存并立即生效，墙上也可切换。此选项可能与镜头模组存在兼容问题；出现镜头抖动时请关闭。开启时，墙跑、完成登顶、后蹬离墙和原地松手都会清除潜行状态，不恢复进墙前的潜行；离墙后可正常手动下蹲。
+
+可选文件 `FreeClimb-No-Climb-Sneak.zip` 关闭上述自动潜行状态切换，其余功能不变。先安装配套主包，离墙存档并退出游戏，再让可选包覆盖主包的 `SKSE/Plugins/FreeClimb.dll`；不需要修改 INI 或刷新动作。移除该覆盖包即可恢复默认版。可选版不改写玩家原本的潜行状态；若从墙上存档切换后仍处于潜行，手动退出潜行即可。 可选版的菜单开关不可用；使用主包 DLL 才能通过菜单控制此功能。
 
 菜单、控制台及可识别的游戏时间冻结会暂停攀爬并保持附着，恢复游戏后才继续移动、动作进度与耐力消耗。关闭菜单后，先松开原先按住的动作键，再重新按下。
 
@@ -141,6 +143,8 @@ powershell -ExecutionPolicy Bypass -File tools/build.ps1
 ```
 
 输出为 `build-multiruntime/Release/FreeClimb.dll`。`FreeClimb-source.zip` 源码包包含 CommonLibSSE-NG、spdlog、rapidcsv、DirectXTK、MinHook、nlohmann/json 和菜单 API 头；固定版本与文件校验分别见 `tools/dependencies.json` 和 `DEPENDENCY-SOURCES.json`。DLL 编译不需要游戏目录或动作素材。
+
+加上 `-NoSneak` 可同时编译关闭自动潜行的可选版，输出为 `build-multiruntime/NoSneak/Release/FreeClimb.dll`。打包、校验时为 `tools/package.py` 和 `tools/validate.py` 传入 `--no-sneak-dll build-multiruntime/NoSneak/Release/FreeClimb.dll`；两个主包保持默认行为，另生成仅含可选 DLL 的 `FreeClimb-No-Climb-Sneak.zip`。
 
 需要重新编译制作助手时，在构建命令后加 `-AuthoringTools`，再将 `build-multiruntime/Release/FreeClimbAuthoring.exe` 复制到 `tools/authoring/bin/FreeClimbAuthoring.exe`，与源码包一起分发。
 

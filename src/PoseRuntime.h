@@ -56,7 +56,8 @@ private:
         RE::NiPointer<RE::NiAVObject> root;
         std::unordered_map<RE::NiAVObject*,std::size_t> slots;
         std::unordered_map<const RE::NiTransform*,RE::NiAVObject*> worldNodes;
-        std::unordered_map<RE::NiAVObject*,std::vector<RE::NiTransform*>> flatAliases;
+        std::unordered_map<RE::NiAVObject*,std::vector<std::size_t>> flatAliases;
+        std::shared_ptr<const FlatNameSnapshot> flatNames;
 
         std::vector<RE::NiPointer<RE::NiAVObject>> nodes;
         std::vector<RE::NiAVObject*> parents;
@@ -79,6 +80,7 @@ private:
         SceneBinding<SceneSlot> scene;
         std::vector<RE::NiPointer<RE::NiAVObject>> bridges;
         std::shared_ptr<const OutputRig> outputRig;
+        std::shared_ptr<FlatNameSnapshot> flatNames;
         RE::NiPointer<RE::NiAVObject> actorRoot;
         RE::hkRefPtr<const RE::hkaSkeleton> skeleton;
         AnimationSkeletonLayout<RE::hkaBone,RE::hkQsTransform> skeletonData;
@@ -105,6 +107,10 @@ private:
         rigIssue.store((std::uint32_t(issue)<<16)|std::uint32_t(bone+1));return false;
     }
     std::uint32_t reusedBindings{};
+    std::uintptr_t lookupDiagnosticRoot{},lookupDiagnosticData{};
+    std::size_t lookupDiagnosticCount{};
+    int lookupDiagnosticBone=-1;
+    std::uint64_t lookupDiagnosticTime{};
     Pose published;
     PoseHandoff handoff;
     NativePoseHistory nativeHistory;
@@ -264,14 +270,20 @@ private:
     bool captureRig(Binding& binding) {
         const auto entries=flatEntries(binding.root.get());
         if(!entries){bindingFailure="invalid flattened scene storage";return false;}
+        if(!binding.flatNames||!binding.flatNames->current(binding.root.get())){bindingFailure="flattened scene identity changed during binding";return false;}
         binding.flatData=entries->data();binding.flatCount=entries->size();
         binding.flatIndices.fill(-1);binding.flatParents.fill(-1);
         binding.reference=library.rig.source().empty()?library.rest:library.rig.source();
         binding.animationReference=binding.reference;
         for(std::size_t i=0;i<99;++i)if(binding.animation.indices[i]>=0)
             binding.animationReference[i]=read(binding.skeletonData.references[binding.animation.indices[i]]);
-        const auto attachment=[&](const RE::BSFixedString& name) {
-            return name.c_str()&&engineOwnedAttachmentName(name.c_str(),library.names,library.parents);
+        const auto attachment=[&](RE::NiAVObject* node) {
+            if(node->name.c_str()&&engineOwnedAttachmentName(node->name.c_str(),library.names,library.parents))return true;
+            for(std::size_t index=0;index<binding.flatNames->entries.size();++index)if(binding.flatNames->entries[index].node==node) {
+                binding.flatNames->entries[index].verifyNodeName=true;
+                if(binding.flatNames->attachment(index,library.names,library.parents))return true;
+            }
+            return false;
         };
         bool valid=true;int failed=-1;const char* reason="unsupported structural transform";
         const auto fail=[&](std::size_t i,const char* message){valid=false;failed=int(i);reason=message;};
@@ -282,8 +294,9 @@ private:
             binding.selected[i]=true;binding.locked[i]=binding.skeletonData.bones[index].lockTranslation;
             binding.reference[i]=PoseRig<Pose>::structuralReference(i,read(slot.local()),read(binding.skeletonData.references[index]),binding.locked[i]);
             binding.nodeParents[i]=slot.node?slot.node->parent:nullptr;
-            if(slot.flat)for(std::size_t j=0;j<entries->size();++j)if(&(*entries)[j].local==slot.flat) {
-                binding.flatIndices[i]=int(j);binding.flatParents[i]=(*entries)[j].parentIndex;break;
+            for(std::size_t j=0;j<entries->size();++j)if((slot.flat&& &(*entries)[j].local==slot.flat)||(slot.node&&(*entries)[j].node==slot.node.get())) {
+                if(binding.flatIndices[i]<0){binding.flatIndices[i]=int(j);binding.flatParents[i]=(*entries)[j].parentIndex;}
+                binding.flatNames->entries[j].verifyNodeName=bool(slot.node);
             }
             if(i==0)return;
             const auto parentIndex=library.parents[i];
@@ -295,7 +308,7 @@ private:
                 auto* ancestor=slot.node->parent;
                 for(unsigned depth=0;ancestor&&ancestor!=parent.node.get()&&depth<128;++depth) {
                     if(ancestor==binding.root.get()){fail(i,"mapped parent is not an actual ancestor");return;}
-                    if(attachment(ancestor->name)){fail(i,"engine-owned attachment is an ancestor of a body bone");return;}
+                    if(attachment(ancestor)){fail(i,"engine-owned attachment is an ancestor of a body bone");return;}
                     bool mapped=false;
                     binding.scene.each([&](std::size_t,const auto& entry){mapped|=entry.node.get()==ancestor;});
                     if(mapped){fail(i,"actual ancestor order differs from animation hierarchy");return;}
@@ -308,10 +321,13 @@ private:
                     if(index<0){found=parent.node==binding.root;break;}
                     if(std::size_t(index)>=entries->size()){fail(i,"flattened parent index is invalid");return;}
                     auto& entry=(*entries)[index];
-                    if(attachment(entry.nodeName)||(entry.node&&attachment(entry.node->name))) {
+                    if(binding.flatNames->attachment(std::size_t(index),library.names,library.parents)||(entry.node&&attachment(entry.node))) {
                         fail(i,"engine-owned attachment is an ancestor of a body bone");return;
                     }
                     if((entry.node&&entry.node==parent.node.get())||&entry.local==parent.flat){found=true;break;}
+                    bool mapped=false;
+                    binding.scene.each([&](std::size_t,const auto& item){mapped|=(entry.node&&item.node.get()==entry.node)||item.flat==&entry.local;});
+                    if(mapped){fail(i,"actual flattened ancestor order differs from animation hierarchy");return;}
                     path.push_back(entry.node?SceneSlot{RE::NiPointer<RE::NiAVObject>(entry.node),nullptr}:
                         SceneSlot{{},&entry.local,&entry.world});
                     index=entry.parentIndex;
@@ -338,7 +354,9 @@ private:
         if(!binding.graph->characterInstance.setup||binding.graph->characterInstance.setup->animationSkeleton.get()!=binding.skeleton.get())return rejectRig(RigIssue::graph);
         const auto* skeleton=binding.skeleton.get();
         if(animationSkeletonLayout(*skeleton)!=binding.skeletonData)return rejectRig(RigIssue::arrays);
-        if(!sameFlatStorage(binding.root.get(),binding.flatData,binding.flatCount))return rejectRig(RigIssue::storage);
+        if(!sameFlatStorage(binding.root.get(),binding.flatData,binding.flatCount)||!binding.flatNames||
+            !binding.flatNames->currentStorage(binding.root.get()))return rejectRig(RigIssue::storage);
+        if(!binding.flatNames->current(binding.root.get()))return rejectRig(RigIssue::hierarchy);
         if(auto* player=RE::PlayerCharacter::GetSingleton();!player||player->Get3D(false)!=binding.actorRoot.get())return rejectRig(RigIssue::model);
         auto* ancestor=binding.root.get();
         for(unsigned depth=0;ancestor&&ancestor!=binding.actorRoot.get()&&depth<128;++depth)ancestor=ancestor->parent;
@@ -377,7 +395,7 @@ private:
         acceptedScene.store(nullptr);target=nullptr;rigInvalidated=true;
     }
     static std::shared_ptr<const OutputRig> makeOutputRig(const Binding& binding) {
-        auto rig=std::make_shared<OutputRig>();rig->root=binding.root;
+        auto rig=std::make_shared<OutputRig>();rig->root=binding.root;rig->flatNames=binding.flatNames;
         rig->parents.resize(99+binding.bridges.size());rig->flatData=binding.flatData;rig->flatCount=binding.flatCount;
         const auto add=[&](RE::NiAVObject* node,std::size_t slot) {
             rig->slots.emplace(node,slot);rig->nodes.emplace_back(node);
@@ -387,9 +405,10 @@ private:
         binding.scene.each([&](std::size_t i,const auto& bone){if(bone.node)add(bone.node.get(),i);});
         for(std::size_t i=0;i<binding.bridges.size();++i)add(binding.bridges[i].get(),99+i);
         if(const auto entries=flatEntries(binding.root.get())) {
-            for(auto& entry:*entries) {
+            for(std::size_t index=0;index<entries->size();++index) {
+                auto& entry=(*entries)[index];
                 if(entry.node&&rig->slots.contains(entry.node)) {
-                    rig->flatAliases[entry.node].push_back(&entry.world);
+                    rig->flatAliases[entry.node].push_back(index);
                     rig->worldNodes.emplace(&entry.world,entry.node);
                 }
             }
@@ -405,13 +424,19 @@ private:
         }
         return local;
     }
+    static bool currentOutputNode(const OutputRig& rig,RE::NiAVObject* node) {
+        if(!sameFlatStorage(rig.root.get(),rig.flatData,rig.flatCount)||!rig.flatNames->currentStorage(rig.root.get()))return false;
+        if(const auto aliases=rig.flatAliases.find(node);aliases!=rig.flatAliases.end())
+            for(const auto index:aliases->second)if(!rig.flatNames->currentEntry(rig.root.get(),index))return false;
+        return true;
+    }
     void lateWorld(RE::NiAVObject* node,RE::NiUpdateData* data,WorldData original,void* caller) {
         const auto output=acceptedScene.load();
         if(!output){original(node,data);return;}
         const auto found=output->rig->slots.find(node);
         if(found==output->rig->slots.end()){original(node,data);return;}
         if(rigInvalidated.load()){original(node,data);return;}
-        if(!sameFlatStorage(output->rig->root.get(),output->rig->flatData,output->rig->flatCount)) {
+        if(!currentOutputNode(*output->rig,node)) {
             rejectRig(RigIssue::storage);invalidateRig();original(node,data);return;
         }
         if(node->parent!=output->rig->parents[found->second]||!validSceneTransform(node->local)) {
@@ -424,11 +449,11 @@ private:
             ScopedLocalOverride guard(node->local,desired);
             original(node,data);
         } else original(node,data);
-        if(!sameFlatStorage(output->rig->root.get(),output->rig->flatData,output->rig->flatCount)) {
+        if(!currentOutputNode(*output->rig,node)) {
             rejectRig(RigIssue::storage);invalidateRig();return;
         }
         if(const auto aliases=output->rig->flatAliases.find(node);aliases!=output->rig->flatAliases.end())
-            for(auto* alias:aliases->second)*alias=node->world;
+            for(const auto index:aliases->second)output->rig->flatData[index].world=node->world;
         if(lateWorldUpdates.fetch_add(1)==0&&traceOutput) {
             HMODULE module{};wchar_t filename[MAX_PATH]{};
             if(GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -639,7 +664,7 @@ private:
         update.flags=static_cast<RE::NiUpdateData::Flag>(effectiveUpdateDataFlags(pass,data.flags.underlying(),true));
         const bool repairedSelectedFlag=update.flags!=data.flags;
         original(update);
-        if(!sameFlatStorage(sceneRoot.get(),outputRig->flatData,outputRig->flatCount)) {
+        if(!sameFlatStorage(sceneRoot.get(),outputRig->flatData,outputRig->flatCount)||!outputRig->flatNames->current(sceneRoot.get())) {
             scene.each([&](std::size_t i,const auto& bone){if(bone.node){if(!terminal)bone.node->local=saved[i];bone.node->GetFlags()=savedFlags[i];}});
             for(std::size_t i=0;i<bridges.size();++i)bridges[i]->GetFlags()=bridgeFlags[i];
             lock.lock();--pendingScenePasses;
@@ -848,15 +873,30 @@ private:
             }
             next.root=RE::NiPointer<RE::NiAVObject>(existingNode(actorRoot,library.names[0]));
             if(!next.root){bindingFailure="existing NPC Root unavailable";continue;}
-            next.scene=bindRuntimeScene(next.root.get(),library.names,library.parents);
+            next.flatNames=std::make_shared<FlatNameSnapshot>();
+            next.scene=bindRuntimeScene(next.root.get(),library.names,library.parents,next.flatNames.get());
             if(!next.scene) {
-                bindingFailure="required model bone missing";
+                bindingFailure=next.flatNames->valid?"required model bone missing":next.flatNames->issue;
                 SKSE::log::warn("Pose binding rejected: {}: index={} name='{}' actorRoot='{}' project='{}' mapped={}",
                     bindingFailure,next.scene.missing,library.names[next.scene.missing],actorRoot->name.c_str(),g->projectName.c_str(),next.scene.count);
-                const auto detail=describeSceneLookup(actorRoot,next.root.get(),library.names[next.scene.missing]);
-                SKSE::log::warn("Scene lookup diagnostic: actorClass='{}' selectedRoot='{}' rootClass='{}' flat={} bones={} populated={} samples=[{}]; actualInside={} actualOutside={} scanned={} incomplete={}; ancestorFlat=[{}] parentChainIncomplete={}",
-                    detail.actorClass,detail.rootName,detail.rootClass,detail.flat.state,detail.flat.count,detail.flat.populated,detail.flat.samples,
-                    detail.inside,detail.outside,detail.scanned,detail.incomplete,detail.ancestorFlatTrees,detail.parentChainIncomplete);
+                const auto rootIdentity=reinterpret_cast<std::uintptr_t>(next.root.get());
+                const auto entries=flatEntries(next.root.get());
+                const auto dataIdentity=entries?reinterpret_cast<std::uintptr_t>(entries->data()):0;
+                const auto entryCount=entries?entries->size():0;
+                const auto now=GetTickCount64();
+                if(!lookupDiagnosticTime||rootIdentity!=lookupDiagnosticRoot||dataIdentity!=lookupDiagnosticData||entryCount!=lookupDiagnosticCount||
+                    next.scene.missing!=lookupDiagnosticBone||now-lookupDiagnosticTime>=2000) {
+                    lookupDiagnosticRoot=rootIdentity;lookupDiagnosticData=dataIdentity;lookupDiagnosticCount=entryCount;
+                    lookupDiagnosticBone=next.scene.missing;lookupDiagnosticTime=now;
+                    const auto detail=describeSceneLookup(actorRoot,next.root.get(),library.names[next.scene.missing],next.flatNames.get());
+                    SKSE::log::warn("Scene lookup diagnostic: actorClass='{}' selectedRoot='{}' rootClass='{}' flat={} bones={} populated={} samples=[{}]; map={} mapCount={} missingIndex={} missingEntry='{}' missingNode={}; actualInside={} actualOutside={} scanned={} incomplete={}; ancestorFlat=[{}] parentChainIncomplete={}",
+                        detail.actorClass,detail.rootName,detail.rootClass,detail.flat.state,detail.flat.count,detail.flat.populated,detail.flat.samples,
+                        detail.flat.mapState,detail.flat.mapCount,detail.flat.missingIndex,detail.flat.missingEntryName,detail.flat.missingNode,
+                        detail.inside,detail.outside,detail.scanned,detail.incomplete,detail.ancestorFlatTrees,detail.parentChainIncomplete);
+                    SKSE::log::warn("Scene lookup name candidates: requested='{}'; flatCaseOnly={} [{}]; sceneCaseOnlyInside={} sceneCaseOnlyOutside={} [{}]; nearby=[{}]; related=[{}]",
+                        library.names[next.scene.missing],detail.flat.caseOnlyCount,detail.flat.caseOnlyCandidates,
+                        detail.caseOnlyInside,detail.caseOnlyOutside,detail.actualCaseCandidates,detail.flat.nearbyEntries,detail.flat.relatedNames);
+                }
                 continue;
             }
             for(std::size_t i=0;i<99;++i)if(next.animation.indices[i]<0&&next.scene.nodes[i]) {
@@ -871,6 +911,7 @@ private:
             next.footIK=g->doFootIK;
             bindingFailure="none";
             if(!captureRig(next))continue;
+            lookupDiagnosticTime=0;
             next.outputRig=makeOutputRig(next);
             for(auto& old:bindings) {
                 if(old.graph==g&&old.footOwned)next.footIK=old.footIK;
@@ -886,6 +927,9 @@ private:
             bindings.clear();bindings.push_back(std::move(next));reusedBindings=0;
             rigIssue=0;target=bindings[0].root.get();
             if(changed)*changed=true;
+            if(bindings[0].flatNames->caseAliases)
+                SKSE::log::info("Scene bone names matched native case-insensitive lookup: project={} caseAliases={}",
+                    g->projectName.c_str(),bindings[0].flatNames->caseAliases);
             if(layout.parentCount!=count||layout.referenceCount!=count)
                 SKSE::log::info("Animation skeleton bound by named bones: project={}, bones={}, parents={}, references={}; extra entries excluded from pose binding",
                     g->projectName.c_str(),count,layout.parentCount,layout.referenceCount);
@@ -896,7 +940,8 @@ private:
                     bindings[0].animation.remapped,bindings[0].animation.aliases,bindings[0].animation.missingOptional);
                 SKSE::log::info("Pose scene class: {}",bindings[0].root->GetRTTI()->name);
                 std::size_t flat=0;bindings[0].scene.each([&](std::size_t,const auto& slot){if(slot.flat)++flat;});
-                SKSE::log::info("Pose storage: {} animated flat transforms; {} existing nodes; no nodes created",flat,bindings[0].scene.count-flat);
+                SKSE::log::info("Pose storage: {} animated flat transforms; {} existing nodes; nameMapUsed={}; no nodes created",
+                    flat,bindings[0].scene.count-flat,bindings[0].flatNames->mapUsed);
                 SKSE::log::info("Scene propagation owns {} existing intermediate ancestors; locals preserved",bindings[0].bridges.size());
                 SKSE::log::info("Character rig captured: adapted={} mapped={} bridges={} lockedTranslations={} bindingMs={:.3f}",
                     library.rig.active(),bindings[0].scene.count,bindings[0].bridges.size(),

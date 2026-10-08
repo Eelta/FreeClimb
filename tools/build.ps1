@@ -2,6 +2,7 @@
 param(
     [switch] $Tests,
     [switch] $AuthoringTools,
+    [switch] $NoSneak,
     [Alias('MotionLibrary')][string] $AnimationPack = '',
     [string] $HkxDirectory = '',
     [string] $BuildDirectory = 'build-multiruntime',
@@ -96,7 +97,9 @@ try {
     Run-Checked 'cmake' @('--build', $directXBuild, '--config', $Configuration, '--target', 'install', '--parallel', "$Parallel")
     $testing = if ($Tests) { 'ON' } else { 'OFF' }
     $authoring = if ($AuthoringTools) { 'ON' } else { 'OFF' }
+    $optionalNoSneak = if ($NoSneak) { 'ON' } else { 'OFF' }
     $configure = @('-S', $projectRoot, '-B', $output, '-G', 'Visual Studio 17 2022', '-A', 'x64', '-DFREECLIMB_PLUGIN=ON', "-DBUILD_TESTING=$testing", "-DFREECLIMB_AUTHORING_TOOLS=$authoring", '-DFREECLIMB_LOCAL_TESTS=OFF')
+    $configure += "-DFREECLIMB_BUILD_NO_SNEAK=$optionalNoSneak"
     if ($AnimationPack) {
         $motionPath = (Resolve-Path -LiteralPath $AnimationPack).Path
         $configure += "-DFREECLIMB_MOTION_FILE=$motionPath"
@@ -112,9 +115,11 @@ try {
     Run-Checked 'cmake' $configure
     $build = @('--build', $output, '--config', $Configuration, '--parallel', "$Parallel")
     if (!$Tests) { $build += @('--target', 'FreeClimb'); if ($AuthoringTools) { $build += @('FreeClimbAuthoring', 'FreeClimbHKXConverter', 'FreeClimbConverter') } }
+    if (!$Tests -and $NoSneak) { $build += 'FreeClimbNoSneak' }
     Run-Checked 'cmake' $build
     if ($Tests) { Run-Checked 'ctest' @('--test-dir', $output, '-C', $Configuration, '--output-on-failure') }
     Write-Output "Built $output\$Configuration\FreeClimb.dll"
+    if ($NoSneak) { Write-Output "Built optional DLL $output\NoSneak\$Configuration\FreeClimb.dll" }
 } finally {
     Pop-Location
 }

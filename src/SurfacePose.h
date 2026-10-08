@@ -1,7 +1,8 @@
 #pragma once
 
 class SurfacePose {
-    struct Contact {Vec point{};float weight{};bool valid{},retiring{};};
+    struct ContactPose {Vec nominal{},start{},pole{},normal{};Quat upper{},middle{};float scale{};};
+    struct Contact {Vec point{},rejectedPoint{};ContactPose rejectedPose{};float weight{};bool valid{},retiring{},rejected{};};
     std::array<Contact,4> contacts{};
     Pose previous,penultimate,transitionFrom,previousAuthored;
     PoseContinuation continuation;
@@ -17,7 +18,7 @@ class SurfacePose {
     float stopPhase{};
     Quat runOrientation,actionOrientation;
     Vec actionHeading{};
-    float sideGrip{},surfaceOffset{};
+    float sideGrip{},surfaceOffset{},surfaceMissSeconds{};
     Vec lastPosition{},lastNormal{};
     std::array<Vec,2> topInitialPalms{};
     std::array<Vec,2> topReplant{};
@@ -46,7 +47,7 @@ public:
     int runFootContacts{};
     float measuredSurfaceGap{},appliedSurfaceGap{};
     unsigned surfaceSamples{};
-    bool surfaceGapValid{};
+    bool surfaceGapValid{},surfaceHeld{};
     std::array<float,2> surfacePalmGaps{};
 
     float movementScale() const {return 1.f;}
@@ -55,6 +56,8 @@ public:
     float blendProgress() const {return transition;}
     Motion bridgeMotion() const {return bridge;}
     Motion bridgeWallRunDirection() const {return bridgeDirection;}
+    unsigned rejectedIdleContacts() const {return unsigned(std::count_if(contacts.begin(),contacts.end(),[](const auto& value){return value.rejected;}));}
+    float surfaceHoldSeconds() const {return surfaceHeld?surfaceMissSeconds:0.f;}
     void reset() {*this={};}
     Pose update(const Library& lib,World& world,const Traversal& traversal,Motion motion,float dt,float scale) {
         dt=std::clamp(dt,0.f,.05f);scale=std::clamp(scale,.5f,2.f);
@@ -106,7 +109,9 @@ public:
         const bool mantle=newMantle;
         const bool entry=catchEntry(motion);
         const bool supportedPlacement=loop&&!edgeAction&&(traversal.state==State::wall||traversal.state==State::ledge);
-        surfaceSamples=0;surfaceGapValid=false;surfacePalmGaps={};measuredSurfaceGap=traversal.cfg.gap;
+        const bool stationaryIdle=started&&motion==Motion::hang&&!authoredPlayback&&motion==lastMotion&&supportedPlacement&&
+            (pos-lastPosition).length()<=.025f*scale&&(n-lastNormal).length()<.001f;
+        surfaceSamples=0;surfaceGapValid=false;surfaceHeld=false;surfacePalmGaps={};measuredSurfaceGap=traversal.cfg.gap;
         Vec measuredPoint{},measuredNormal{};
         float surfaceGoal=0;
         if(supportedPlacement) {
@@ -138,10 +143,15 @@ public:
                 if(measured)break;
             }
             if(measured) {
+                surfaceMissSeconds=0;
                 measuredSurfaceGap=*measured;surfaceGapValid=true;
                 surfaceGoal=std::abs(*measured-traversal.cfg.gap)<.1f?0.f:
                     std::clamp(*measured-traversal.cfg.gap,0.f,20.f);
             }
+        }
+        if(!surfaceGapValid) {
+            surfaceMissSeconds=std::min(.2f,surfaceMissSeconds+dt);
+            if(stationaryIdle&&surfaceMissSeconds<=.1f&&surfaceOffset>0) {surfaceGoal=surfaceOffset;surfaceHeld=true;}
         }
         surfaceOffset=started?surfaceOffset+std::clamp(surfaceGoal-surfaceOffset,-90.f*dt,90.f*dt):surfaceGoal;
         const float poseGap=traversal.cfg.gap+surfaceOffset;
@@ -619,10 +629,24 @@ public:
         if(!authoredPlayback&&(parkour||departing||runEntry))weights={0,0,0,0};
         if(!authoredPlayback&&running)weights[0]=weights[1]=0;
         constexpr int starts[]={28,31,6,9},mids[]={29,32,7,10},ends[]={38,39,8,11};
+        std::array<ContactPose,4> contactPoses{};
+        auto sameContactPose=[&](const ContactPose& a,const ContactPose& b) {
+            const float distance=.25f*scale;
+            return (a.nominal-b.nominal).length()<distance&&(a.start-b.start).length()<distance&&
+                (a.pole-b.pole).length()<distance&&(a.normal-b.normal).length()<.001f&&std::abs(a.scale-b.scale)<.001f&&
+                angleBetween(a.upper,b.upper)<.01f&&angleBetween(a.middle,b.middle)<.01f;
+        };
+        auto rejectIdleContact=[&](int index) {
+            if(!stationaryIdle)return;
+            auto& contact=contacts[index];contact.rejected=true;
+            contact.rejectedPoint=contact.point;contact.rejectedPose=contactPoses[index];
+        };
         maxReachError=0;contactCount=sidePalmContact?1:0;
         for(int i=0;i<4;++i) {
             auto w=lib.world(p);auto& c=contacts[i];
             const Vec nominal=toWorld(w[ends[i]].t);
+            contactPoses[i]={nominal,toWorld(w[starts[i]].t),toWorld(w[mids[i]].t),traversal.surfaceNormal,p[starts[i]].q,p[mids[i]].q,scale};
+            if(!stationaryIdle||weights[i]<.01f||!sameContactPose(c.rejectedPose,contactPoses[i]))c.rejected=false;
             if(!authoredPlayback&&running&&i>=2) {
 
                 auto& footContact=contacts[i];footContact={};
@@ -710,7 +734,25 @@ public:
                     const float offset=i<2?5.f:8.f;
                     const Vec surface=hit->normal.unit();
                     const Vec target=nominal+surface*(offset*scale-(nominal-hit->point).dot(surface));
-                    if((target-nominal).length()<10*scale){c.point=target;c.valid=true;c.retiring=false;c.weight=std::min(c.weight,dt*10);}
+                    if((target-nominal).length()<10*scale) {
+                        if(c.rejected&&(target-c.rejectedPoint).length()<.25f*scale){c.weight=0;continue;}
+                        if(stationaryIdle) {
+                            const auto goal=toLocal(target),start=w[starts[i]].t;
+                            const float reach=(w[mids[i]].t-start).length()+(w[ends[i]].t-w[mids[i]].t).length();
+                            bool supported=(goal-start).length()<=reach+.5f;
+                            if(supported&&i<2) {
+                                const Vec reachable=(goal-start).length()>reach-.04f?start+(goal-start).unit()*(reach-.04f):goal;
+                                const Vec weighted=w[ends[i]].t+(reachable-w[ends[i]].t)*weights[i];
+                                auto checked=p;solveIK(checked,starts[i],mids[i],ends[i],weighted,w[mids[i]].t);
+                                supported=angleBetween(authored[starts[i]].q,checked[starts[i]].q)<=.65f&&
+                                    angleBetween(authored[mids[i]].q,checked[mids[i]].q)<=.75f&&lib.armBendValid(checked,i);
+                            }
+                            if(!supported) {
+                                c.point=target;rejectIdleContact(i);c.weight=0;continue;
+                            }
+                        }
+                        c.rejected=false;c.point=target;c.valid=true;c.retiring=false;c.weight=std::min(c.weight,dt*10);
+                    }
                 }
             }
             if(!c.valid)continue;
@@ -718,7 +760,7 @@ public:
             const float reach=(w[mids[i]].t-start).length()+(w[ends[i]].t-w[mids[i]].t).length();
             if((target-start).length()>reach+.5f){
                 if(!c.retiring)++retiredContacts;
-                c.retiring=true;
+                c.retiring=true;rejectIdleContact(i);
             }
             if((target-start).length()>reach-.04f)target=start+(target-start).unit()*(reach-.04f);
 
@@ -732,7 +774,7 @@ public:
             if(i<2&&(angleBetween(authored[starts[i]].q,p[starts[i]].q)>.65f||
                 angleBetween(authored[mids[i]].q,p[mids[i]].q)>.75f)) {
                 p[starts[i]]=authored[starts[i]];p[mids[i]]=authored[mids[i]];
-                c.retiring=true;++retiredContacts;continue;
+                c.retiring=true;rejectIdleContact(i);++retiredContacts;continue;
             }
             lib.contactOrientation(p,ends[i],localOrientation,orientation);++contactCount;
         }
@@ -1007,7 +1049,7 @@ public:
         }
         const auto correctedArms=authoredPlayback?0:lib.guardArmBends(p);
         for(int hand=0;hand<2;++hand)if(correctedArms&(1u<<hand)) {
-            contacts[hand].retiring=true;
+            contacts[hand].retiring=true;rejectIdleContact(hand);
             if(sidewaysRun)sidePalmContact=false;
         }
         if(!authoredPlayback)lib.forearmTwist(p);

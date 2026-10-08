@@ -26,22 +26,29 @@ struct Actor {
     bool SetGraphVariableBool(std::string_view,bool){++graphWrites;return true;}
 };
 static void inputBoundary() {
-    const UserSettings active{};auto requested=active;
+    UserSettings active;active.climbSneakEnabled=true;auto requested=active;
     requested.bindings.entry=parseKeyChord("LShift+W").value();
     requested.gamepad.enabled=false;requested.gamepad.deadzone=.4f;requested.gamepad.triggerThreshold=.7f;
     requested.threepeatAnimations=false;requested.upSpeed=137;requested.diagnostics=true;
     requested.staminaEnabled=false;requested.automaticClimbActions=false;requested.wallRunEnabled=false;
+    requested.climbSneakEnabled=false;
     check(deferredRuntimeSettings(active,requested),"input and animation edits need safe detach");
     const auto live=liveRuntimeSettings(active,requested,true);
     check(live.bindings==active.bindings&&live.gamepad==active.gamepad,"active input ownership is preserved");
     check(live.threepeatAnimations==active.threepeatAnimations,"active animation calibration is preserved");
     check(live.upSpeed==137&&live.diagnostics&&!live.staminaEnabled&&!live.automaticClimbActions&&!live.wallRunEnabled,"ordinary edits apply during traversal");
+    check(!live.climbSneakEnabled,"Climbing sneak turns off immediately while input changes wait for safe detach");
     check(requested.bindings!=active.bindings&&!requested.gamepad.enabled,"pending requested inputs remain intact");
     const auto complete=liveRuntimeSettings(live,requested,false);
     check(complete.bindings==requested.bindings&&complete.gamepad==requested.gamepad&&!complete.threepeatAnimations,"safe detach activates deferred inputs and animation option");
     check(!deferredRuntimeSettings(complete,requested),"fully applied request no longer stays pending");
     auto ordinary=active;ordinary.upSpeed=124;ordinary.audioVolume=.3f;ordinary.diagnostics=true;ordinary.wallRunEnabled=false;
     check(!deferredRuntimeSettings(active,ordinary),"ordinary changes do not wait for safe detach");
+    auto sneakOnly=active;sneakOnly.climbSneakEnabled=false;
+    check(!deferredRuntimeSettings(active,sneakOnly)&&!liveRuntimeSettings(active,sneakOnly,true).climbSneakEnabled,
+        "Changing only climbing sneak applies on the wall without a deferred request");
+    check(!deferredRuntimeSettings(sneakOnly,active)&&liveRuntimeSettings(sneakOnly,active,true).climbSneakEnabled,
+        "Reenabling climbing sneak also applies immediately while input ownership is retained");
 }
 static void preservedCalibration() {
     auto cfg=fc_test::settings();
@@ -79,14 +86,14 @@ static void movementAndStamina() {
 }
 static void pausedAction() {
     auto geometry=wall();auto t=attached(geometry);
-    UserSettings active;active.automaticClimbActions=false;active.surfaceActionVariants=false;
+    UserSettings active;active.automaticClimbActions=false;active.surfaceActionVariants=false;active.climbSneakEnabled=true;
     applyLiveTraversalSettings(active,t.cfg);
     const auto hop=t.update(geometry,{1,0,false,false,true},1.f/60,1000000);
     check(hopMotion(hop.motion)&&t.state==State::action,"real checked manual hop begins before paused edit");
     const auto position=t.position,normal=t.normal,surface=t.surfaceNormal;
     const auto phase=t.progress(),duration=t.actionDuration();const auto state=t.state;
     TraversalSuspension suspended;check(suspended.suspend(),"menu pause enters hold");
-    Actor actor;TraversalStealth stealth;check(stealth.acquire(&actor,false),"climb stealth ownership begins");
+    Actor actor;TraversalStealth stealth;check(stealth.acquire(&actor,false,active.climbSneakEnabled),"climb stealth ownership begins");
     auto requested=active;requested.upSpeed=165;requested.sideSpeed=141;
     requested.staminaEnabled=false;requested.automaticClimbActions=true;requested.diagnostics=true;
     requested.fancyJumps=false;requested.hopOut=65;
@@ -96,6 +103,19 @@ static void pausedAction() {
     check(t.progress()==phase&&t.actionDuration()==duration,"paused live settings do not restart or retime ongoing hop");
     check(stealth.active()&&stealth.sneaking()&&actor.state.actorState1.sneaking&&!actor.graphWrites,"settings do not cancel held stealth or send animation transitions");
     check(live.bindings==active.bindings&&live.gamepad==active.gamepad,"paused edits keep current keyboard and controller ownership");
+    auto applied=live;
+    for(const bool enabled:{false,true}) {
+        requested.climbSneakEnabled=enabled;
+        applied=liveRuntimeSettings(applied,requested,true);applyLiveTraversalSettings(applied,t.cfg);
+        check(stealth.update(&actor,t.wallRunning(),applied.climbSneakEnabled)&&stealth.active()&&
+            stealth.sneaking()==enabled&&actor.state.actorState1.sneaking==enabled&&!actor.graphWrites,
+            "Disabling and reenabling climbing sneak applies to the owned actor while suspended");
+        check(suspended.active()&&t.active()&&t.state==state&&same(t.position,position)&&same(t.normal,normal)&&same(t.surfaceNormal,surface)&&
+            t.progress()==phase&&t.actionDuration()==duration,
+            "Paused sneak changes preserve attachment, position and the exact ongoing action phase");
+        check(applied.bindings==active.bindings&&applied.gamepad==active.gamepad,
+            "Paused sneak changes keep input ownership while pending keyboard and controller edits remain deferred");
+    }
     check(suspended.resume(),"resume ends menu hold");
     bool landed=false;
     for(unsigned frame=0;frame<120&&t.state==State::action;++frame) {

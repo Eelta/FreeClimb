@@ -43,7 +43,9 @@ Climbing upward toward a suitable platform can trigger an automatic mantle. Cont
 
 When stamina consumption is enabled, wall running costs **twice** as much stamina per second as climbing.
 
-Climbing uses the game's sneaking state without playing a crouch animation. Wall running, completed mantles and both ways of leaving the wall clear that state. Sneaking from before the climb is not restored; you can crouch normally afterward.
+**Sneak while climbing** is off by default. Enable it on the settings menu's General page, or set `[General] ClimbSneakEnabled=1` in `FreeClimb.ini`, to use the game's sneaking state without playing a crouch animation. Menu changes save and apply immediately, including while attached to a wall. This option may conflict with camera mods; disable it if the camera twitches. With it enabled, wall running, completed mantles and both ways of leaving the wall clear that state. Sneaking from before the climb is not restored; you can crouch normally afterward.
+
+The optional `FreeClimb-No-Climb-Sneak.zip` disables these automatic sneak-state changes and keeps all other features. Install the matching main package first, leave the wall, save and exit the game, then let the optional package overwrite `SKSE/Plugins/FreeClimb.dll`. No INI changes or animation generation are needed. Remove the override to restore the default DLL. The optional build leaves existing sneaking untouched; if switching from a save made on a wall leaves you sneaking, toggle sneak off manually. The optional build keeps the menu switch disabled; use the main DLL to control this feature through the menu.
 
 Menus, the console and recognized game-time freezes pause climbing while keeping the character attached. Movement, animation progress and stamina costs resume with gameplay. Release held action buttons before pressing them again after closing a menu.
 
@@ -141,6 +143,8 @@ powershell -ExecutionPolicy Bypass -File tools/build.ps1
 ```
 
 The output is `build-multiruntime/Release/FreeClimb.dll`. `FreeClimb-source.zip` includes CommonLibSSE-NG, spdlog, rapidcsv, DirectXTK, MinHook, nlohmann/json and the menu API header. Pinned versions and file hashes are recorded in `tools/dependencies.json` and `DEPENDENCY-SOURCES.json`. Compiling the DLL does not require the game directory or animation assets.
+
+Add `-NoSneak` to also build the optional DLL at `build-multiruntime/NoSneak/Release/FreeClimb.dll`. Pass `--no-sneak-dll build-multiruntime/NoSneak/Release/FreeClimb.dll` to both `tools/package.py` and `tools/validate.py` when packaging and validating it. The two main packages retain the default behavior; the additional `FreeClimb-No-Climb-Sneak.zip` contains only the optional DLL.
 
 To rebuild the helper, add `-AuthoringTools` to the build command. Copy `build-multiruntime/Release/FreeClimbAuthoring.exe` to `tools/authoring/bin/FreeClimbAuthoring.exe` before distributing the source bundle.
 

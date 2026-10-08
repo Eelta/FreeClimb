@@ -232,6 +232,14 @@ void basic() {
     check("$FC_NOTIFICATIONS","notifications",draft.notifications);
     check("$FC_LOW_STAMINA_NOTIFICATIONS","lowStamina",draft.lowStaminaNotifications);
     check("$FC_AUTO_MANTLE","autoMantle",draft.autoMantle);
+#if defined(FREECLIMB_NO_TRAVERSAL_SNEAK) && FREECLIMB_NO_TRAVERSAL_SNEAK
+    bool climbSneakEnabled=false;
+    ui::BeginDisabled();
+    check("$FC_CLIMB_SNEAK_ENABLED","climbSneakEnabled",climbSneakEnabled);
+    ui::EndDisabled();
+#else
+    check("$FC_CLIMB_SNEAK_ENABLED","climbSneakEnabled",draft.climbSneakEnabled);
+#endif
 }
 void movement() {
     slider("$FC_UP_SPEED","upSpeed",draft.upSpeed,10,140,"%.0f");

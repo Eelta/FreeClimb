@@ -115,9 +115,38 @@ static void invalidAndLoaded() {
     stealth.clear();const auto stateReads=actor.stateReads;
     check(!stealth.active()&&!stealth.release(&actor)&&actor.stateReads==stateReads,"revert discards identity without touching unloaded memory");
 }
+static void liveSetting() {
+    for(bool wallRunning:{false,true}) {
+        fc::TraversalStealth stealth;Actor actor;
+        check(stealth.acquire(&actor,wallRunning,true),"enabled acquisition retains traversal ownership");
+        actor.graphSneaking=true;
+        check(stealth.update(&actor,wallRunning,false),"disabling sneak retains wall attachment");
+        check(stealth.active()&&!stealth.sneaking()&&!actor.state.actorState1.sneaking&&!actor.graphSneaking,"disabling clears owned game and graph states immediately");
+        check(actor.graphReads==1&&actor.graphWrites==1,"owned state clears once");
+        for(unsigned frame=0;frame<120;++frame)check(stealth.update(&actor,frame%2,false),"disabled mode still validates current actor");
+        check(actor.graphReads==1&&actor.graphWrites==1,"disabled mode does not repeatedly clear sneak graph");
+        check(stealth.update(&actor,wallRunning,true),"re-enabling applies without reattachment");
+        check(stealth.sneaking()==!wallRunning&&static_cast<bool>(actor.state.actorState1.sneaking)==!wallRunning,"re-enabled state matches climbing or wall running");
+        check(actor.graphReads==1&&actor.graphWrites==1,"re-enabling sends no crouch animation");
+        check(stealth.release(&actor)&&!actor.state.actorState1.sneaking,"all enabled exits clear state");
+    }
+    for(bool original:{false,true}) {
+        fc::TraversalStealth stealth;Actor actor;
+        actor.state.actorState1.sneaking=actor.graphSneaking=original;
+        check(stealth.acquire(&actor,false,false),"disabled setting allows valid traversal ownership");
+        for(unsigned frame=0;frame<120;++frame)check(stealth.update(&actor,frame%2,false),"disabled traversal updates normally");
+        check(stealth.release(&actor),"disabled exit releases traversal ownership");
+        check(static_cast<bool>(actor.state.actorState1.sneaking)==original&&actor.graphSneaking==original&&!actor.graphReads&&!actor.graphWrites,"disabled feature never owns or clears unrelated sneak state");
+        check(!stealth.update(&actor,false,true)&&static_cast<bool>(actor.state.actorState1.sneaking)==original,"enabling on ground cannot force sneak");
+    }
+    fc::TraversalStealth stealth;Actor saved;
+    check(stealth.acquire(&saved,false,false)&&stealth.release(&saved),"current disabled setting does not own sneak state");
+    saved.state.actorState1.sneaking=true;saved.graphSneaking=true;
+    check(stealth.cleanupLoaded(&saved)&&!saved.state.actorState1.sneaking&&!saved.graphSneaking,"identified saved traversal still clears a previous enabled build's sneak state");
+}
 int main() {
     try {
-        climbRunClimb();allExits();menuHoldAndIdle();invalidAndLoaded();
+        climbRunClimb();allExits();menuHoldAndIdle();invalidAndLoaded();liveSetting();
         std::cout<<checks<<" traversal stealth checks passed\n";return 0;
     } catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
 }

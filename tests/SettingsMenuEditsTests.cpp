@@ -54,9 +54,9 @@ int main(int argc,char** argv) {
         };
         for(unsigned i=0;i<2400;++i)check(edits.apply(draft,submit)==SettingsEditResult::unchanged,"unchanged renders do not enqueue settings or rewrite disk");
         check(writes==0,"opening the menu alone does not write settings");
-        const std::array<std::function<void(UserSettings&)>,30> changes{{
+        const std::array<std::function<void(UserSettings&)>,31> changes{{
             [](auto& u){u.enabled=false;},[](auto& u){u.notifications=false;},[](auto& u){u.lowStaminaNotifications=false;},
-            [](auto& u){u.autoMantle=false;},[](auto& u){u.upSpeed=110;},[](auto& u){u.downSpeed=68;},
+            [](auto& u){u.autoMantle=false;},[](auto& u){u.climbSneakEnabled=true;},[](auto& u){u.upSpeed=110;},[](auto& u){u.downSpeed=68;},
             [](auto& u){u.sideSpeed=71;},[](auto& u){u.wallRunEnabled=false;},[](auto& u){u.wallRunSpeed=401;},[](auto& u){u.diagonalRunMultiplier=1.2f;},
             [](auto& u){u.automaticClimbActions=false;},[](auto& u){u.wallRunObstacleJumps=false;},
             [](auto& u){u.contextualMantleEnabled=false;},[](auto& u){u.autoActionMinSeconds=2;u.autoActionMaxSeconds=2;},
@@ -108,6 +108,8 @@ int main(int argc,char** argv) {
             const auto expected=restoreSettingsPage(page,draft);const auto before=writes;draft=expected;
             check(edits.apply(draft,submit,true)==SettingsEditResult::queued&&writes==before+1,"Restore Defaults automatically applies and writes only the selected page");
             check(userSettingsIni(draft)==userSettingsIni(expected)&&draft.language=="chinese","restoring a page preserves all other settings and selected language");saved();
+            if(page==SettingsPage::general)check(!draft.climbSneakEnabled&&!requested.climbSneakEnabled&&!loadUserSettings(path).settings.climbSneakEnabled,
+                "General defaults restore disabled climbing sneak to the menu, runtime request and disk");
             check(edits.apply(draft,submit)==SettingsEditResult::unchanged,"render following page restore does not save twice");
         }
         check(edits.apply(draft,submit,true)==SettingsEditResult::queued,"explicit Restore Defaults can retry writing unchanged values");

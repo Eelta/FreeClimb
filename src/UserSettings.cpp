@@ -52,6 +52,7 @@ constexpr Flag flags[]{
     {"General","Enabled",&UserSettings::enabled},{"General","Notifications",&UserSettings::notifications},
     {"General","LowStaminaNotifications",&UserSettings::lowStaminaNotifications},{"General","JumpToAttach",&UserSettings::jumpToAttach},
     {"General","AutoMantle",&UserSettings::autoMantle},{"General","ContextActions",&UserSettings::contextActions},
+    {"General","ClimbSneakEnabled",&UserSettings::climbSneakEnabled},
     {"General","ThreepeatAnimations",&UserSettings::threepeatAnimations},{"General","AutomaticClimbActions",&UserSettings::automaticClimbActions},
     {"General","LegacyAutomaticHops",&UserSettings::legacyAutomaticHops},{"General","SurfaceActionVariants",&UserSettings::surfaceActionVariants},
     {"General","WallRunObstacleJumps",&UserSettings::wallRunObstacleJumps},{"General","Diagnostics",&UserSettings::diagnostics},
@@ -142,6 +143,7 @@ UserSettings restoreSettingsPage(SettingsPage page,const UserSettings& current) 
     case SettingsPage::general:
         settings.enabled=defaults.enabled;settings.notifications=defaults.notifications;
         settings.lowStaminaNotifications=defaults.lowStaminaNotifications;settings.autoMantle=defaults.autoMantle;
+        settings.climbSneakEnabled=defaults.climbSneakEnabled;
         break;
     case SettingsPage::movement:
         settings.wallRunEnabled=defaults.wallRunEnabled;

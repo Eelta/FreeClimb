@@ -567,6 +567,48 @@ void flattenedBindingStructures(REL::Version version) {
     }
     const auto refs=[&]{for(auto* node:{actor.object(),root.object(),com.object(),pelvis.object(),nested.object(),outside.object()})require(node->GetRefCount()==1,"binder releases only its temporary node references");};refs();
     require(std::array{actor.bytes,root.bytes,com.bytes,pelvis.bytes,nested.bytes,outside.bytes}==baselineNodes&&entries.bytes==originalEntries,"successful production lookup does not mutate nodes or flat storage");
+    BinderName lowerThigh,lowerRoot;lowerThigh.assign("npc l thigh [lthg]");lowerRoot.assign("npc root [root]");
+    const auto assignName=[](RE::BSFixedString& name,const char* text){std::memcpy(&name,&text,sizeof(text));};
+    {
+        Storage<RE::BSFixedString,sizeof(RE::BSFixedString)> nativeName;nativeName.put(0,lowerThigh.text.data());
+        require(*nativeName.object()==std::string_view(names[6])&&std::string_view(nativeName.object()->c_str())!=names[6],"real BSFixedString comparison matches case-only spelling that legacy exact comparison rejects");
+        require(fc::sameSceneBoneName(names[6],lowerThigh.text.data())&&!fc::sameSceneBoneName(names[6],"NPC L Thigh [LThg] ")&&
+            !fc::sameSceneBoneName(names[6],"NPC R Thigh [LThg]")&&!fc::sameSceneBoneName(names[6],"NPC L Thigh [LThg]x"),"scene comparison folds ASCII case only and retains exact length and spelling");
+        require(!fc::sameSceneBoneName(std::string_view("\xC0",1),std::string_view("\xE0",1)),"scene comparison never folds non-ASCII bytes");
+        assignName(entries.object()[6].nodeName,lowerThigh.text.data());fc::FlatNameSnapshot mixedNames;
+        {
+            const auto bound=fc::bindRuntimeScene(root.object(),names,fc::canonicalBoneParents,&mixedNames);
+            require(bool(bound)&&bound.nodes[6].flat==&entries.object()[6].local&&mixedNames.caseAliases==1,"case-only flat entry resolves its exact existing storage");
+        }
+        const auto detail=fc::describeSceneLookup(actor.object(),root.object(),names[6],&mixedNames);
+        require(detail.flat.caseOnlyCount==1&&detail.flat.missingIndex==6&&detail.flat.caseOnlyCandidates.find("'npc l thigh [lthg]' len=18 hex=6E7063")!=std::string::npos,"diagnostic retains raw case-only spelling, length and bytes from the existing snapshot");
+        assignName(entries.object()[7].nodeName,pooled[6].text.data());
+        require(!fc::bindRuntimeScene(root.object(),names,fc::canonicalBoneParents),"flat entries whose names differ only in case but identify different bones are ambiguous");
+        assignName(entries.object()[7].nodeName,pooled[7].text.data());
+        assignName(entries.object()[6].nodeName,nullptr);
+        SceneStorage actualCase,actualDuplicate;initialize(actualCase,lowerThigh);initialize(actualDuplicate,pooled[6]);
+        actualCase.object()->parent=pelvis.object();actualDuplicate.object()->parent=pelvis.object();
+        std::array<RE::NiAVObject*,1> one{actualCase.object()};diagnosticChildren(pelvis,one);
+        {
+            fc::FlatNameSnapshot actualNames;const auto bound=fc::bindRuntimeScene(root.object(),names,fc::canonicalBoneParents,&actualNames);
+            require(bool(bound)&&bound.nodes[6].node.get()==actualCase.object()&&actualNames.caseAliases==1,"case-only existing physical bone fallback retains that node without materialization");
+        }
+        const auto actualDetail=fc::describeSceneLookup(actor.object(),root.object(),names[6]);
+        require(actualDetail.inside==0&&actualDetail.caseOnlyInside==1&&actualDetail.actualCaseCandidates.find("npc l thigh [lthg]")!=std::string::npos,"physical diagnostic distinguishes exact and case-only matches");
+        require(actualDetail.flat.nearbyEntries.find("row=6 ")!=std::string::npos&&actualDetail.flat.nearbyEntries.find("row=13 ")!=std::string::npos&&
+            actualDetail.flat.nearbyEntries.find("row=14 ")==std::string::npos&&!actualDetail.flat.relatedNames.empty(),"missing exact storage diagnostics include only bounded neighboring rows and related names");
+        require(fc::sceneDiagnosticRawName(std::string(256,'x')).size()<300,"raw diagnostic names and hexadecimal bytes stay bounded");
+        std::array<RE::NiAVObject*,2> two{actualCase.object(),actualDuplicate.object()};diagnosticChildren(pelvis,two);
+        require(!fc::existingNode(root.object(),names[6])&&!fc::bindRuntimeScene(root.object(),names,fc::canonicalBoneParents),"different physical nodes with native-equivalent names never choose the first match");
+        diagnosticChildren(pelvis,std::span<RE::NiAVObject*>{});assignName(entries.object()[6].nodeName,pooled[6].text.data());
+        assignName(root.object()->name,lowerRoot.text.data());
+        require(fc::existingNode(actor.object(),names[0])==root.object(),"case-only selected Root is found within the actor subtree");
+        assignName(outside.object()->name,pooled[0].text.data());
+        require(!fc::existingNode(actor.object(),names[0]),"two distinct case-equivalent roots are rejected as ambiguous");
+        assignName(outside.object()->name,pooled[6].text.data());assignName(root.object()->name,pooled[0].text.data());
+    }
+    refs();
+    require(std::array{actor.bytes,root.bytes,com.bytes,pelvis.bytes,nested.bytes,outside.bytes}==baselineNodes&&entries.bytes==originalEntries,"case-only fixture restores every native node and flat entry");
     const auto missing=[&](const char* label) {
         const auto actorBefore=actor.bytes,rootBefore=root.bytes,comBefore=com.bytes,pelvisBefore=pelvis.bytes,nestedBefore=nested.bytes,outsideBefore=outside.bytes;
         const auto bonesBefore=entries.bytes;
@@ -588,7 +630,133 @@ void flattenedBindingStructures(REL::Version version) {
     map.put(0x0C,std::uint32_t{8});map.put(0x10,std::uint32_t{7});map.put(0x14,std::uint32_t{7});map.put(0x18,sentinel);map.put(0x28,mapSlots.data());
     auto& boneMap=reinterpret_cast<RE::BSFlattenedBoneTree*>(root.object())->GetRuntimeData().boneMap;std::memcpy(&boneMap,map.bytes.data(),map.bytes.size());Storage<RE::BSFixedString,sizeof(RE::BSFixedString)> key;key.put(0,thighName);
     const auto found=boneMap.find(*key.object());require(boneMap.size()==1&&found!=boneMap.end()&&found->second==6&&std::string_view(found->first.c_str())==names[6],"real typed boneMap resolves the bounded thigh index when entry.nodeName is empty");
-    missing("production binder reproduces index6 mapped3 when the only thigh name is in the real typed boneMap");
+    fc::FlatNameSnapshot snapshot;
+    {
+        const auto bound=fc::bindRuntimeScene(root.object(),names,fc::canonicalBoneParents,&snapshot);
+        require(bool(bound)&&bound.count==81&&bound.nodes[6].flat==&entries.object()[6].local,"map-only thigh resolves existing selected-root flat storage");
+        require(snapshot.valid&&snapshot.mapUsed&&snapshot.find(names[6])==6&&snapshot.current(root.object()),"map lookup captures a current bounded identity snapshot");
+    }
+    refs();
+    const auto acceptedMap=mapSlots;
+    require(std::memcmp(mapSlots.data(),acceptedMap.data(),sizeof(mapSlots))==0,"map lookup does not mutate native map entries");
+    mapSlots[bucket].name=lowerThigh.text.data();
+    {
+        fc::FlatNameSnapshot mixedMap;const auto bound=fc::bindRuntimeScene(root.object(),names,fc::canonicalBoneParents,&mixedMap);
+        require(bool(bound)&&bound.nodes[6].flat==&entries.object()[6].local&&mixedMap.caseAliases==1,"case-only native map key resolves the unnamed required flat bone");
+        require(!snapshot.current(root.object()),"case-equivalent map key replacement still invalidates exact raw identity");
+    }
+    mapSlots=acceptedMap;
+    mapSlots[bucket].index=-1;missing("negative required map index is rejected");require(!snapshot.current(root.object()),"changed map index invalidates snapshot");
+    mapSlots[bucket].index=99;missing("out-of-range required map index is rejected");
+    mapSlots[bucket].index=7;missing("map name conflicting with the selected entry name is rejected");
+    mapSlots=acceptedMap;
+    const auto extra=(bucket+1)&7;
+    const auto mapFree=[&](std::uint32_t free){std::memcpy(reinterpret_cast<std::byte*>(&boneMap)+0x10,&free,sizeof(free));};
+    mapSlots[extra]={thighName,6,0,sentinel};mapFree(6);
+    {
+        const auto bound=fc::bindRuntimeScene(root.object(),names,fc::canonicalBoneParents);
+        require(bool(bound),"duplicate aliases identifying the same storage remain unambiguous");
+    }
+    mapSlots[extra].index=7;mapSlots[extra].name=lowerThigh.text.data();missing("case-equivalent canonical map names identifying two storages are rejected");
+    BinderName unrelated;unrelated.assign("optional-alias");
+    mapSlots[extra]={unrelated.text.data(),6,0,sentinel};
+    require(bool(fc::bindRuntimeScene(root.object(),names,fc::canonicalBoneParents)),"unrelated alias to a required bone does not reject it");
+    mapSlots[extra].index=-1;
+    require(bool(fc::bindRuntimeScene(root.object(),names,fc::canonicalBoneParents)),"unrelated sentinel map index is never dereferenced");
+    const auto calfName=fc::flatRawName(entries.object()[7].nodeName);
+    std::memcpy(&entries.object()[7].nodeName,&empty,sizeof(empty));mapSlots[extra]={pooled[7].text.data(),6,0,sentinel};
+    {
+        const auto duplicate=fc::bindRuntimeScene(root.object(),names,fc::canonicalBoneParents);
+        require(!duplicate&&duplicate.missing==7,"different required canonical names cannot claim one unnamed flat transform");
+    }
+    std::memcpy(&entries.object()[7].nodeName,&calfName,sizeof(calfName));
+    mapSlots[extra]={pooled[43].text.data(),6,0,sentinel};
+    missing("engine-owned attachment alias cannot become a body output transform");
+    mapSlots[extra]={pooled[0].text.data(),-1,0,sentinel};
+    require(bool(fc::bindRuntimeScene(root.object(),names,fc::canonicalBoneParents)),"selected Root owns its actual node despite a sentinel root map alias");
+    mapSlots[extra]={pooled[46].text.data(),1,0,sentinel};
+    const auto attachmentNames=fc::captureFlatNames(root.object());
+    require(attachmentNames.valid&&attachmentNames.attachment(1,names,fc::canonicalBoneParents),"map-only magic ancestor is recognized as engine-owned");
+    mapSlots[extra]={pooled[43].text.data(),2,0,sentinel};
+    require(fc::captureFlatNames(root.object()).attachment(2,names,fc::canonicalBoneParents),"map-only weapon ancestor is recognized as engine-owned");
+    mapSlots=acceptedMap;mapFree(7);
+    require(snapshot.current(root.object()),"restored map identity matches the captured snapshot");
+    entries.object()[6].node=outside.object();
+    require(!snapshot.currentEntry(root.object(),6)&&!snapshot.current(root.object()),"newly populated flat bone invalidates old raw storage ownership");
+    entries.object()[6].node=nullptr;
+    std::memcpy(&entries.object()[6].nodeName,&thighName,sizeof(thighName));
+    require(!snapshot.current(root.object()),"entry-name identity change invalidates the snapshot");
+    std::memcpy(&entries.object()[6].nodeName,&empty,sizeof(empty));
+    entries.object()[6].local.translate.x=123;
+    require(snapshot.current(root.object()),"ordinary animated transform changes retain map identity");
+    entries.object()[6].local.translate.x=0;
+    const auto invalidMap=[&](const char* reason) {
+        const auto invalid=fc::captureFlatNames(root.object());require(!invalid.valid,reason);
+        require(!fc::bindRuntimeScene(root.object(),names,fc::canonicalBoneParents),"malformed map cannot produce a binding");
+    };
+    mapSlots[bucket].next=mapSlots.data()+bucket;
+    invalidMap("cyclic map chain is bounded and rejected");mapSlots=acceptedMap;
+    mapSlots[bucket].next=reinterpret_cast<const std::byte*>(mapSlots.data())+1;
+    invalidMap("unaligned map chain link is rejected");mapSlots=acceptedMap;
+    mapSlots[bucket].name=reinterpret_cast<const char*>(1);
+    invalidMap("unreadable map key is rejected without dereference");mapSlots=acceptedMap;
+    mapFree(8);invalidMap("occupied map count must match header");mapFree(7);
+    const auto mapPut=[&](std::size_t offset,auto value){std::memcpy(reinterpret_cast<std::byte*>(&boneMap)+offset,&value,sizeof(value));};
+    mapPut(0x0C,std::uint32_t{8193});invalidMap("oversized map capacity is bounded");
+    mapPut(0x0C,std::uint32_t{8});mapFree(9);invalidMap("map free count cannot exceed capacity");mapFree(7);
+    mapPut(0x28,reinterpret_cast<void*>(1));invalidMap("unreadable map storage is rejected");
+    mapPut(0x28,mapSlots.data());
+    require(snapshot.current(root.object()),"malformed map fixtures restore original identity");
+    {
+        using Clock=std::chrono::steady_clock;
+        Storage<Entry,sizeof(Entry)*536> sparse;
+        std::vector<BinderName> sparseNames(536);std::vector<SceneStorage> extraNodes(260);
+        std::vector<MapSlot> sparseMap(1024);
+        for(std::size_t i=0;i<536;++i) {
+            sparseNames[i].assign("Additional Bone "+std::to_string(i));const char* name=sparseNames[i].text.data();
+            auto& entry=sparse.object()[i];entry.parentIndex=-1;entry.local.scale=entry.world.scale=1;
+            std::memcpy(&entry.nodeName,&name,sizeof(name));
+        }
+        std::memcpy(sparse.object(),&entries.object()[4],sizeof(Entry));sparse.object()[0].parentIndex=-1;
+        std::memcpy(sparse.object()+1,&entries.object()[5],sizeof(Entry));sparse.object()[1].parentIndex=0;
+        for(std::size_t i=0;i<extraNodes.size();++i) {
+            initialize(extraNodes[i],sparseNames[i+2]);extraNodes[i].object()->parent=root.object();
+            sparse.object()[i+2].node=extraNodes[i].object();
+        }
+        for(std::size_t i=6;i<99;++i) {
+            auto& entry=sparse.object()[294+i];std::memcpy(&entry,&entries.object()[i],sizeof(Entry));
+            const auto parent=entry.parentIndex;entry.parentIndex=std::int16_t(parent>=6?parent+294:parent>=4?parent-4:-1);
+        }
+        for(std::size_t i=0;i<536;++i)sparseMap[i]={i==300?thighName:fc::flatRawName(sparse.object()[i].nodeName),std::int32_t(i),0,sentinel};
+        mapPut(0x0C,std::uint32_t{1024});mapFree(488);mapPut(0x14,std::uint32_t{1023});mapPut(0x28,sparseMap.data());
+        storage(root,sparse.object(),536,262);
+        fc::FlatNameSnapshot sparseSnapshot;
+        const auto captureBegin=Clock::now();
+        {
+            const auto bound=fc::bindRuntimeScene(root.object(),names,fc::canonicalBoneParents,&sparseSnapshot);
+            require(bool(bound)&&bound.nodes[6].flat==&sparse.object()[300].local,"536-entry 262-populated sparse layout resolves a map bone beyond the populated prefix");
+            require(bound.nodes[0].node.get()==root.object()&&sparseSnapshot.find(names[4])==0,"selected Root stays outside the COM-first entry table");
+        }
+        const auto captureMs=std::chrono::duration<double,std::milli>(Clock::now()-captureBegin).count();
+        const auto begin=Clock::now();std::size_t current=0;
+        for(int i=0;i<1000;++i)current+=sparseSnapshot.current(root.object());
+        require(current==1000,"sparse snapshot repeated live guards remain valid");
+        std::cout<<"Sparse 536-entry 262-node 1024-bucket snapshot, mocked "<<version.string()<<", bind ms="<<captureMs<<", 1000 guard passes ms="
+            <<std::chrono::duration<double,std::milli>(Clock::now()-begin).count()<<'\n';
+        std::vector<SceneStorage> lookupNodes(535);std::vector<RE::NiAVObject*> lookupChildren;
+        for(std::size_t i=0;i<lookupNodes.size();++i) {
+            initialize(lookupNodes[i],sparseNames[i]);lookupNodes[i].object()->parent=root.object();lookupChildren.push_back(lookupNodes[i].object());
+        }
+        diagnosticChildren(root,lookupChildren);const auto lookupBegin=Clock::now();std::size_t found=0;
+        for(int i=0;i<1000;++i)found+=fc::existingNode(root.object(),names[0])==root.object();
+        require(found==1000,"bounded unique Root search succeeds across 536 actual nodes");
+        std::cout<<"Unique root lookup, 536 actual nodes, mocked "<<version.string()<<", 1000 passes ms="
+            <<std::chrono::duration<double,std::milli>(Clock::now()-lookupBegin).count()<<'\n';
+        diagnosticChildren(root,rootChildren);
+        storage(root,entries.object(),99,3);mapSlots=acceptedMap;
+        mapPut(0x0C,std::uint32_t{8});mapFree(7);mapPut(0x14,std::uint32_t{7});mapPut(0x28,mapSlots.data());
+    }
+    require(snapshot.current(root.object()),"sparse fixture leaves prior map identity restorable");
     require(entries.bytes!=originalEntries,"map-only case actually removes the entry name rather than changing expected counts");
     std::cout<<"PASS production scene binder synthetic fixtures for mocked runtime "<<version.string()<<"; these structures do not establish the player's root cause\n";
 }

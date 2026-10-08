@@ -317,6 +317,7 @@ def validate_animation_pack(root, manifest):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dll', type=Path, default=package.ROOT / 'build-multiruntime/Release/FreeClimb.dll')
+    parser.add_argument('--no-sneak-dll', type=Path)
     arguments = parser.parse_args()
     root = package.ROOT
     version = package.version()
@@ -378,6 +379,14 @@ def main():
     require(not any(name.lower().endswith(('.motion', '.fbx')) for name in complete_sources), 'Source archive contains animation data')
     source_zip = archive_matches(root / 'release' / policy['source_archive'], complete_sources)
     report = {'status': 'pass', 'version': version, 'runtime': runtime_zip, 'source': source_zip, 'dll': dll, 'unchanged_assets': baseline, 'animation_pack': animation_report, 'translations': translation_report, 'scope': 'Structure, provenance hashes and both archives; not in-game validation; AE not verified in game'}
+    if arguments.no_sneak_dll:
+        data = arguments.no_sneak_dll.read_bytes()
+        require(b'Build variant: no-climb-sneak; automatic traversal sneak state disabled' in data,
+                'Missing optional no-climb-sneak build marker')
+        optional_metadata = dll_version(data, [int(x) for x in version.split('.')] + [0])
+        report['optional_no_sneak'] = archive_matches(root / 'release/FreeClimb-No-Climb-Sneak.zip',
+                                                    {'SKSE/Plugins/FreeClimb.dll': arguments.no_sneak_dll})
+        report['optional_no_sneak']['dll'] = optional_metadata
     (report_root / 'validation.json').write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(report, indent=2))
 

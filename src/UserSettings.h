@@ -10,6 +10,7 @@ namespace fc {
 struct UserSettings {
     std::string language="english";
     bool enabled=true,notifications=true,lowStaminaNotifications=true,jumpToAttach=true,autoMantle=true;
+    bool climbSneakEnabled=false;
     bool contextActions=true,threepeatAnimations=true,automaticClimbActions=true,legacyAutomaticHops=false;
     bool surfaceActionVariants=true,wallRunObstacleJumps=true,contextualMantleEnabled=true,diagnostics=false,fancyJumps=true;
     bool wallRunEnabled=true;

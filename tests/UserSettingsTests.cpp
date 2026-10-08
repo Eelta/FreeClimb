@@ -33,16 +33,29 @@ int main() {
     auto missing=loadUserSettings(path);
     expect(!missing.found&&missing.settings.language=="english","Missing INI must use English defaults");
     expect(missing.settings.wallRunEnabled,"Missing INI preserves enabled wall running");
+    expect(!missing.settings.climbSneakEnabled,"Missing INI disables automatic climbing sneak by default");
     expect(missing.settings.downSpeed==78&&missing.settings.wallRunSpeed==379.5f,"Runtime defaults must match shipped settings");
     expect(!UserSettings{}.diagnostics&&!missing.settings.diagnostics,"Detailed diagnostics must default off when configuration is absent");
     write(path,"[General]\nDiagnostics=1\n");
     const auto explicitDiagnostics=loadUserSettings(path);
     expect(explicitDiagnostics.settings.wallRunEnabled,"Old INI without a wall run master switch preserves existing behavior");
+    expect(!explicitDiagnostics.settings.climbSneakEnabled,"Old INI without the climb sneak switch uses the disabled default");
     expect(explicitDiagnostics.settings.diagnostics,"Existing explicit Diagnostics=1 must remain enabled when read");
     expect(explicitDiagnostics.warnings.empty()&&explicitDiagnostics.settings.gamepad==GamepadSettings{},"Old INI files without a gamepad section retain keyboard behavior and adopt gamepad defaults");
     std::string diagnosticsError;
     expect(saveUserSettings(path,explicitDiagnostics.settings,diagnosticsError),"Explicit diagnostic setting should save");
     expect(loadUserSettings(path).settings.diagnostics,"Saving an explicit Diagnostics=1 must preserve the user's choice");
+    for(const bool enabled:{false,true}) {
+        write(path,std::string("[General]\nClimbSneakEnabled=")+(enabled?"1":"0")+"\n[FutureMod]\nCustom=keep\n");
+        const auto sneak=loadUserSettings(path);
+        expect(sneak.warnings.empty()&&sneak.settings.climbSneakEnabled==enabled,"The climb sneak switch loads both explicit values");
+        expect(saveUserSettings(path,sneak.settings,diagnosticsError),"The climb sneak switch saves successfully");
+        expect(loadUserSettings(path).settings.climbSneakEnabled==enabled&&read(path).find("Custom=keep")!=std::string::npos,
+            "Saving and reloading preserves the climb sneak choice and unrelated settings");
+    }
+    write(path,"[General]\nClimbSneakEnabled=invalid\n");
+    const auto invalidSneak=loadUserSettings(path);
+    expect(!invalidSneak.settings.climbSneakEnabled&&invalidSneak.warnings.size()==1,"An invalid climb sneak switch warns and retains the disabled default");
     write(path,"\xef\xbb\xbf[Movement]\r\nUpSpeed=nan\r\nDownSpeed=999\r\nSideSpeed=bad\r\nWallRunSpeed=0\r\nAutoActionMinSeconds=5\r\nAutoActionMaxSeconds=1\r\n[Stamina]\r\nEnabled=0\r\nMovingPerSecond=21\r\nRequiredToGrab=-3\r\n[Menu]\r\nLanguage=1\r\n[General]\r\nLegacyAutomaticHops=1\r\n[AutomaticActions]\r\nLeftWeight=-1\r\nRightWeight=2\r\n[Controls]\r\nHoldSeconds=99\r\n");
     const auto loaded=loadUserSettings(path);
     expect(loaded.found&&loaded.settings.language=="chinese","BOM and CRLF settings should load and migrate legacy Chinese language");
@@ -189,7 +202,7 @@ int main() {
     expect(sanitizeUserSettings(settings).language=="chinese","In-memory language must canonicalize before applying");
     write(path,
         "[Menu]\nLanguage=french\n"
-        "[General]\nEnabled=0\nNotifications=0\nLowStaminaNotifications=0\nAutoMantle=0\n"
+        "[General]\nEnabled=0\nNotifications=0\nLowStaminaNotifications=0\nAutoMantle=0\nClimbSneakEnabled=1\n"
         "AutomaticClimbActions=0\nWallRunObstacleJumps=0\nDiagnostics=1\nJumpToAttach=0\n"
         "ContextActions=0\nThreepeatAnimations=0\nSurfaceActionVariants=0\n"
         "[Movement]\nWallRunEnabled=0\nUpSpeed=41\nDownSpeed=42\nSideSpeed=43\nWallRunSpeed=244\nDiagonalRunMultiplier=1.23\n"
@@ -207,7 +220,7 @@ int main() {
     const auto originalFields=iniFields(customized.settings),defaultFields=iniFields(UserSettings{});
     struct PageCase {SettingsPage page;std::set<std::string> fields;};
     const PageCase pages[]{
-        {SettingsPage::general,{"general/enabled","general/notifications","general/lowstaminanotifications","general/automantle"}},
+        {SettingsPage::general,{"general/enabled","general/notifications","general/lowstaminanotifications","general/automantle","general/climbsneakenabled"}},
         {SettingsPage::movement,{"movement/wallrunenabled","movement/upspeed","movement/downspeed","movement/sidespeed","movement/wallrunspeed","movement/diagonalrunmultiplier"}},
         {SettingsPage::automatic,{"general/automaticclimbactions","general/wallrunobstaclejumps","automaticactions/contextualmantleenabled",
             "movement/autoactionminseconds","movement/autoactionmaxseconds","automaticactions/leftweight","automaticactions/rightweight"}},

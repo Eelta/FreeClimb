@@ -682,11 +682,12 @@ void reportOutput(RE::PlayerCharacter* p,fc::Motion motion,float coreMs,float pu
         output.worldMismatchFrames,output.worldMismatches,output.worldAngle,output.worldDistance,unsigned(output.pass),output.transformPasses,output.selectedFlagRepairs,
         output.upperRollDegrees[0],output.upperRollDegrees[1],
         coreMs,peakTraversalMs,publishMs,peakPublishMs,output.callbackMs,output.propagationMs,casts,peakFrameCasts,rayCandidates,peakFrameRayCandidates,rayClassifications,peakFrameRayClassifications);
-    SKSE::log::info("Surface placement audit: motion={} support={} samples={} gap={:.2f}/{:.2f}/{:.2f} palmPlaneGap={:.2f}/{:.2f} contacts={} reachError={:.2f} pos=({:.2f},{:.2f},{:.2f}) normal=({:.3f},{:.3f},{:.3f})",
+    SKSE::log::info("Surface placement audit: motion={} support={} samples={} gap={:.2f}/{:.2f}/{:.2f} palmPlaneGap={:.2f}/{:.2f} contacts={} reachError={:.2f} pos=({:.2f},{:.2f},{:.2f}) normal=({:.3f},{:.3f},{:.3f}) retiredContacts={} rejectedIdleContacts={}",
         int(motion),poses.surface.surfaceGapValid,poses.surface.surfaceSamples,traversal.cfg.gap,
         poses.surface.measuredSurfaceGap,poses.surface.appliedSurfaceGap,poses.surface.surfacePalmGaps[0],poses.surface.surfacePalmGaps[1],
         poses.surface.contactCount,poses.surface.maxReachError,traversal.position.x,traversal.position.y,traversal.position.z,
-        traversal.surfaceNormal.x,traversal.surfaceNormal.y,traversal.surfaceNormal.z);
+        traversal.surfaceNormal.x,traversal.surfaceNormal.y,traversal.surfaceNormal.z,
+        poses.surface.retiredContacts,poses.surface.rejectedIdleContacts());
     peakTraversalMs=peakPublishMs=0;peakFrameCasts=0;peakFrameRayCandidates=peakFrameRayClassifications=0;
     SKSE::log::info("Final display audit (sampled): lateWorldUpdates={} lateRootUpdates={} skinCalls={} ownedSkinSamples={} bodyInputs={} ownedInputs={} cachedSamples={} bodyMismatchSamples={}",
         poses.lateWorldUpdates.load(),poses.lateRootUpdates.load(),poses.skinCalls.load(),poses.ownedSkinCalls.load(),
@@ -915,7 +916,7 @@ bool acquire(RE::PlayerCharacter* p) {
     observedSpanContinuous=false;
     lastRenderedMotion=fc::Motion::none;lastRenderedSample=0;
     obstacleJumpBase=lastObstacleJump=traversal.obstacleJumpCount();
-    if(!traversalStealth.acquire(p,traversal.wallRunning())) {release(p,"stealth state unavailable");return false;}
+    if(!traversalStealth.acquire(p,traversal.wallRunning(),activeSettings.climbSneakEnabled)) {release(p,"stealth state unavailable");return false;}
     const auto controlsAcquired=diagnostics?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     SKSE::log::info("Attached at ({:.1f},{:.1f},{:.1f}); normal=({:.2f},{:.2f},{:.2f}); actorScale={:.2f}; controllerBounds=({:.2f},{:.2f},{:.2f}); actorHeight={:.2f}",
         traversal.position.x,traversal.position.y,traversal.position.z,traversal.normal.x,traversal.normal.y,traversal.normal.z,
@@ -962,7 +963,7 @@ void update(RE::PlayerCharacter* p,float dt) {
     if(!ready||!animationState) {exitNativeDiagnostics.reset();return;}
     if(traversal.active()) {
         if(!allowed(p)) {release(p,"actor invalid while attached");return;}
-        if(!traversalStealth.update(p,traversal.wallRunning())) {release(p,"traversal state invalid");return;}
+        if(!traversalStealth.update(p,traversal.wallRunning(),activeSettings.climbSneakEnabled)) {release(p,"traversal state invalid");return;}
     }
     if(grabInputSuspended()||fc::gameTimeSuspended(dt)) {
         suspendTraversal();
@@ -1335,7 +1336,7 @@ void update(RE::PlayerCharacter* p,float dt) {
     if(result.staminaCost>0) p->AsActorValueOwner()->ModActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage,RE::ActorValue::kStamina,-result.staminaCost);
     if(traversal.cfg.staminaEnabled&&lowStaminaNotifications&&stamina<=20&&!lowStaminaNoted){note("FreeClimb: low stamina - stop to rest or climb down");lowStaminaNoted=true;}
     if(stamina>30)lowStaminaNoted=false;
-    if(!result.released&&!traversalStealth.update(p,traversal.wallRunning())) {release(p,"traversal state invalid");return;}
+    if(!result.released&&!traversalStealth.update(p,traversal.wallRunning(),activeSettings.climbSneakEnabled)) {release(p,"traversal state invalid");return;}
     const auto publishStarted=std::chrono::steady_clock::now();
     poses.update(world,traversal,result.motion,dt,p->GetScale());
     traversalAudio.update(poses.library,traversal,result,poses.surface.sampledPhase(),effectiveDt,animationReady);
@@ -1553,6 +1554,7 @@ bool runtimeHooksReady() {
 }
 
 void applyLiveRuntimeSettings(const fc::UserSettings& value,bool retainInputs) {
+    const bool sneakChanged=activeSettings.climbSneakEnabled!=value.climbSneakEnabled;
     activeSettings=fc::liveRuntimeSettings(activeSettings,value,retainInputs);
     const auto& u=activeSettings;
     enabled=u.enabled;notifications=u.notifications;lowStaminaNotifications=u.lowStaminaNotifications;
@@ -1562,6 +1564,11 @@ void applyLiveRuntimeSettings(const fc::UserSettings& value,bool retainInputs) {
     fc::applyLiveTraversalSettings(u,traversal.cfg);wallRunSpeedOverride=u.wallRunSpeed;
     traversalAudio.enabled=u.audioEnabled;traversalAudio.volume=u.audioVolume;
     if(!u.audioEnabled)traversalAudio.stop();
+    if(sneakChanged&&traversalStealth.active()) {
+        auto* player=RE::PlayerCharacter::GetSingleton();
+        if(!traversalStealth.update(player,traversal.wallRunning(),u.climbSneakEnabled))release(player,"traversal state invalid");
+    }
+    if(sneakChanged)SKSE::log::info("Automatic climb sneak setting: enabled={}",fc::TraversalStealth::supported()&&u.climbSneakEnabled);
 }
 void applyRuntimeSettings(const fc::UserSettings& value) {
     const auto oldGamepad=activeSettings.gamepad;
@@ -1671,10 +1678,14 @@ void registerMenu() {
 void loadSettings() {
     const auto loaded=fc::loadUserSettings("Data/SKSE/Plugins/FreeClimb.ini");
     desiredSettings=loaded.settings;applyRuntimeSettings(desiredSettings);
+#if defined(FREECLIMB_NO_TRAVERSAL_SNEAK) && FREECLIMB_NO_TRAVERSAL_SNEAK
+    SKSE::log::info("Build variant: no-climb-sneak; automatic traversal sneak state disabled");
+#endif
     for(const auto& warning:loaded.warnings)SKSE::log::warn("Settings: {}",warning);
-    SKSE::log::info("FreeClimb {}; standalone HKX framework; climb entry={}; wall-run modifier={}; stamina enabled={}",
+    SKSE::log::info("FreeClimb {}; standalone HKX framework; climb entry={}; wall-run modifier={}; stamina enabled={}; climb sneak enabled={}",
         SKSE::PluginDeclaration::GetSingleton()->GetVersion().string("."),
-        fc::serializeKeyChord(activeSettings.bindings.entry),fc::serializeKeyChord(activeSettings.bindings.runModifier),traversal.cfg.staminaEnabled);
+        fc::serializeKeyChord(activeSettings.bindings.entry),fc::serializeKeyChord(activeSettings.bindings.runModifier),traversal.cfg.staminaEnabled,
+        fc::TraversalStealth::supported()&&activeSettings.climbSneakEnabled);
     SKSE::log::info("Experimental controller: enabled={} entry={} run={} hop={} drop={} deadzone={:.2f} trigger={:.2f}",
         activeSettings.gamepad.enabled,fc::serializeGamepadChord(activeSettings.gamepad.bindings.entry),
         fc::serializeGamepadChord(activeSettings.gamepad.bindings.runModifier),fc::serializeGamepadChord(activeSettings.gamepad.bindings.hop),

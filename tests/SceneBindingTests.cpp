@@ -13,6 +13,10 @@ constexpr std::array<int,4> magicTracks{46,47,48,49};
 constexpr std::array<int,13> attachmentTracks{42,43,46,47,48,49,60,61,62,63,64,65,66};
 bool unownedTrack(int i){return i>=97||std::find(attachmentTracks.begin(),attachmentTracks.end(),i)!=attachmentTracks.end();}
 void check(bool ok,const char* message){if(!ok)throw std::runtime_error(message);}
+std::string lowerSceneName(std::string name) {
+    for(auto& value:name)if(value>='A'&&value<='Z')value=char(value+('a'-'A'));
+    return name;
+}
 struct FixtureNode {
     int id{},parentId{-1},order{};
     std::string name;
@@ -135,6 +139,12 @@ void actualScene(const char* path,const Library& lib) {
 int main(int argc,char** argv) {
     try {
         check(argc>=2,"motion path is required");Library lib;check(lib.load(argv[1]),"motion library");
+        check(sameSceneBoneName("NPC L Thigh [LThg]","npc l thigh [lthg]"),"live bone lookup follows native ASCII case-insensitive names");
+        check(!sameSceneBoneName("NPC L Thigh [LThg]","NPC R Thigh [RThg]"),"case folding preserves left and right identity");
+        check(!sameSceneBoneName("NPC L Thigh [LThg]"," NPC L Thigh [LThg]")&&
+            !sameSceneBoneName("NPC L Thigh [LThg]","NPC L Thigh [LThg] ")&&
+            !sameSceneBoneName("NPC L Thigh [LThg]","NPC L Thigh [LThg]X"),"live lookup never trims or invents partial aliases");
+        check(!sameSceneBoneName("NPC L Thigh [LThg]","x_NPC L Thigh [LThg]"),"live lookup never strips arbitrary prefixes");
         std::array<int,99> objects{};std::array<unsigned,99> lookups{};
         std::set<std::string> present(lib.names.begin(),lib.names.end());
         auto lookup=[&](const std::string& name)->int* {
@@ -170,6 +180,14 @@ int main(int argc,char** argv) {
         for(int equipment:equipmentTracks) {
             check(engineOwnedEquipmentTrack(equipment,lib.names,lib.parents),"all nine canonical equipment leaves remain native");
             check(engineOwnedEquipmentName(lib.names[equipment],lib.names,lib.parents),"equipment ancestor guard recognizes each native equipment name");
+            const auto lower=lowerSceneName(lib.names[equipment]);
+            check(engineOwnedEquipmentName(lower,lib.names,lib.parents)&&engineOwnedAttachmentName(lower,lib.names,lib.parents),
+                "mixed-case live equipment remains excluded as a body ancestor");
+            names=lib.names;names[equipment]=lower;
+            check(!engineOwnedEquipmentTrack(equipment,names,lib.parents)&&!engineOwnedEquipmentName(lower,names,lib.parents),
+                "canonical equipment schema remains case-exact despite live-name folding");
+            check(!engineOwnedEquipmentName(lower+" ",lib.names,lib.parents)&&!engineOwnedAttachmentName("x_"+lower,lib.names,lib.parents),
+                "case-insensitive equipment guard does not accept altered names");
             check(!engineOwnedEquipmentName("x_"+lib.names[equipment],lib.names,lib.parents),"equipment ancestor guard never uses fuzzy names");
             names=lib.names;changed=lib.parents;std::swap(names[1],names[equipment]);std::swap(changed[1],changed[equipment]);
             check(!engineOwnedEquipmentTrack(1,names,changed)&&!engineOwnedEquipmentName(lib.names[equipment],names,changed),"equipment identity requires its exact canonical index");
@@ -197,6 +215,13 @@ int main(int argc,char** argv) {
         for(int magic:magicTracks) {
             check(engineOwnedMagicTrack(magic,lib.names,lib.parents)&&engineOwnedTrack(magic,lib.names,lib.parents),"all four canonical magic leaves remain game-owned");
             check(engineOwnedAttachmentName(lib.names[magic],lib.names,lib.parents),"shared ancestor guard recognizes exact magic socket names");
+            const auto lower=lowerSceneName(lib.names[magic]);
+            check(engineOwnedAttachmentName(lower,lib.names,lib.parents),"mixed-case live magic attachments remain rejected as body ancestors");
+            names=lib.names;names[magic]=lower;
+            check(!engineOwnedMagicTrack(magic,names,lib.parents)&&!engineOwnedAttachmentName(lower,names,lib.parents),
+                "canonical magic schema remains case-exact despite live-name folding");
+            check(!engineOwnedAttachmentName(lower+" ",lib.names,lib.parents)&&!engineOwnedAttachmentName("x_"+lower,lib.names,lib.parents),
+                "case-insensitive magic guard does not accept altered names");
             check(!engineOwnedAttachmentName("x_"+lib.names[magic],lib.names,lib.parents),"shared ancestor guard does not invent magic aliases");
             names=lib.names;changed=lib.parents;std::swap(names[1],names[magic]);std::swap(changed[1],changed[magic]);
             check(!engineOwnedMagicTrack(1,names,changed)&&!engineOwnedAttachmentName(lib.names[magic],names,changed),"magic exclusion requires the exact canonical track index");
