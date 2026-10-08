@@ -3,11 +3,12 @@
 namespace fc {
 struct Keys { bool w{},a{},s{},d{},shift{},space{},entry{},bindingsMapped{},letGo{}; };
 
-inline Input wallInput(Keys k,bool spacePressed,bool autoMantle=true,bool justAttached=false,bool wasWallRunning=false) {
+inline Input wallInput(Keys k,bool spacePressed,bool autoMantle=true,bool justAttached=false,bool wasWallRunning=false,bool wallRunEnabled=true) {
     if(k.letGo||(k.a&&k.s&&k.d&&(spacePressed||k.space)))return {0,0,true,false,false,false,false};
     spacePressed=spacePressed&&!justAttached;
+    const bool run=k.shift&&wallRunEnabled;
     return {float(k.d)-float(k.a),float(k.w)-float(k.s),spacePressed&&k.s,
-        autoMantle&&k.w,spacePressed&&!k.s&&!k.shift&&!wasWallRunning,k.s,k.shift&&!k.s};
+        autoMantle&&k.w,spacePressed&&!k.s&&!run&&!wasWallRunning,k.s,run&&!k.s};
 }
 inline bool entryChord(Keys k) {return k.bindingsMapped?k.entry:k.w&&k.a&&k.d&&k.space;}
 inline bool approachIntent(Keys k) {return entryChord(k)&&!k.s&&!k.letGo;}
@@ -80,8 +81,12 @@ inline GrabFlight grabFlight(bool inAir,bool jumping,bool jumpGraph,bool nativeJ
     const bool air=inAir||jumping||jumpGraph||nativeJump;
     return {air,air&&(speed<-.5f||(inAir&&!jumping&&speed<=.5f)),speed,(inAir||jumping)&&std::isfinite(verticalSpeed)};
 }
-inline Motion grabEntryMotion(GrabFlight flight) {
-    return flight.descending?Motion::ledgeCatch:Motion::jumpCatch;
+inline Motion grabEntryMotion(GrabFlight flight,float approachSpeed=0,float approachDistance=-1,bool verifiedGrounded=false) {
+    if(flight.confirmedAirborne||(!verifiedGrounded&&(flight.airborne||flight.descending)))
+        return flight.descending?Motion::ledgeCatch:Motion::jumpCatch;
+    if(!std::isfinite(approachSpeed)||approachSpeed<0||!std::isfinite(approachDistance)||
+        (approachDistance<0&&approachDistance!=-1))return Motion::jumpCatch;
+    return approachDistance>=0&&approachDistance<=48?Motion::reach:Motion::jumpCatch;
 }
 class JumpGrabGate {
     float remaining{};

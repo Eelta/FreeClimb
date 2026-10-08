@@ -118,7 +118,7 @@ static void actualTerrainWitness(const char* file) {
         peakEntryRays=std::max(peakEntryRays,world.rays);
         const auto entryRays=world.rays;
         check(success&&t.entryLiftHeight()>0,"measured terrain/inferred-wall fixture accepts bounded lift");
-        const float lift=t.entryLiftHeight();t.entry(Motion::sprintCatch,true);float minimum=world.capsuleDistance(t.position);
+        const float lift=t.entryLiftHeight();t.entry(Motion::reach,true);float minimum=world.capsuleDistance(t.position);
         while(t.state==State::approach) {
             const auto result=t.update(world,{},1.f/fps,1000);check(!result.released,"mixed fixture plays checked full curve");
             minimum=std::min(minimum,world.capsuleDistance(t.position));
@@ -165,7 +165,7 @@ int main(int argc,char** argv){try {
             check(rising?t.entryLiftHeight()>0:t.entryLiftHeight()==0,"only the rising plinth needs raised endpoint");
             check(t.lastAttachDistance<=60.01f,"horizontal approach never exceeds60");
             const auto initial=t.position;check((initial-w.global(start)).length()<.01f,"no entry teleport");
-            t.entry(Motion::sprintCatch,true);Vec previous=t.position;int frames=0;
+            t.entry(Motion::reach,true);Vec previous=t.position;int frames=0;
             while(t.state==State::approach&&frames++<fps*2) {
                 const auto result=t.update(w,{},1.f/fps,1000);
                 check(!result.released,"preflight curve remains playable");
@@ -185,7 +185,7 @@ int main(int argc,char** argv){try {
         auto blocked=freshEntry();check(!accepted(roof,{0,0,0},true,blocked),"low ceiling blocks full lifted body route");
         auto distant=stairs;distant.boxes={{{-1000,104,-1000},{1000,500,1000}}};
         auto tooFar=freshEntry();check(!accepted(distant,{0,0,0},true,tooFar),"raised searches preserve horizontal reach/snap cap");
-        auto t=freshEntry();check(accepted(stairs,{0,0,0},true,t),"dynamic obstacle fixture starts valid");t.entry(Motion::sprintCatch,true);
+        auto t=freshEntry();check(accepted(stairs,{0,0,0},true,t),"dynamic obstacle fixture starts valid");t.entry(Motion::reach,true);
         stairs.boxes.push_back({{-1000,30,110},{1000,35,200},false});
         bool stopped=false;
         for(int frame=0;frame<fps&&t.active();++frame) {
@@ -194,12 +194,12 @@ int main(int argc,char** argv){try {
         }
         check(stopped,"new obstruction is caught during actual playback");
         auto removed=baseWorld(0,.625f);auto changed=freshEntry();check(accepted(removed,{0,0,0},true,changed),"support change starts with real wall");
-        changed.entry(Motion::sprintCatch,true);removed.boxes.clear();
+        changed.entry(Motion::reach,true);removed.boxes.clear();
         const auto before=changed.position;const auto result=changed.update(removed,{},1.f/fps,1000);
         check(result.released&&result.releaseVelocity.z<0&&(changed.position-before).length()<.001f,"vanished upper grip cannot finish an air catch and hands off to physical fall");
     }
     Library library;check(argc>=2&&library.load(argv[1]),"load actual motion library for ground-entry transitions");
-    for(int fps:{30,60,120})for(bool releaseShift:{false,true})for(Motion entry:{Motion::sprintCatch,Motion::runLaunch})
+    for(int fps:{30,60,120})for(bool releaseShift:{false,true})for(Motion entry:{Motion::reach,Motion::runLaunch})
         posedEntry(library,fps,releaseShift,entry);
     if(argc>=3)actualTerrainWitness(argv[2]);
     std::cout<<"Ground entry "<<scenarios<<" rotated/far/FPS cases passed";

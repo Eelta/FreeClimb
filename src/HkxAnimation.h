@@ -13,4 +13,7 @@ struct HkxClip {
     std::vector<Pose> frames;
 };
 bool decodeHkxAnimation(std::span<const std::uint8_t> bytes,HkxClip& clip,std::string& error);
+bool decodeHkxAnimation(std::span<const std::uint8_t> bytes,HkxClip& clip,std::string& error,std::string_view member);
+bool decodeHkxAnimationMembers(std::span<const std::uint8_t> bytes,std::vector<std::pair<std::string,HkxClip>>& clips,
+    std::string& error,std::size_t maximumDecodedBytes=200*1024*1024);
 }

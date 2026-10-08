@@ -43,11 +43,15 @@ GOG 1.6.1179 需要 GOG 专用的 SKSE64 2.2.6，以及包含 `Data/SKSE/Plugins
 
 启用耐力消耗时，墙跑每秒耗耐力为攀岩的 **2 倍**。
 
+攀岩使用游戏的潜行状态，不播放下蹲动作。墙跑、完成登顶、后蹬离墙和原地松手都会清除潜行状态，不恢复进墙前的潜行；离墙后可正常手动下蹲。
+
+菜单、控制台及可识别的游戏时间冻结会暂停攀爬并保持附着，恢复游戏后才继续移动、动作进度与耐力消耗。关闭菜单后，先松开原先按住的动作键，再重新按下。
+
 ### 按键重绑
 
 按键页提供前进、后退、左、右、上墙攀爬、墙跑修饰键和跃抓键。点击绑定按钮，先松开全部按键，再同时按住所需的 1–4 键，全部松开后完成录入。左右修饰键分别保留。
 
-录入键盘或手柄组合时，均可按 Esc 或手柄 Back 取消。只记录同时按住的组合，最多 4 键或按钮；无效输入保留原绑定。录入只修改草稿，点击“**保存设置**”后才应用并写入配置。
+录入键盘或手柄组合时，均可按 Esc 或手柄 Back 取消。只记录同时按住的组合，最多 4 键或按钮；无效输入保留原绑定。有效组合录入完成后自动应用并保存。
 
 上墙攀爬使用独立的完整绑定，不需要额外按前进键。上墙后先进入攀岩，再按墙跑修饰键切换墙跑；若上墙时已经按住墙跑修饰键，先松开再按即可。“后退 + 跃抓键”向外蹬离，“左 + 后退 + 右 + 跃抓键”原地松手。
 
@@ -76,14 +80,16 @@ GOG 1.6.1179 需要 GOG 专用的 SKSE64 2.2.6，以及包含 `Data/SKSE/Plugins
 | 页面 | 设置内容 |
 | --- | --- |
 | General / 基础 | 总开关、操作提示、低耐力提醒、自动登顶 |
-| Movement / 移动 | 四向攀爬速度、墙跑速度、斜向墙跑倍率 |
+| Movement / 移动 | 墙跑开关、四向攀爬速度、墙跑速度、斜向墙跑倍率 |
 | Automatic actions / 自动动作 | 情境侧跃、墙跑自动越障、情境登顶、尝试间隔、左右机会保留率 |
 | Stamina / 耐力 | 耐力消耗开关、攀爬与停驻消耗、开始抓墙的耐力门槛 |
 | Audio / 音效 | 音效开关与音量 |
 | Keys / 按键 | 键盘和手柄绑定、手柄开关与阈值 |
 | Animations and diagnostics / 动作管理与诊断 | 安全重载动作包、文件验证结果、动作统计、详细诊断开关 |
 
-底部仅有“**保存设置**”和“**还原默认设置**”两个按钮，点击后都会写入 `Data/SKSE/Plugins/FreeClimb.ini` 并应用。移动与按键修改等待安全离墙后生效；还原默认设置只恢复并保存当前选项卡上的设置，其它选项卡、界面语言和仅在 INI 中提供的参数保持不变；其它页面未保存的编辑仍保留在编辑区。音效调整会在下次播放攀爬音效时预览。
+修改设置后自动应用并写入 `Data/SKSE/Plugins/FreeClimb.ini`。移动、耐力、自动动作和诊断设置立即生效，墙上暂停时也可调整。输入及依赖动画校准的设置等待安全离墙后生效，音效调整影响下次播放。“**还原默认设置**”只恢复并保存当前选项卡，其它选项卡、界面语言和仅在 INI 中提供的参数保持不变。
+
+鼠标停在选项上时，页面下方显示对应说明。墙跑默认开启；关闭后墙跑修饰键不再切换模式，仍可正常攀岩。
 
 关闭 **Consume stamina / 消耗耐力** 会同时取消 FreeClimb 的入墙耐力门槛与全部动作扣费。
 
@@ -91,21 +97,21 @@ GOG 1.6.1179 需要 GOG 专用的 SKSE64 2.2.6，以及包含 `Data/SKSE/Plugins
 
 ## 菜单翻译
 
-翻译文件使用固定键和文本值：复制 `FreeClimb_english.txt`，按语言 ID 命名，例如 `FreeClimb_french.txt`；保留键名，只翻译制表符后的文字，并将 `$FC_LANGUAGE_NAME` 设为语言自身名称。把文件安装到 `Data/Interface/Translations/`，重启游戏后选择该语言，再点击“保存设置”。翻译加载错误记录在 `Data/SKSE/FreeClimb.log` 中。
+翻译文件使用固定键和文本值：复制 `FreeClimb_english.txt`，按语言 ID 命名，例如 `FreeClimb_french.txt`；保留键名，只翻译制表符后的文字，并将 `$FC_LANGUAGE_NAME` 设为语言自身名称。把文件安装到 `Data/Interface/Translations/`，重启游戏后选择该语言，选择会自动保存。翻译加载错误记录在 `Data/SKSE/FreeClimb.log` 中。
 
 文件由 FreeClimb 自行读取，菜单使用 ImGui，不依赖游戏 Scaleform 自动发现翻译。框架导航入口保留 **FreeClimb → Settings**。翻译范围为 FreeClimb 菜单文字；HUD 操作提示与原始技术诊断不在接口范围内。
 
 ## 动作自定义
 
-动作目录为 `Data/meshes/actors/character/animations/FreeClimb/`，由 `pack.json`、`skeleton.json`、35 个 HKX 和 35 个动作配置组成。
+动作目录为 `Data/meshes/actors/character/animations/FreeClimb/`，包含 `pack.json`、`skeleton.json`、25 个 HKX 和配套配置。墙跑和情境侧跃各方向都使用独立的 HKX 和 JSON，包含自己的过渡和所需参考；左右替换包可以同时安装，互不覆盖。
 
 **替换现有槽的动画与配套参数无需重新编译 DLL。** 可用 MO2 覆盖部分文件，保留完整默认包提供其余槽。新增动作槽或新的触发逻辑需要修改插件。
 
-HKX 必须重定向至规定的 99 骨架，并符合受支持的 Skyrim SE 64 位 Havok 2010.2 动画格式。人物移动、碰撞和抓点仍由 FreeClimb 控制；部分动作采用控制器固定时序，修改 HKX 时长不会统一改变所有动作速度。
+运行时使用 FreeClimb 的 99 轨道 HKX。下方转换器可将支持的标准 Skyrim SE 人形 HKX 整理为该格式，无需作者手工改成 99 轨道；其它骨架仍需先重定向。人物移动、碰撞和抓点由 FreeClimb 控制；部分动作采用固定控制时序，修改 HKX 时长不会统一改变所有动作速度。
 
 替换步骤、主要参数、动作槽用途和常见问题见 **[动作 DIY 教程](docs/ANIMATION-DIY.zh-CN.md)**。
 
-源码包附带 **[动作制作助手](tools/authoring/README.zh-CN.md)**。安装带 Tkinter 的 Python 3.10 以上版本后，运行 `tools/authoring/Start.cmd`。选择兼容 HKX 和动作槽，标记手脚支撑时段，即可校验并导出仅含两个文件的 MO2 覆盖包。原生校验组件已随包提供，使用时不用编译；骨架重定向仍在动画软件中完成。
+使用源码包中的 **[动作工具](tools/converter/README.zh-CN.md)**：打开 `tools/converter/bin/FreeClimbConverter.exe`，导入支持的 Skyrim SE 人形 HKX，预览后导出 MO2 ZIP。时机适配和可选的姿态、接触、路线调整都在同一窗口完成，不用手写 JSON、安装 Python 或编译。预览使用编辑后的骨架动作；游戏碰撞与服装物理仍需进游戏检查。
 
 ## 日志与问题反馈
 
@@ -120,7 +126,7 @@ Diagnostics=0
 
 关闭详细诊断后，基础启动信息、动作包加载摘要、错误/警告以及简短的入墙和结束原因仍会记录。开启后增加动作切换、路线失败、姿态输出观测等信息，适合排查卡住、抓点异常或动作未出现的问题。
 
-有菜单时，在 **Animations and diagnostics / 动作管理与诊断** 中打开 **Detailed diagnostic log / 详细诊断日志**，然后点击“保存设置”。无菜单时，退出游戏，将 `Diagnostics` 改为 `1` 后再启动。自定义 INI 的既有取值会在升级时保留。
+有菜单时，在 **Animations and diagnostics / 动作管理与诊断** 中打开 **Detailed diagnostic log / 详细诊断日志**，修改会自动保存。无菜单时，退出游戏，将 `Diagnostics` 改为 `1` 后再启动。自定义 INI 的既有取值会在升级时保留。
 
 **每次启动游戏会覆盖该日志。** 收集问题记录时，先开启详细诊断，再复现问题，并在下次启动前复制日志保存。反馈请附完整游戏版本、FreeClimb 版本、地点、按键、现象及修改过的动作包；画面问题可附视频或截图。崩溃问题还需提供崩溃记录器生成的报告，FreeClimb 日志不包含完整崩溃转储。
 
@@ -137,6 +143,8 @@ powershell -ExecutionPolicy Bypass -File tools/build.ps1
 输出为 `build-multiruntime/Release/FreeClimb.dll`。`FreeClimb-source.zip` 源码包包含 CommonLibSSE-NG、spdlog、rapidcsv、DirectXTK、MinHook、nlohmann/json 和菜单 API 头；固定版本与文件校验分别见 `tools/dependencies.json` 和 `DEPENDENCY-SOURCES.json`。DLL 编译不需要游戏目录或动作素材。
 
 需要重新编译制作助手时，在构建命令后加 `-AuthoringTools`，再将 `build-multiruntime/Release/FreeClimbAuthoring.exe` 复制到 `tools/authoring/bin/FreeClimbAuthoring.exe`，与源码包一起分发。
+
+同次构建还会生成 `FreeClimbConverter.exe` 和 `FreeClimbHKXConverter.exe`，两者放入 `tools/converter/bin/`。[转换器说明](tools/converter/README.zh-CN.md#命令行与构建)也提供了不编译 SKSE 插件、只构建工具的方法。
 
 运行不依赖动作文件的测试：
 

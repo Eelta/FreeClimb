@@ -1,6 +1,8 @@
 #include "PCH.h"
 #include "RuntimeSupport.h"
 #include "AnimationSkeletonLayout.h"
+#include "FlatSkeleton.h"
+#include "CanonicalSkeleton.h"
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -505,6 +507,175 @@ void memoryGuards() {
 }
 }
 
+RE::NiRTTI diagnosticNodeType{"NiNode",nullptr};
+RE::NiRTTI diagnosticFlatType{"BSFlattenedBoneTree",&diagnosticNodeType};
+const RE::NiRTTI* diagnosticNodeRTTI(const RE::NiObject*) {return &diagnosticNodeType;}
+const RE::NiRTTI* diagnosticFlatRTTI(const RE::NiObject*) {return &diagnosticFlatType;}
+RE::NiNode* diagnosticAsNode(RE::NiObject* object) {return reinterpret_cast<RE::NiNode*>(object);}
+using SceneStorage=Storage<RE::NiNode,0x200>;
+void diagnosticChildren(SceneStorage& storage,std::span<RE::NiAVObject*> children) {
+    const auto offset=address(&storage.object()->GetChildren())-storage.address();
+    storage.put(offset+8,children.data());storage.put(offset+0x10,std::uint16_t(children.size()));
+}
+struct BinderName {
+    RE::BSStringPool::Entry entry{};
+    std::array<char,96> text{};
+    void assign(std::string_view name) {
+        require(name.size()<text.size(),"binder string fixture length");entry._flags=1;entry._length=std::uint32_t(name.size());
+        std::copy(name.begin(),name.end(),text.begin());text[name.size()]='\0';
+    }
+};
+static_assert(offsetof(BinderName,text)==sizeof(RE::BSStringPool::Entry));
+void flattenedBindingStructures(REL::Version version) {
+    const auto runtime=version.minor()==5?REL::Module::Runtime::SE:REL::Module::Runtime::AE;
+    require(REL::Module::mock(version,runtime,L"SkyrimSE.exe",0x140000000),"binding fixture mock runtime");
+    std::array<std::uintptr_t,4> nodeTable{},flatTable{};nodeTable[2]=address(&diagnosticNodeRTTI);nodeTable[3]=address(&diagnosticAsNode);
+    flatTable[2]=address(&diagnosticFlatRTTI);flatTable[3]=address(&diagnosticAsNode);
+    std::array<std::string,99> names;std::array<BinderName,99> pooled;
+    for(std::size_t i=0;i<names.size();++i){names[i]=fc::canonicalBoneNames[i];pooled[i].assign(names[i]);}
+    BinderName actorName,cacheName;actorName.assign("skeleton.nif");cacheName.assign("body-cache");
+    SceneStorage actor,root,com,pelvis,nested,outside;
+    const auto initialize=[&](SceneStorage& storage,BinderName& name,bool flat=false) {
+        storage.put(0,flat?flatTable.data():nodeTable.data());storage.object()->_refCount=1;
+        const char* text=name.text.data();std::memcpy(&storage.object()->name,&text,sizeof(text));
+        for(int axis=0;axis<3;++axis)storage.object()->local.rotate.entry[axis][axis]=storage.object()->world.rotate.entry[axis][axis]=1;
+        storage.object()->local.scale=storage.object()->world.scale=1;
+        require(std::string_view(storage.object()->name.c_str())==name.text.data(),"real BSFixedString resolves its string-pool Entry");
+    };
+    initialize(actor,actorName);initialize(root,pooled[0],true);initialize(com,pooled[4]);initialize(pelvis,pooled[5]);initialize(nested,cacheName,true);initialize(outside,pooled[6]);
+    root.object()->parent=actor.object();com.object()->parent=root.object();pelvis.object()->parent=com.object();outside.object()->parent=actor.object();nested.object()->parent=pelvis.object();
+    std::array<RE::NiAVObject*,2> actorChildren{root.object(),outside.object()};std::array<RE::NiAVObject*,1> rootChildren{com.object()},comChildren{pelvis.object()},pelvisChildren{nested.object()};
+    diagnosticChildren(actor,actorChildren);diagnosticChildren(root,rootChildren);diagnosticChildren(com,comChildren);
+    using Entry=RE::BSFlattenedBoneTree::BoneEntry;Storage<Entry,sizeof(Entry)*99> entries;
+    for(std::size_t i=0;i<99;++i){auto& entry=entries.object()[i];entry.parentIndex=std::int16_t(fc::canonicalBoneParents[i]);entry.unk6A=-1;entry.nextSiblingIndex=-1;
+        for(int axis=0;axis<3;++axis)entry.local.rotate.entry[axis][axis]=entry.world.rotate.entry[axis][axis]=1;entry.local.scale=entry.world.scale=1;
+        if(i<1||i>3){const char* text=pooled[i].text.data();std::memcpy(&entry.nodeName,&text,sizeof(text));}
+    }
+    entries.object()[0].node=root.object();entries.object()[4].node=com.object();entries.object()[5].node=pelvis.object();
+    const auto storage=[&](SceneStorage& owner,Entry* bones,std::uint32_t count,std::uint32_t populated) {
+        auto& data=reinterpret_cast<RE::BSFlattenedBoneTree*>(owner.object())->GetRuntimeData();data.numBones=count;data.numPopulatedBones=populated;data.boneEntries=bones;
+        require(fc::flatEntries(owner.object()).has_value(),"fixture has bounded valid typed flat entries");
+    };
+    storage(root,entries.object(),99,3);const auto originalEntries=entries.bytes;
+    const auto baselineNodes=std::array{actor.bytes,root.bytes,com.bytes,pelvis.bytes,nested.bytes,outside.bytes};
+    {
+        const auto bound=fc::bindRuntimeScene(root.object(),names,fc::canonicalBoneParents);
+        require(bool(bound)&&bound.count==81&&bound.virtualLeaves==3&&bound.unownedTracks==15,"production binder accepts the ordinary selected-root flat skeleton");
+        require(bound.nodes[6].flat==&entries.object()[6].local&&!bound.nodes[6].node,"ordinary flat binding selects actual left-thigh storage without creating a node");
+        for(std::size_t i=0;i<99;++i)if(fc::engineOwnedTrack(i,names,fc::canonicalBoneParents))require(!bound.nodes[i],"production binding excludes engine-owned camera and attachment tracks");
+        std::cout<<"Production binder, mocked runtime "<<version.string()<<", selected-root flat: missing="<<bound.missing<<", mapped="<<bound.count<<", virtual="<<bound.virtualLeaves<<", unowned="<<bound.unownedTracks<<'\n';
+    }
+    const auto refs=[&]{for(auto* node:{actor.object(),root.object(),com.object(),pelvis.object(),nested.object(),outside.object()})require(node->GetRefCount()==1,"binder releases only its temporary node references");};refs();
+    require(std::array{actor.bytes,root.bytes,com.bytes,pelvis.bytes,nested.bytes,outside.bytes}==baselineNodes&&entries.bytes==originalEntries,"successful production lookup does not mutate nodes or flat storage");
+    const auto missing=[&](const char* label) {
+        const auto actorBefore=actor.bytes,rootBefore=root.bytes,comBefore=com.bytes,pelvisBefore=pelvis.bytes,nestedBefore=nested.bytes,outsideBefore=outside.bytes;
+        const auto bonesBefore=entries.bytes;
+        {const auto bound=fc::bindRuntimeScene(root.object(),names,fc::canonicalBoneParents);require(!bound&&bound.missing==6&&bound.count==3&&bound.virtualLeaves==3,label);require(!bound.nodes[6],"failure cannot substitute the same-named thigh outside the owned NPC Root");
+            std::cout<<"Production binder, mocked runtime "<<version.string()<<", "<<label<<": missing="<<bound.missing<<", mapped="<<bound.count<<", virtual="<<bound.virtualLeaves<<", unowned="<<bound.unownedTracks<<'\n';}
+        refs();require(actor.bytes==actorBefore&&root.bytes==rootBefore&&com.bytes==comBefore&&pelvis.bytes==pelvisBefore&&nested.bytes==nestedBefore&&outside.bytes==outsideBefore&&entries.bytes==bonesBefore,"failed production lookup does not mutate nodes or flat storage");
+    };
+    root.put(0,nodeTable.data());actor.put(0,flatTable.data());storage(actor,entries.object(),99,3);
+    missing("production binder reproduces index6 mapped3 when the actual flat storage belongs to an ancestor");
+    actor.put(0,nodeTable.data());Storage<Entry,sizeof(Entry)> nestedEntries;auto& thigh=*nestedEntries.object();thigh.parentIndex=-1;thigh.unk6A=-1;thigh.nextSiblingIndex=-1;
+    const char* thighName=pooled[6].text.data();std::memcpy(&thigh.nodeName,&thighName,sizeof(thighName));storage(nested,nestedEntries.object(),1,0);diagnosticChildren(pelvis,pelvisChildren);
+    const auto nestedBefore=nestedEntries.bytes;
+    missing("production binder reproduces index6 mapped3 for a named unmaterialized thigh in a nested flat tree");
+    require(nestedEntries.bytes==nestedBefore,"failed lookup leaves nested flat entry unchanged");diagnosticChildren(pelvis,std::span<RE::NiAVObject*>{});
+    root.put(0,flatTable.data());const char* empty=nullptr;std::memcpy(&entries.object()[6].nodeName,&empty,sizeof(empty));
+    using Map=RE::BSTHashMap<RE::BSFixedString,std::int32_t>;struct MapSlot {const char* name{};std::int32_t index{};std::uint32_t padding{};const void* next{};};
+    static_assert(sizeof(Map)==0x30&&sizeof(Map::value_type)==0x10&&sizeof(MapSlot)==0x18);std::array<MapSlot,8> mapSlots{};Storage<Map,sizeof(Map)> map;
+    const auto sentinel=RE::detail::BSTScatterTableSentinel;const auto bucket=RE::BSCRC32<const void*>()(thighName)&7;mapSlots[bucket]={thighName,6,0,sentinel};
+    map.put(0x0C,std::uint32_t{8});map.put(0x10,std::uint32_t{7});map.put(0x14,std::uint32_t{7});map.put(0x18,sentinel);map.put(0x28,mapSlots.data());
+    auto& boneMap=reinterpret_cast<RE::BSFlattenedBoneTree*>(root.object())->GetRuntimeData().boneMap;std::memcpy(&boneMap,map.bytes.data(),map.bytes.size());Storage<RE::BSFixedString,sizeof(RE::BSFixedString)> key;key.put(0,thighName);
+    const auto found=boneMap.find(*key.object());require(boneMap.size()==1&&found!=boneMap.end()&&found->second==6&&std::string_view(found->first.c_str())==names[6],"real typed boneMap resolves the bounded thigh index when entry.nodeName is empty");
+    missing("production binder reproduces index6 mapped3 when the only thigh name is in the real typed boneMap");
+    require(entries.bytes!=originalEntries,"map-only case actually removes the entry name rather than changing expected counts");
+    std::cout<<"PASS production scene binder synthetic fixtures for mocked runtime "<<version.string()<<"; these structures do not establish the player's root cause\n";
+}
+void sceneLookupDiagnostics() {
+    require(REL::Module::mock(REL::Version(1,6,640,0),REL::Module::Runtime::AE,L"SkyrimSE.exe",0x140000000),"diagnostic AE fixture runtime");
+    std::array<std::uintptr_t,4> nodeTable{},flatTable{};
+    nodeTable[2]=address(&diagnosticNodeRTTI);nodeTable[3]=address(&diagnosticAsNode);
+    flatTable[2]=address(&diagnosticFlatRTTI);flatTable[3]=address(&diagnosticAsNode);
+    SceneStorage actor,root,inside,outside;
+    auto initialize=[&](SceneStorage& storage,const char* name,bool flat=false) {
+        storage.put(0,flat?flatTable.data():nodeTable.data());storage.put(0x10,name);
+    };
+    initialize(actor,"skeleton.nif");initialize(root,"NPC Root [Root]",true);
+    initialize(inside,"NPC L Thigh [LThg]");initialize(outside,"NPC L Thigh [LThg]");
+    root.put(0x30,actor.object());inside.put(0x30,root.object());outside.put(0x30,actor.object());
+    std::array<RE::NiAVObject*,2> actorChildren{root.object(),outside.object()};
+    std::array<RE::NiAVObject*,1> rootChildren{inside.object()};
+    diagnosticChildren(actor,actorChildren);diagnosticChildren(root,rootChildren);
+    using Entry=RE::BSFlattenedBoneTree::BoneEntry;
+    Storage<Entry,0x100> entries;
+    entries.put(0x68,std::int16_t{-1});entries.put(0x80+0x68,std::int16_t{0});
+    entries.put(0x78,"NPC Root [Root]");entries.put(0x80+0x78,"NPC L Thigh [LThg]");
+    root.put(0x128,std::uint32_t{2});root.put(0x12C,std::uint32_t{0});root.put(0x130,entries.object());
+    const auto actorBefore=actor.bytes,rootBefore=root.bytes,insideBefore=inside.bytes,outsideBefore=outside.bytes;
+    const auto entriesBefore=entries.bytes;
+    auto result=fc::describeSceneLookup(actor.object(),root.object(),"NPC L Thigh [LThg]");
+    require(result.actorClass=="NiNode"&&result.rootClass=="BSFlattenedBoneTree"&&result.rootName=="NPC Root [Root]","diagnostic reports actual actor and selected root classes");
+    require(result.flat.state=="valid"&&result.flat.count==2&&result.flat.populated==0&&result.flat.samples=="0:NPC Root [Root]; 1:NPC L Thigh [LThg]","diagnostic samples checked flat storage");
+    require(result.inside==1&&result.outside==1&&result.scanned==4&&!result.incomplete&&!result.parentChainIncomplete,"diagnostic distinguishes exact bone matches inside and outside the selected root");
+    require(actor.bytes==actorBefore&&root.bytes==rootBefore&&inside.bytes==insideBefore&&outside.bytes==outsideBefore&&entries.bytes==entriesBefore,"diagnostics never mutate actor, skeleton, children or flat storage");
+    Storage<Entry,0x400> namedEntries;
+    for(std::size_t i=0;i<8;++i){namedEntries.put(i*0x80+0x68,std::int16_t{-1});namedEntries.put(i*0x80+0x78,"named");}
+    root.put(0x128,std::uint32_t{8});root.put(0x130,namedEntries.object());
+    result=fc::describeSceneLookup(actor.object(),root.object(),"Missing Thigh");
+    require(result.flat.samples=="0:named; 1:named; 2:named; 3:named; 4:named; 5:named","flat diagnostic output is capped at six named samples");
+    root.put(0x128,std::uint32_t{2});root.put(0x130,entries.object());
+    result=fc::describeSceneLookup(actor.object(),root.object(),"Missing Thigh");
+    require(!result.inside&&!result.outside&&!result.incomplete,"complete absent lookup remains absent without manufacturing a node");
+    root.put(0x130,reinterpret_cast<Entry*>(1));
+    result=fc::describeSceneLookup(actor.object(),root.object(),"Missing Thigh");
+    require(result.flat.state=="invalid"&&result.flat.samples.empty(),"unreadable flat data cannot be sampled");
+    root.put(0x130,entries.object());root.put(0x128,std::uint32_t{4097});
+    require(fc::describeSceneLookup(actor.object(),root.object(),"Missing Thigh").flat.state=="invalid","oversized flat storage rejected before traversal");
+    root.put(0x128,std::uint32_t{2});entries.put(0x80+0x68,std::int16_t{1});
+    require(fc::describeSceneLookup(actor.object(),root.object(),"Missing Thigh").flat.state=="invalid","self-parented flat storage marked invalid");
+    entries.put(0x80+0x68,std::int16_t{0});
+    root.put(0,nodeTable.data());actor.put(0,flatTable.data());
+    actor.put(0x128,std::uint32_t{2});actor.put(0x130,entries.object());
+    result=fc::describeSceneLookup(actor.object(),root.object(),"NPC L Thigh [LThg]");
+    require(result.flat.state=="not-flat"&&result.ancestorFlatTrees=="1:skeleton.nif(valid,2)","diagnostic records a flattened parent without expanding ownership");
+    actor.put(0x30,root.object());
+    require(fc::describeSceneLookup(actor.object(),root.object(),"Missing Thigh").parentChainIncomplete,"parent cycles terminate with explicit incomplete flag");
+    actor.put(0x30,static_cast<RE::NiNode*>(nullptr));actor.put(0,nodeTable.data());
+    rootChildren[0]=actor.object();
+    require(fc::describeSceneLookup(actor.object(),root.object(),"Missing Thigh").incomplete,"child cycles terminate with explicit incomplete flag");
+    rootChildren[0]=reinterpret_cast<RE::NiAVObject*>(1);
+    require(fc::describeSceneLookup(actor.object(),root.object(),"Missing Thigh").incomplete,"unreadable actual child is not dereferenced");
+    rootChildren[0]=inside.object();
+    const auto childOffset=address(&root.object()->GetChildren())-root.address();root.put(childOffset+8,reinterpret_cast<void*>(1));
+    require(fc::describeSceneLookup(actor.object(),root.object(),"Missing Thigh").incomplete,"unreadable children array is not traversed");
+    diagnosticChildren(root,rootChildren);
+    root.put(0,reinterpret_cast<void*>(1));
+    result=fc::describeSceneLookup(actor.object(),root.object(),"Missing Thigh");
+    require(result.rootClass=="<invalid-vtable>"&&result.incomplete,"unreadable vtable cannot be invoked");root.put(0,nodeTable.data());
+    require(fc::sceneDiagnosticText(reinterpret_cast<const char*>(1))=="<unreadable>","unreadable diagnostic name is safe");
+    const std::string longName(200,'a');
+    require(fc::sceneDiagnosticText(longName.c_str()).size()==83&&fc::sceneDiagnosticText("a\nb")=="a?b","diagnostic names are bounded and cannot inject log lines");
+    auto absent=fc::describeSceneLookup(nullptr,nullptr,"Missing Thigh");
+    require(absent.actorClass=="<unreadable>"&&absent.parentChainIncomplete,"null roots are reported without dereference");
+    std::vector<SceneStorage> chain(130);
+    std::vector<std::array<RE::NiAVObject*,1>> links(130);
+    for(std::size_t i=0;i<chain.size();++i) {
+        initialize(chain[i],"branch");
+        if(i)chain[i].put(0x30,chain[i-1].object());
+        if(i+1<chain.size()){links[i][0]=chain[i+1].object();diagnosticChildren(chain[i],links[i]);}
+    }
+    result=fc::describeSceneLookup(chain.front().object(),chain.front().object(),"Missing Thigh");
+    require(result.incomplete&&result.scanned==129,"actual tree depth is capped at 128");
+    result=fc::describeSceneLookup(chain.back().object(),chain.back().object(),"Missing Thigh");
+    require(result.parentChainIncomplete,"ancestor traversal depth is capped at 128");
+    std::vector<SceneStorage> wide(4096);std::vector<RE::NiAVObject*> leaves;leaves.reserve(wide.size());
+    for(auto& leaf:wide){initialize(leaf,"leaf");leaves.push_back(leaf.object());}
+    diagnosticChildren(actor,leaves);
+    result=fc::describeSceneLookup(actor.object(),actor.object(),"Missing Thigh");
+    require(result.incomplete&&result.scanned==4096,"actual tree node budget is capped at 4096");
+    std::cout<<"PASS bounded scene diagnostics: exact names, typed flat fields, owned-domain distinction, read-only guards and traversal limits\n";
+}
 int main() {
     try {
         constexpr std::array versions{
@@ -516,6 +687,8 @@ int main() {
         for(const auto version:versions)runtimeCase(version);
         memoryGuards();
         animationSkeletonMemoryGuards();
+        sceneLookupDiagnostics();
+        for(const auto version:{REL::Version(1,5,97,0),REL::Version(1,6,640,0),REL::Version(1,6,1170,0)})flattenedBindingStructures(version);
         virtualHookPublication();
         addressLibraryCases();
         REL::Module::reset();

@@ -111,10 +111,35 @@ static void midpointAndLiveSweep(const Library& lib) {
     check(!backFlipBodyClear(open,lib,start,start,0,0,outward,0,37,std::numeric_limits<float>::quiet_NaN()),"nonfinite body scale fails closed");
 }
 
+static void authoredSourceSweep(const Library& base) {
+    auto lib=base;auto& clip=lib.clips[int(Motion::backFlipOut)-1];clip.authoredPlayback=true;
+    clip.trajectory.count=3;clip.trajectory.knots[0]={0,{}};
+    clip.trajectory.knots[1]={.5f,{7,-60,45}};clip.trajectory.knots[2]={1,{0,-120,10}};
+    for(std::size_t i=0;i<clip.frames.size();++i)clip.frames[i][0].t=clip.frames[i][0].t+clip.trajectory.sample(float(i)/float(clip.frames.size()-1));
+    for(float phase:{0.f,.25f,.5f,.75f,1.f}) {
+        const auto original=lib.sample(Motion::backFlipOut,phase);
+        const auto sample=sampleBackFlipOut(lib,phase,.5f,37,1);
+        check((sample[0].t-(original[0].t-clip.trajectory.sample(phase))).length()<.00001f,"authored exit consumes source Root exactly once");
+        for(std::size_t i=0;i<sample.size();++i)check(angleBetween(sample[i].q,original[i].q)<.00001f,"authored exit collision pose retains source joint rotations");
+    }
+    const float a=.40f,b=.42f,mid=(a+b)*.5f;
+    const Vec from{0,-200,300},to{1,-205,299},middle{80,-240,400},outward{0,-1,0};
+    const auto body=backFlipBody(lib,sampleBackFlipOut(lib,mid,0,37,1));
+    FlipGeometry obstacle;obstacle.ball=middle+body[4].point;
+    check(backFlipBodyClear(obstacle,lib,from,to,a,b,outward,0,37,1),"legacy midpoint misses a deliberately different authored route");
+    check(!backFlipBodyClear(obstacle,lib,from,to,a,b,outward,0,37,1,nullptr,middle),"actual authored midpoint participates in the body collision sweep");
+    FlipGeometry open;
+    check(backFlipBodyClear(open,lib,from,to,a,b,outward,0,37,1,nullptr,middle),"clear authored route retains full body validation");
+    check(!backFlipBodyClear(open,lib,from,to,a,b,outward,0,37,1,nullptr,Vec{0,0,std::numeric_limits<float>::quiet_NaN()}),"invalid authored midpoint fails closed");
+    clip.trajectory={};
+    const auto source=lib.sample(Motion::backFlipOut,.5f),fallback=sampleBackFlipOut(lib,.5f,.5f,37,1);
+    check((source[0].t-fallback[0].t).length()<.00001f,"in-place fallback does not erase unconsumed source offsets");
+}
+
 int main(int argc,char** argv) {
     try {
         check(argc==2,"supply FreeClimb.motion path");Library lib;check(lib.load(argv[1]),"load runtime capture library");
-        captureAndPlacement(lib);realGeometry(lib);midpointAndLiveSweep(lib);
+        captureAndPlacement(lib);realGeometry(lib);midpointAndLiveSweep(lib);authoredSourceSweep(lib);
         std::cout<<"BackFlipPose tests passed\n";return 0;
     } catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
 }

@@ -49,7 +49,7 @@ public:
                 else if(foot)emit(SoundCue::step,.65f);
             }
         } else if(!cycle) {
-            const bool entry=motion==Motion::reach||motion==Motion::jumpCatch||motion==Motion::sprintCatch||motion==Motion::ledgeCatch;
+            const bool entry=motion==Motion::reach||motion==Motion::jumpCatch||motion==Motion::ledgeCatch;
             const bool hop=hopMotion(motion);
             const bool wallKick=motion>=Motion::kickUp&&motion<=Motion::kickRight;
             const bool departing=motion==Motion::dropBack||motion==Motion::backFlipOut;

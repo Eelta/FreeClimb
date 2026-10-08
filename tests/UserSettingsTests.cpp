@@ -32,10 +32,12 @@ int main() {
     std::filesystem::create_directories(directory);const auto path=directory/"FreeClimb.ini";
     auto missing=loadUserSettings(path);
     expect(!missing.found&&missing.settings.language=="english","Missing INI must use English defaults");
+    expect(missing.settings.wallRunEnabled,"Missing INI preserves enabled wall running");
     expect(missing.settings.downSpeed==78&&missing.settings.wallRunSpeed==379.5f,"Runtime defaults must match shipped settings");
     expect(!UserSettings{}.diagnostics&&!missing.settings.diagnostics,"Detailed diagnostics must default off when configuration is absent");
     write(path,"[General]\nDiagnostics=1\n");
     const auto explicitDiagnostics=loadUserSettings(path);
+    expect(explicitDiagnostics.settings.wallRunEnabled,"Old INI without a wall run master switch preserves existing behavior");
     expect(explicitDiagnostics.settings.diagnostics,"Existing explicit Diagnostics=1 must remain enabled when read");
     expect(explicitDiagnostics.warnings.empty()&&explicitDiagnostics.settings.gamepad==GamepadSettings{},"Old INI files without a gamepad section retain keyboard behavior and adopt gamepad defaults");
     std::string diagnosticsError;
@@ -190,7 +192,7 @@ int main() {
         "[General]\nEnabled=0\nNotifications=0\nLowStaminaNotifications=0\nAutoMantle=0\n"
         "AutomaticClimbActions=0\nWallRunObstacleJumps=0\nDiagnostics=1\nJumpToAttach=0\n"
         "ContextActions=0\nThreepeatAnimations=0\nSurfaceActionVariants=0\n"
-        "[Movement]\nUpSpeed=41\nDownSpeed=42\nSideSpeed=43\nWallRunSpeed=244\nDiagonalRunMultiplier=1.23\n"
+        "[Movement]\nWallRunEnabled=0\nUpSpeed=41\nDownSpeed=42\nSideSpeed=43\nWallRunSpeed=244\nDiagonalRunMultiplier=1.23\n"
         "AutoActionMinSeconds=7\nAutoActionMaxSeconds=9\nHopOutDistance=40\nKickOutDistance=60\nFancyJumps=0\n"
         "[AutomaticActions]\nContextualMantleEnabled=0\nLeftWeight=0.25\nRightWeight=0.5\n"
         "[Stamina]\nEnabled=0\nMovingPerSecond=23\nHangingPerSecond=12\nRequiredToGrab=31\n"
@@ -200,12 +202,13 @@ int main() {
         "Entry=Ctrl+Up\nRunModifier=Alt\nHop=Enter\n"
         "[Gamepad]\nEnabled=0\nDeadzone=.35\nTriggerThreshold=.7\nEntry=RB+X\nRunModifier=RB\nHop=X\nDrop=A\n");
     const auto customized=loadUserSettings(path);
+    expect(!customized.settings.wallRunEnabled,"Explicit movement wall run disable is read independently of obstacle jumps");
     expect(customized.warnings.empty()&&validateBindings(customized.settings.bindings).valid,"Page reset fixture must have valid non-default settings");
     const auto originalFields=iniFields(customized.settings),defaultFields=iniFields(UserSettings{});
     struct PageCase {SettingsPage page;std::set<std::string> fields;};
     const PageCase pages[]{
         {SettingsPage::general,{"general/enabled","general/notifications","general/lowstaminanotifications","general/automantle"}},
-        {SettingsPage::movement,{"movement/upspeed","movement/downspeed","movement/sidespeed","movement/wallrunspeed","movement/diagonalrunmultiplier"}},
+        {SettingsPage::movement,{"movement/wallrunenabled","movement/upspeed","movement/downspeed","movement/sidespeed","movement/wallrunspeed","movement/diagonalrunmultiplier"}},
         {SettingsPage::automatic,{"general/automaticclimbactions","general/wallrunobstaclejumps","automaticactions/contextualmantleenabled",
             "movement/autoactionminseconds","movement/autoactionmaxseconds","automaticactions/leftweight","automaticactions/rightweight"}},
         {SettingsPage::stamina,{"stamina/enabled","stamina/movingpersecond","stamina/hangingpersecond","stamina/requiredtograb"}},

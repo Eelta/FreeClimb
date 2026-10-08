@@ -4,10 +4,14 @@
 #include "Core.h"
 #include "Controls.h"
 #include "InputBindings.h"
+#include "EntryInputDiagnostics.h"
 #include "GamepadInput.h"
 #include "MenuInterruption.h"
+#include "TraversalSuspension.h"
+#include "TraversalStealth.h"
 #include <SKSE/InputMap.h>
 #include "UserSettings.h"
+#include "SettingsRuntime.h"
 #include "SettingsMenu.h"
 #include "ControllerGravityLease.h"
 #include "GroundMotionProbe.h"
@@ -31,11 +35,17 @@ fc::ClimbEntryIntent climbEntry;
 fc::NativeJumpIntent nativeJumpIntent;
 fc::EntryPreparationGrace entryPreparationGrace;
 fc::InputState inputState;
+fc::InputState entryKeyboardSnapshot;
+fc::KeyChord entryKeyboardSnapshotBinding;
+fc::EntryInputDiagnostics keyboardEntryDiagnostics,gamepadEntryDiagnostics;
 fc::InputOwnership inputOwnership;
 fc::GamepadState gamepadState;
 fc::GamepadOwnership gamepadOwnership;
 bool gamepadAvailable{},gamepadPreferred{},gamepadOwned{},gamepadLost{},gamepadHookReady{};
 fc::WallRunEntryGate wallRunEntryGate;
+fc::TraversalSuspension traversalSuspension;
+fc::KeyboardReleaseGate keyboardReleaseGate;
+fc::TraversalStealth traversalStealth;
 fc::PoseRuntime poses;
 fc::TraversalAudioRuntime traversalAudio;
 fc::ViewHeading viewHeading;
@@ -92,7 +102,7 @@ fc::UserSettings activeSettings,desiredSettings;
 std::optional<fc::UserSettings> pendingSettings;
 std::optional<std::pair<bool,float>> pendingAudio;
 bool pendingSave{},pendingReload{};
-std::uint64_t settingsRevision{},reloadRevision{};
+std::uint64_t settingsRevision{},reloadRevision{},liveSettingsRevision{};
 fc::SettingsMenuSnapshot menuSnapshot;
 std::string settingsStatus="not_ready",settingsError;
 std::array<std::uint64_t,fc::motionCount+1> totalMotionUses{},totalObservedUses{};
@@ -242,9 +252,15 @@ fc::MenuInputState menuInputState(const RE::IMenu& menu) {
     }
     return {menu.PausesGame(),menu.InventoryItemMenu(),input};
 }
+bool engineTimeSuspended() {
+    const auto* main=RE::Main::GetSingleton();
+    const auto* timer=RE::BSTimer::GetSingleton();
+    return (main&&main->GetRuntimeData().freezeTime)||
+        (timer&&fc::gameTimeSuspended(timer->delta,false,timer->pauseCount));
+}
 bool grabInputSuspended() {
     const auto ui=RE::UI::GetSingleton();
-    if(!foreground()||!ui||fc::settingsMenuBlocking())return true;
+    if(!foreground()||!ui||fc::settingsMenuBlocking()||engineTimeSuspended())return true;
     RE::BSSpinLockGuard lock(ui->processMessagesLock);
     if(ui->GameIsPaused()||ui->numItemMenus>0||ui->IsMenuOpen("Console")||ui->IsMenuOpen("Dialogue Menu")||
         ui->IsMenuOpen("Loading Menu")||ui->IsMenuOpen("TweenMenu"))return true;
@@ -265,6 +281,14 @@ void cancelGrabRequest() {
     climbEntry.blockUntilRelease();grabProbeCooldown=0;
 }
 
+void suspendTraversal() {
+    if(!traversalSuspension.suspend())return;
+    exitNativeDiagnostics.reset();groundMotionProbe.suspend();traversalAudio.stop();
+    inputState.reset();keyboardReleaseGate.suspend();gamepadState.blockUntilButtonsReleased();
+    wallRunEntryGate.reset();lastHop=false;nativeJumpIntent={};cancelGrabRequest();
+    poses.suspend(true);
+    if(diagnostics&&traversal.active())SKSE::log::info("Traversal suspended; wall contact and animation ownership retained");
+}
 void stopLocomotion() {
     if(auto controls=RE::PlayerControls::GetSingleton()) {
         controls->data.moveInputVec={0,0};
@@ -413,6 +437,10 @@ struct GameWorld final:fc::World {
         return motion==fc::Motion::backFlipOut&&fc::backFlipBodyClear(*this,poses.library,
             from,to,fromPhase,toPhase,outward,traversal.surfaceNormal.z,traversal.cfg.gap,player->GetScale());
     }
+    bool actionBodyPathClear(fc::Motion motion,fc::Vec from,fc::Vec to,float fromPhase,float toPhase,fc::Vec outward,fc::Vec middle) override {
+        return motion==fc::Motion::backFlipOut&&fc::backFlipBodyClear(*this,poses.library,
+            from,to,fromPhase,toPhase,outward,traversal.surfaceNormal.z,traversal.cfg.gap,player->GetScale(),nullptr,middle);
+    }
     std::optional<fc::Hit> ray(fc::Vec from,fc::Vec to) override {
         auto cell=player->GetParentCell();
         auto world=cell?cell->GetbhkWorld():nullptr;
@@ -510,11 +538,12 @@ void setMotion(RE::PlayerCharacter*,fc::Motion m) {
 void release(RE::PlayerCharacter* p,const char* reason,bool fade=false,bool physicalFall=false,bool completedTop=false) {
     exitNativeDiagnostics.reset();
     const auto releaseStarted=diagnostics?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
-    wallRunEntryGate.reset();
+    traversalSuspension.clear();poses.suspend(false);wallRunEntryGate.reset();
     if(preparationChangedView)cancelEntryPreparation();
     if(fade)traversalAudio.resetTiming();else traversalAudio.stop();
     entryPreparationGrace.cancel();preparationStarted=0;poseHealth.reset();
     viewHeading.reset();
+    traversalStealth.release(p);
     poses.release(fade,physicalFall,completedTop);
     const auto poseReleased=diagnostics?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     const bool wasOwned=ownedController.get()!=nullptr;
@@ -538,7 +567,7 @@ void release(RE::PlayerCharacter* p,const char* reason,bool fade=false,bool phys
         const auto controlsReleased=diagnostics?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
         SKSE::log::info("Released: {}",reason);
         if(diagnostics)for(int i=1;i<=fc::motionCount;++i)if(motionUses[i])
-            SKSE::log::info("Session action {} entries={} selectedSeconds={:.3f}",i,motionUses[i],selectedSeconds[i]);
+            SKSE::log::info("Session action {} entries={} selectedSeconds={:.3f} slot={}",i,motionUses[i],selectedSeconds[i],fc::motionSlotNames[i-1]);
         if(diagnostics)SKSE::log::info("Session measured routes: edgeHop={} corner={} eave={} automaticClimbActions={} automaticAttempts={} wallRunObstacleJumps={}",
             contextHops,contextCorners,contextEaves,lastAutomaticAction-automaticActionBase,lastAutomaticAttempt-automaticAttemptBase,lastObstacleJump-obstacleJumpBase);
         if(diagnostics) {
@@ -675,6 +704,74 @@ bool allowed(RE::PlayerCharacter* p) {
         state->GetKnockState()==RE::KNOCK_STATE_ENUM::kNormal&&state->GetSitSleepState()==RE::SIT_SLEEP_STATE::kNormal;
 }
 
+const char* entryDiagnosticReason(RE::PlayerCharacter* p,float dt,bool fromGamepad) {
+    if(!ready)return "runtime not ready";
+    if(!animationState)return "animation state marker unavailable";
+    if(grabInputSuspended())return "input suspended by focus, menu or frozen time";
+    if(fc::gameTimeSuspended(dt))return "invalid or paused game time";
+    if(traversalSuspension.active())return "resume requires fresh input";
+    if(!enabled)return "FreeClimb disabled";
+    if(traversal.active())return "already attached";
+    if(fromGamepad) {
+        if(!activeSettings.gamepad.enabled)return "controller disabled";
+        if(!gamepadHookReady||!gamepadAvailable)return "controller unavailable";
+        if(gamepadState.waitingForButtonsRelease())return "controller buttons must release";
+    } else if(keyboardReleaseGate.waiting())return "keyboard bindings must release";
+    if(gamepadSelected()!=fromGamepad)return "other input device selected";
+    const auto held=keys();
+    if(held.s)return "backward veto";
+    if(held.letGo)return "drop veto";
+    if(!fc::entryChord(held))return "raw chord absent from mapped input";
+    if(!p)return "player unavailable";
+    if(!p->Is3DLoaded())return "player 3D unavailable";
+    if(!p->GetCharController())return "character controller unavailable";
+    if(!p->GetParentCell())return "player cell unavailable";
+    if(p->IsDead())return "player dead";
+    if(p->IsInKillMove())return "kill move active";
+    if(p->IsOnMount())return "player mounted";
+    const auto* actor=p->AsActorState();
+    if(actor->IsSwimming())return "player swimming";
+    if(actor->IsWeaponDrawn())return "weapon drawn";
+    if(actor->GetKnockState()!=RE::KNOCK_STATE_ENUM::kNormal)return "knock state active";
+    if(actor->GetSitSleepState()!=RE::SIT_SLEEP_STATE::kNormal)return "sit or sleep state active";
+    if(!jumpToAttach)return "JumpToAttach disabled";
+    const auto* controls=RE::ControlMap::GetSingleton();
+    if(!controls)return "control map unavailable";
+    if(!controls->IsMovementControlsEnabled())return "native movement controls disabled";
+    if(p->IsSneaking())return "player sneaking";
+    if(graph(p,"bIsSynced"))return "synced animation active";
+    if(graph(p,"SkyParkourOngoing"))return "SkyParkour active";
+    if(graph(p,"SkyParkourSliding"))return "SkyParkour sliding";
+    if(p->IsAnimationDriven())return "animation drives movement";
+    if(tdm&&tdm->GetTargetLockState())return "TDM target lock active";
+    if(climbEntry.waitingForRelease())return "entry chord must release";
+    if(traversal.cooldown>0)return "release cooldown; confirmed airborne catch may bypass";
+    if(grabProbeCooldown>0)return "entry probe interval pending";
+    if(preparationStarted)return "pose preparation pending";
+    return "ready for entry validation";
+}
+
+void observeEntryInput(RE::PlayerCharacter* p,float dt) {
+    if(!diagnostics){keyboardEntryDiagnostics.reset();gamepadEntryDiagnostics.reset();return;}
+    const bool keyboardCurrent=entryKeyboardSnapshotBinding==activeSettings.bindings.entry;
+    const bool rawKeyboard=keyboardCurrent&&fc::chordHeld(entryKeyboardSnapshot,activeSettings.bindings.entry);
+    const bool rawGamepad=gamepadAvailable&&gamepadState.heldChord(activeSettings.gamepad.bindings.entry);
+    const auto now=GetTickCount64();
+    const std::array events{keyboardEntryDiagnostics.sample(rawKeyboard,now),gamepadEntryDiagnostics.sample(rawGamepad,now)};
+    for(unsigned device=0;device<events.size();++device) {
+        if(events[device]==fc::EntryDiagnosticEvent::none)continue;
+        const bool gamepad=device!=0;
+        const auto mapped=gamepad?gamepadState.keys(activeSettings.gamepad.bindings):fc::mapKeys(inputState,activeSettings.bindings);
+        const auto reason=events[device]==fc::EntryDiagnosticEvent::released?"entry chord no longer complete":entryDiagnosticReason(p,dt,gamepad);
+        SKSE::log::info("Entry input: phase={} device={} chord={} gate='{}'; rawComplete={} mappedEntry={} selected={} keyboardMask={:X} keyboardSnapshotCurrent={} keyboardRelease={} controllerRelease={} chordRelease={} W={} A={} S={} D={} hop={} run={} drop={} preparing={} releaseCooldown={:.3f} probeCooldown={:.3f}",
+            fc::name(events[device]),gamepad?"gamepad":"keyboard",gamepad?fc::serializeGamepadChord(activeSettings.gamepad.bindings.entry):fc::serializeKeyChord(activeSettings.bindings.entry),reason,
+            gamepad?rawGamepad:rawKeyboard,mapped.entry,gamepadSelected()==gamepad,
+            keyboardCurrent?fc::entryHeldMask(entryKeyboardSnapshot,activeSettings.bindings.entry):0,keyboardCurrent,
+            keyboardReleaseGate.waiting(),gamepadState.waitingForButtonsRelease(),climbEntry.waitingForRelease(),
+            mapped.w,mapped.a,mapped.s,mapped.d,mapped.space,mapped.shift,mapped.letGo,preparationStarted!=0,traversal.cooldown,grabProbeCooldown);
+    }
+}
+
 bool observeNativeContacts(RE::PlayerCharacter* p,const char* reason="near-stop",bool contacts=true) {
     const RE::NiPointer<RE::bhkCharacterController> controller(p?p->GetCharController():nullptr);
     auto* cell=p?p->GetParentCell():nullptr;auto* world=cell?cell->GetbhkWorld():nullptr;
@@ -753,8 +850,12 @@ void observeNativeMovement(RE::PlayerCharacter* p,const fc::Keys& held,float dt)
         int(controller->surfaceInfo.supportedState.get()),graph(p,"bIsSynced"),p->IsAnimationDriven(),
         graph(p,"SkyParkourOngoing"),graph(p,"SkyParkourSliding"),ownedController.get()!=nullptr,
         held.shift,held.w,held.a,held.s,held.d,velocity.m128_f32[0]/worldScale,velocity.m128_f32[1]/worldScale,velocity.m128_f32[2]/worldScale);
-    SKSE::log::info("Native entry history: attachmentsSinceLoad={} pending={} waitingForKeyRelease={} preparing={} changedView={}",
-        attachmentsSinceLoad,jumpGrab.pending(),climbEntry.waitingForRelease(),preparationStarted!=0,preparationChangedView);
+    const bool keyboardSnapshotCurrent=entryKeyboardSnapshotBinding==activeSettings.bindings.entry;
+    SKSE::log::info("Native entry history: attachmentsSinceLoad={} pending={} waitingForKeyRelease={} preparing={} changedView={} device={} chord={} entry={} hop={} keyboardRelease={} controllerRelease={} rawKeyboardMask={:X} keyboardSnapshotCurrent={}",
+        attachmentsSinceLoad,jumpGrab.pending(),climbEntry.waitingForRelease(),preparationStarted!=0,preparationChangedView,
+        gamepadSelected()?"gamepad":"keyboard",gamepadSelected()?fc::serializeGamepadChord(activeSettings.gamepad.bindings.entry):fc::serializeKeyChord(activeSettings.bindings.entry),
+        held.entry,held.space,keyboardReleaseGate.waiting(),gamepadState.waitingForButtonsRelease(),
+        keyboardSnapshotCurrent?fc::entryHeldMask(entryKeyboardSnapshot,activeSettings.bindings.entry):0,keyboardSnapshotCurrent);
     observeNativeContacts(p);
 
     if(!std::isfinite(controller->collisionBound.extents.x))return;
@@ -762,8 +863,8 @@ void observeNativeMovement(RE::PlayerCharacter* p,const fc::Keys& held,float dt)
     for(float height:{12.f,70.f,125.f}) {
         GameWorld witness(p);const auto from=position+fc::Vec{0,0,height};
         const auto hit=witness.ray(from,from+intent.unit()*(radius+30));
-        SKSE::log::info("Native near-stop ray: height={:.0f} hit={} distance={:.2f} reference={:08X} base={:08X} layer={} formType={} response={} model='{}' normal=({:.3f},{:.3f},{:.3f})",
-            height,hit.has_value(),witness.firstDistance,witness.firstReference,witness.firstBaseReference,witness.firstLayer,
+        SKSE::log::info("Native near-stop ray: height={:.0f} hit={} climbable={} distance={:.2f} reference={:08X} base={:08X} layer={} formType={} response={} model='{}' normal=({:.3f},{:.3f},{:.3f})",
+            height,hit.has_value(),hit&&hit->climbable,witness.firstDistance,witness.firstReference,witness.firstBaseReference,witness.firstLayer,
             witness.firstFormType,witness.firstResponseType,witness.firstStaticModel,
             witness.firstNormal.x,witness.firstNormal.y,witness.firstNormal.z);
     }
@@ -814,6 +915,7 @@ bool acquire(RE::PlayerCharacter* p) {
     observedSpanContinuous=false;
     lastRenderedMotion=fc::Motion::none;lastRenderedSample=0;
     obstacleJumpBase=lastObstacleJump=traversal.obstacleJumpCount();
+    if(!traversalStealth.acquire(p,traversal.wallRunning())) {release(p,"stealth state unavailable");return false;}
     const auto controlsAcquired=diagnostics?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     SKSE::log::info("Attached at ({:.1f},{:.1f},{:.1f}); normal=({:.2f},{:.2f},{:.2f}); actorScale={:.2f}; controllerBounds=({:.2f},{:.2f},{:.2f}); actorHeight={:.2f}",
         traversal.position.x,traversal.position.y,traversal.position.z,traversal.normal.x,traversal.normal.y,traversal.normal.z,
@@ -847,6 +949,7 @@ void update(RE::PlayerCharacter* p,float dt) {
         }
     }
     gamepadLost=false;
+    if(grabInputSuspended()||fc::gameTimeSuspended(dt))suspendTraversal();
     entryLookDiagnostics.beforeNative(p);
     if(traversal.active()) stopLocomotion();
     prior(p,dt);
@@ -854,21 +957,35 @@ void update(RE::PlayerCharacter* p,float dt) {
         if(traversal.active())release(p,"character rig changed");
         else {cancelEntryPreparation();cancelGrabRequest();}
     }
-    if(std::isfinite(dt)&&dt>1e-6f)poses.tick(dt);
     serviceSettings();
-    if(!ready||!enabled||!animationState) {exitNativeDiagnostics.reset();return;}
-
-    if(grabInputSuspended()) {
-        exitNativeDiagnostics.reset();
-        groundMotionProbe.suspend();
-        inputState.reset();gamepadState.blockUntilButtonsReleased();wallRunEntryGate.reset();traversalAudio.stop();
-
-        if(traversal.active())release(p,"input suspended");
-        cancelGrabRequest();
+    observeEntryInput(p,dt);
+    if(!ready||!animationState) {exitNativeDiagnostics.reset();return;}
+    if(traversal.active()) {
+        if(!allowed(p)) {release(p,"actor invalid while attached");return;}
+        if(!traversalStealth.update(p,traversal.wallRunning())) {release(p,"traversal state invalid");return;}
+    }
+    if(grabInputSuspended()||fc::gameTimeSuspended(dt)) {
+        suspendTraversal();
+        if(traversal.active()) {
+            const auto position=vec(p->GetPosition());
+            if(p->GetCharController()!=ownedController.get()||p->GetParentCell()!=climbingCell||
+                !position.finite()||(position-traversal.position).length()>150.f) {
+                release(p,"wall ownership invalid while suspended");return;
+            }
+            stopLocomotion();
+        }
         return;
     }
-
-    if(!std::isfinite(dt)||dt<=1e-6f){exitNativeDiagnostics.reset();entryPreparationGrace.cancel();return;}
+    if(traversalSuspension.resume()) {
+        inputState.reset();keyboardReleaseGate.suspend();gamepadState.blockUntilButtonsReleased();
+        wallRunEntryGate.reset();lastHop=false;nativeJumpIntent={};cancelGrabRequest();
+        poses.suspend(false);poseHealth.resume(poses.applied.load());
+        if(traversal.active())stopLocomotion();
+        if(diagnostics&&traversal.active())SKSE::log::info("Traversal resumed; fresh input and pose callback required");
+        return;
+    }
+    poses.tick(dt);
+    if(!enabled){exitNativeDiagnostics.reset();return;}
     traversalAudio.observe(dt);
     observeNativeShapeBaseline(p,dt);
     const bool fromGamepad=gamepadSelected();
@@ -975,26 +1092,32 @@ void update(RE::PlayerCharacter* p,float dt) {
 
         const auto facing=jumpGrab.facing();
         const float yaw=std::atan2(facing.x,facing.y);
+        const auto* entryController=p->GetCharController();
+        const bool entryOnGround=entryController->context.currentState==RE::hkpCharacterStateType::kOnGround&&
+            entryController->wantState!=RE::hkpCharacterStateType::kJumping&&!flight.confirmedAirborne;
+        auto entry=entryOnGround?fc::grabEntryMotion(flight,approachSpeed,-1,true):fc::grabEntryMotion(flight);
+        const auto nearEntry=entryOnGround&&fc::grabEntryMotion(flight,approachSpeed,0,true)==fc::Motion::reach?fc::Motion::reach:fc::Motion::none;
         auto candidate=traversal;
-        if(!candidate.attach(world,vec(p->GetPosition()),facing,stamina,grabMaxSnap,explicitAirCatch,!flight.airborne)) {
-            if(diagnostics&&diagnosticCooldown<=0&&world.hits>0) {
-                SKSE::log::info("Climb entry rejected: {}; airborne={} descending={} snap={:.2f}/{}; pos=({:.1f},{:.1f},{:.1f}); yaw={:.2f}; casts={} hits={} firstRayDistance={:.1f}; normal=({:.2f},{:.2f},{:.2f})",
+        if(!candidate.attach(world,vec(p->GetPosition()),facing,stamina,grabMaxSnap,explicitAirCatch,!flight.airborne,entry,nearEntry)) {
+            if(diagnostics&&diagnosticCooldown<=0) {
+                SKSE::log::info("Climb entry rejected: {}; airborne={} descending={} snap={:.2f}/{}; pos=({:.1f},{:.1f},{:.1f}); yaw={:.2f}; casts={} hits={} firstRayDistance={:.1f}; normal=({:.2f},{:.2f},{:.2f}); stamina={:.2f} required={:.2f} staminaEnabled={}",
                     fc::name(candidate.lastFailure),flight.airborne,flight.descending,candidate.lastAttachDistance,grabMaxSnap,
                     p->GetPositionX(),p->GetPositionY(),p->GetPositionZ(),yaw,world.casts,world.hits,world.firstDistance,
-                    world.firstNormal.x,world.firstNormal.y,world.firstNormal.z);
+                    world.firstNormal.x,world.firstNormal.y,world.firstNormal.z,stamina,candidate.cfg.startStamina,candidate.cfg.staminaEnabled);
                 reportIgnoredTrigger(world);diagnosticCooldown=2;
-                SKSE::log::info("Grab collision: reference={:08X} base={:08X} formType={} broadphase={} motion={} response={} filter={:08X}; point=({:.2f},{:.2f},{:.2f}); fixedStaticModel='{}'",
+                if(world.hits>0)SKSE::log::info("Grab collision: reference={:08X} base={:08X} formType={} broadphase={} motion={} response={} filter={:08X}; point=({:.2f},{:.2f},{:.2f}); fixedStaticModel='{}'",
                     world.firstReference,world.firstBaseReference,world.firstFormType,world.firstBroadphase,world.firstMotionType,world.firstResponseType,
                     world.firstFilterInfo,world.firstHitPoint.x,world.firstHitPoint.y,world.firstHitPoint.z,world.firstStaticModel);
             }
             if(preparationStarted||preparationChangedView)cancelEntryPreparation();
             return;
         }
+        entry=candidate.entrySelection();
+        const auto checkedEntry=candidate;
         float nativeSlope=.707107f;
         if(auto* proxyController=skyrim_cast<RE::bhkCharProxyController*>(p->GetCharController()))
             if(const auto* proxy=proxyController->GetCharacterProxy();proxy&&std::isfinite(proxy->maxSlopeCosine)&&proxy->maxSlopeCosine>=0&&proxy->maxSlopeCosine<=1)
                 nativeSlope=std::max(nativeSlope,proxy->maxSlopeCosine);
-        const auto* entryController=p->GetCharController();
         const bool grounded=fc::groundEntryGeometryAllowed(
             entryController->context.currentState==RE::hkpCharacterStateType::kOnGround,
             entryController->wantState==RE::hkpCharacterStateType::kJumping,
@@ -1054,10 +1177,17 @@ void update(RE::PlayerCharacter* p,float dt) {
         entryPreparationGrace.cancel();preparationStarted=0;
         candidate.cfg.threepeatAnimations=activeSettings.threepeatAnimations;
         poses.library.configureThreepeat(candidate.cfg);
+        if(!candidate.entry(world,entry,!flight.airborne,&checkedEntry)) {
+            cancelEntryPreparation();
+            if(diagnostics&&diagnosticCooldown<=0) {
+                SKSE::log::info("Climb entry rejected: selected entry path blocked; motion={} casts={}",int(entry),world.casts);
+                diagnosticCooldown=2;
+            }
+            return;
+        }
         traversal=std::move(candidate);gamepadOwned=fromGamepad;
         const bool nativeSpace=jumpGrab.startedNativeJump();
         reportIgnoredTrigger(world);
-        const auto entry=fc::grabEntryMotion(flight);
         if(!acquire(p)) {
             traversal.stop();gamepadOwned=false;
             cancelEntryPreparation();
@@ -1072,7 +1202,9 @@ void update(RE::PlayerCharacter* p,float dt) {
         preparationChangedView=false;
         if(diagnostics&&preparedRetry&&!grabIntent.requested)SKSE::log::info("Completed validated entry preparation after chord release within 150ms");
         wallRunEntryGate.begin(heldKeys);
-        traversal.entry(entry,!flight.airborne);jumpGrab.cancel();climbEntry.blockUntilRelease();attachedThisFrame=true;
+        jumpGrab.cancel();climbEntry.blockUntilRelease();attachedThisFrame=true;
+        if(diagnostics)SKSE::log::info("Entry animation: slot={} grounded={} targetDistance={:.2f}",
+            fc::motionSlotNames[int(entry)-1],entryOnGround,(traversal.entryTarget()-vec(p->GetPosition())).length());
         if(diagnostics)SKSE::log::info("Entry={} preEntryForwardSpeed={:.1f} airborne={} descending={} nativeSpace={} velocityZ={:.2f} entryLift={} explicitAirCatch={} snap={:.2f} raisedTarget={:.1f} roundedCapsule={} duration={:.3f}; groundSupported={} supportedState={} nativeProbes={} lowProbes={}; target=({:.2f},{:.2f},{:.2f}) targetDelta=({:.2f},{:.2f},{:.2f})",
             int(entry),approachSpeed,flight.airborne,flight.descending,nativeSpace,flight.verticalSpeed,!flight.airborne,
             explicitAirCatch,traversal.lastAttachDistance,traversal.entryLiftHeight(),traversal.roundedEntryPath(),traversal.entryDuration(),
@@ -1085,7 +1217,7 @@ void update(RE::PlayerCharacter* p,float dt) {
             world.firstReference,world.firstBaseReference,world.firstLayer,world.firstHitPoint.x,world.firstHitPoint.y,world.firstHitPoint.z,
             world.firstNormal.x,world.firstNormal.y,world.firstNormal.z,world.firstStaticModel);
     }
-    fc::Input input=fc::wallInput(wallRunEntryGate.filter(heldKeys),hopPressed,autoMantle,attachedThisFrame,traversal.wallRunning());
+    fc::Input input=fc::wallInput(wallRunEntryGate.filter(heldKeys),hopPressed,autoMantle,attachedThisFrame,traversal.wallRunning(),traversal.cfg.wallRunEnabled);
     const float contactSpeed=poses.surface.movementScale();
     input.x*=contactSpeed;input.y*=contactSpeed;
 
@@ -1130,9 +1262,9 @@ void update(RE::PlayerCharacter* p,float dt) {
     if(diagnostics) {
         if(traversal.state==fc::State::mantle&&stateBefore!=fc::State::mantle) {
             const auto from=traversal.topStart(),target=traversal.topTarget(),lip=traversal.topLip();
-            SKSE::log::info("Mantle selected: motion={} preciseContacts={} sourceBegin={:.3f} reason={}; height={:.2f} forward={:.2f} surfaceZ={:.3f} wasRunning={} preparation={:.3f}",
+            SKSE::log::info("Mantle selected: motion={} preciseContacts={} sourceBegin={:.3f} reason={}; height={:.2f} forward={:.2f} surfaceZ={:.3f} wasRunning={} preparation={:.3f} route={} seconds={:.3f}",
                 int(result.motion),traversal.preciseTopContacts(),traversal.topSampleBegin(),traversal.topSelectionReason(),
-                lip.z-from.z,(target-from).dot(traversal.normal*-1),traversal.surfaceNormal.z,runningBefore,traversal.topPreparation());
+                lip.z-from.z,(target-from).dot(traversal.normal*-1),traversal.surfaceNormal.z,runningBefore,traversal.topPreparation(),traversal.topRouteKind(),traversal.topSeconds());
         }
         if(traversal.automaticAttemptCount()!=lastAutomaticAttempt) {
             lastAutomaticAttempt=traversal.automaticAttemptCount();
@@ -1203,6 +1335,7 @@ void update(RE::PlayerCharacter* p,float dt) {
     if(result.staminaCost>0) p->AsActorValueOwner()->ModActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage,RE::ActorValue::kStamina,-result.staminaCost);
     if(traversal.cfg.staminaEnabled&&lowStaminaNotifications&&stamina<=20&&!lowStaminaNoted){note("FreeClimb: low stamina - stop to rest or climb down");lowStaminaNoted=true;}
     if(stamina>30)lowStaminaNoted=false;
+    if(!result.released&&!traversalStealth.update(p,traversal.wallRunning())) {release(p,"traversal state invalid");return;}
     const auto publishStarted=std::chrono::steady_clock::now();
     poses.update(world,traversal,result.motion,dt,p->GetScale());
     traversalAudio.update(poses.library,traversal,result,poses.surface.sampledPhase(),effectiveDt,animationReady);
@@ -1275,9 +1408,15 @@ struct AttachedSpaceGuard {
         prior(keyboard,dt);
         if(!ready)return;
         fc::settingsMenuKeyboardSample(keyboard->GetRuntimeData().curState);
+        if(diagnostics) {
+            entryKeyboardSnapshot=fc::diagnosticKeyboardSnapshot(keyboard->GetRuntimeData().curState);
+            entryKeyboardSnapshotBinding=activeSettings.bindings.entry;
+        } else {entryKeyboardSnapshot.reset();entryKeyboardSnapshotBinding={};}
         const bool suspended=grabInputSuspended();
-        if(suspended) {
-            cancelGrabRequest();inputState.reset();wallRunEntryGate.reset();
+        if(suspended){suspendTraversal();keyboardReleaseGate.suspend();}
+        const bool keyboardBlocked=keyboardReleaseGate.sample(keyboard->GetRuntimeData().curState,activeSettings.bindings);
+        if(suspended||keyboardBlocked) {
+            cancelGrabRequest();inputState.reset();
         }
         auto* queue=RE::BSInputEventQueue::GetSingleton();
         if(!queue)return;
@@ -1287,18 +1426,18 @@ struct AttachedSpaceGuard {
             const std::array<std::string_view,4> events{"Forward","Back","Strafe Left","Strafe Right"};
             for(std::size_t i=0;i<events.size();++i)nativeMovementKeys[i]=controls->GetMappedKey(events[i],RE::INPUT_DEVICE::kKeyboard);
         }
-        fc::removeInputEvents(queue->GetQueueHead(),queue->GetQueueTail(),[suspended,nativeMovementKeys](RE::InputEvent* event) {
+        fc::removeInputEvents(queue->GetQueueHead(),queue->GetQueueTail(),[suspended,keyboardBlocked,nativeMovementKeys](RE::InputEvent* event) {
             if(fc::settingsMenuFilterInput(event))return true;
             auto* button=event->AsButtonEvent();
             if(!button||event->GetDevice()!=RE::INPUT_DEVICE::kKeyboard)return false;
             const auto scan=button->GetIDCode();
             const auto before=inputState;
-            if(!suspended)inputState.set(scan,button->IsPressed());
-            if(button->IsDown()&&!suspended&&!traversal.active())gamepadPreferred=false;
+            if(!suspended&&!keyboardBlocked)inputState.set(scan,button->IsPressed());
+            if(button->IsDown()&&!suspended&&!keyboardBlocked&&!traversal.active())gamepadPreferred=false;
             if(traversal.active()&&!gamepadOwned)wallRunEntryGate.filter(fc::mapKeys(inputState,activeSettings.bindings));
             return inputOwnership.filter(scan,button->IsDown(),button->IsUp(),
-                !suspended&&traversal.active()&&!gamepadOwned,before,inputState,activeSettings.bindings,
-                !suspended&&std::find(nativeMovementKeys.begin(),nativeMovementKeys.end(),scan)!=nativeMovementKeys.end());
+                !suspended&&!keyboardBlocked&&traversal.active()&&!gamepadOwned,before,inputState,activeSettings.bindings,
+                !suspended&&!keyboardBlocked&&std::find(nativeMovementKeys.begin(),nativeMovementKeys.end(),scan)!=nativeMovementKeys.end());
         });
         entryLookDiagnostics.queue(queue->GetQueueHead(),1);
     }
@@ -1334,7 +1473,9 @@ struct GamepadGuard {
         if(!pad){fc::settingsMenuGamepadSample(false);return;}
         const auto& raw=pad->GetRuntimeData().currentState.gamepad;
         fc::settingsMenuGamepadSample(true,raw.buttons,raw.leftTrigger,raw.rightTrigger);
-        const bool suspended=grabInputSuspended()||!enabled||!activeSettings.gamepad.enabled;
+        const bool blocked=grabInputSuspended();
+        if(blocked)suspendTraversal();
+        const bool suspended=blocked||!enabled||!activeSettings.gamepad.enabled;
         if(suspended)gamepadState.blockUntilButtonsReleased();
         const auto before=gamepadState;
         sample(*pad);
@@ -1387,13 +1528,8 @@ struct MenuListener:RE::BSTEventSink<RE::MenuOpenCloseEvent> {
                 e->menuName.c_str(),available,flags,context,blocking,traversal.active());
             if(!blocking)nextOverlayLog=now+250;
         }
-        if(blocking) {
-            exitNativeDiagnostics.reset();
-            traversalAudio.stop();
-            inputState.reset();gamepadState.blockUntilButtonsReleased();wallRunEntryGate.reset();
-            if(traversal.active())release(RE::PlayerCharacter::GetSingleton(),"menu opened");
-            cancelGrabRequest();
-        }
+        if(blocking)suspendTraversal();
+
         return RE::BSEventNotifyControl::kContinue;
     }
 } menuListener;
@@ -1416,33 +1552,24 @@ bool runtimeHooksReady() {
     return true;
 }
 
-void applyRuntimeSettings(const fc::UserSettings& value) {
-    const auto oldGamepad=activeSettings.gamepad;
-    activeSettings=fc::sanitizeUserSettings(value);
-    if(activeSettings.gamepad!=oldGamepad)gamepadState.blockUntilButtonsReleased();
+void applyLiveRuntimeSettings(const fc::UserSettings& value,bool retainInputs) {
+    activeSettings=fc::liveRuntimeSettings(activeSettings,value,retainInputs);
     const auto& u=activeSettings;
     enabled=u.enabled;notifications=u.notifications;lowStaminaNotifications=u.lowStaminaNotifications;
-    jumpToAttach=u.jumpToAttach;autoMantle=u.autoMantle;diagnostics=u.diagnostics;
-    grabMaxSnap=u.grabMaxSnap;
+    jumpToAttach=u.jumpToAttach;autoMantle=u.autoMantle;diagnostics=u.diagnostics;grabMaxSnap=u.grabMaxSnap;
     poses.traceOutput=diagnostics;lowStaminaNoted=false;
     if(!diagnostics)crestAuditTime=-1;
-    auto& c=traversal.cfg;
-    c.contextActions=u.contextActions;c.threepeatAnimations=u.threepeatAnimations;
-    c.automaticClimbActions=u.automaticClimbActions;c.legacyAutomaticHops=false;
-    c.surfaceActionVariants=u.surfaceActionVariants;c.wallRunObstacleJumps=u.wallRunObstacleJumps;
-    c.contextualMantleEnabled=u.contextualMantleEnabled;c.automaticSideWeights=u.automaticSideWeights;
-    c.climbSpeed=u.upSpeed;c.downSpeed=u.downSpeed;c.sideSpeed=u.sideSpeed;
-    wallRunSpeedOverride=u.wallRunSpeed;c.runSpeed=u.wallRunSpeed>0?u.wallRunSpeed:379.5f;
-    c.diagonalRunMultiplier=u.diagonalRunMultiplier;
-    c.autoActionMinSeconds=u.autoActionMinSeconds;c.autoActionMaxSeconds=u.autoActionMaxSeconds;
-    c.fancyJumps=u.fancyJumps;c.hopOut=u.hopOut;c.kickOut=u.kickOut;
-    c.reach=u.reach;c.groundJumpHeight=u.groundJumpHeight;c.maxNormalZ=u.maxNormalZ;
-    c.staminaEnabled=u.staminaEnabled;c.drain=u.movingPerSecond;c.hangDrain=u.hangingPerSecond;c.startStamina=u.requiredToGrab;
+    fc::applyLiveTraversalSettings(u,traversal.cfg);wallRunSpeedOverride=u.wallRunSpeed;
     traversalAudio.enabled=u.audioEnabled;traversalAudio.volume=u.audioVolume;
     if(!u.audioEnabled)traversalAudio.stop();
-    cancelGrabRequest();wallRunEntryGate.reset();
-    lastHop=keys().space;
-    if(ready)poses.library.configureThreepeat(c);
+}
+void applyRuntimeSettings(const fc::UserSettings& value) {
+    const auto oldGamepad=activeSettings.gamepad;
+    applyLiveRuntimeSettings(value,false);
+    if(activeSettings.gamepad!=oldGamepad)gamepadState.blockUntilButtonsReleased();
+    traversal.cfg.threepeatAnimations=activeSettings.threepeatAnimations;
+    cancelGrabRequest();wallRunEntryGate.reset();lastHop=keys().space;
+    if(ready)poses.library.configureThreepeat(traversal.cfg);
 }
 
 void refreshMenuSnapshot() {
@@ -1489,13 +1616,14 @@ void serviceSettings() {
         } else {settingsStatus="pending";settingsError.clear();}
     }
     if(requested) {
-        notifications=requested->notifications;lowStaminaNotifications=requested->lowStaminaNotifications;
-        traversalAudio.enabled=requested->audioEnabled;traversalAudio.volume=requested->audioVolume;
-        if(!requested->audioEnabled)traversalAudio.stop();
         if(!requested->enabled&&traversal.active())release(RE::PlayerCharacter::GetSingleton(),"disabled in settings",true);
-        if(!traversal.active())cancelEntryPreparation();
-        if(!traversal.active()&&poses.canReloadPack()) {
-            applyRuntimeSettings(*requested);
+        const bool complete=!traversal.active()&&poses.canReloadPack();
+        if(complete) {
+            cancelEntryPreparation();applyRuntimeSettings(*requested);liveSettingsRevision=revision;
+        } else if(liveSettingsRevision!=revision) {
+            applyLiveRuntimeSettings(*requested,true);liveSettingsRevision=revision;
+        }
+        if(complete||!fc::deferredRuntimeSettings(activeSettings,*requested)) {
             {std::scoped_lock lock(settingsMutex);if(settingsRevision==revision)pendingSettings.reset();}
             if(settingsStatus!="save_failed"){settingsStatus="applied";settingsError.clear();}
         } else if(settingsStatus!="save_failed")settingsStatus="pending";
@@ -1605,17 +1733,20 @@ void onMessage(SKSE::MessagingInterface::Message* m) {
     case SKSE::MessagingInterface::kPostLoadGame: {
         auto p=RE::PlayerCharacter::GetSingleton();
 
-        if(animationState&&animationState->value!=0&&p) p->SetGraphVariableBool("bIsSynced",false);
+        if(animationState&&animationState->value!=0&&p) {
+            traversalStealth.cleanupLoaded(p);p->SetGraphVariableBool("bIsSynced",false);
+        }
         release(p,"new game / loaded"); traversal.reset();
         attachmentsSinceLoad=0;
         nativeShapeBaselineSamples=nativeShapeBaselineAttempts=0;nativeShapeBaselineAge=nativeShapeBaselineRetry=0;
         jumpGrab.cancel();nativeJumpIntent={};inputState.reset();inputOwnership.reset();
+        entryKeyboardSnapshot.reset();entryKeyboardSnapshotBinding={};keyboardEntryDiagnostics.reset();gamepadEntryDiagnostics.reset();
         gamepadState.reset();gamepadOwnership.reset();gamepadPreferred=false;gamepadLost=false;
         totalMotionUses.fill(0);totalObservedUses.fill(0);
         climbEntry.blockUntilRelease();lastHop=false;refreshMenuSnapshot();break;
     }
     case SKSE::MessagingInterface::kSaveGame:
-        release(RE::PlayerCharacter::GetSingleton(),"save"); break;
+        suspendTraversal(); break;
     }
 }
 }
@@ -1646,10 +1777,13 @@ SKSEPluginLoad(const SKSE::LoadInterface* skse) {
     loadSettings();
     auto serialization=SKSE::GetSerializationInterface();
     serialization->SetUniqueID(0x46434C4D);
-    serialization->SetSaveCallback([](SKSE::SerializationInterface*) { release(RE::PlayerCharacter::GetSingleton(),"serialize"); });
+    serialization->SetSaveCallback([](SKSE::SerializationInterface*) { suspendTraversal(); });
     serialization->SetRevertCallback([](SKSE::SerializationInterface*) { release(RE::PlayerCharacter::GetSingleton(),"revert"); });
     const bool registered=SKSE::GetMessagingInterface()->RegisterListener(onMessage);
     if(registered)SKSE::log::info("Plugin load complete; waiting for game data");
     else SKSE::log::error("Plugin load failed: SKSE message listener registration failed");
     return registered;
 }
+
+
+

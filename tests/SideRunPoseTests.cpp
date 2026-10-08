@@ -1,4 +1,4 @@
-#include "AnimationOverrides.h"
+#include "AnimationPack.h"
 #include "Pose.h"
 #include <iostream>
 #include <stdexcept>
@@ -224,10 +224,19 @@ int main(int argc,char** argv) {
         }
         Library lib;require(argc>1&&lib.load(argv[1]),"load actual bundled library");
         if(argc==3) {
-            const auto overrides=fc::loadHkxOverrides(lib,argv[2]);
-            require(overrides.loaded==activeMotionCount&&overrides.rejected==0&&overrides.missing==0,
-                "load every active HKX slot without missing or rejected clips");
-            for(Motion motion:activeMotions)require(lib.hasAnimationOverride(motion),"every active slot installs its HKX override");
+            const auto manifest=std::filesystem::path(argv[2])/"pack.json";
+            if(std::filesystem::exists(manifest)) {
+                const auto pack=fc::loadAnimationPack(lib,manifest);
+                require(pack.committed&&pack.loaded==activeMotionCount&&pack.rejected==0&&pack.missing==0,
+                    "load every active HKX slot through the complete animation pack");
+                for(Motion motion:activeMotions)require(lib.clip(motion).frames.size()>=2&&lib.clip(motion).seconds>0,
+                    "every active slot loads its complete HKX animation");
+            } else {
+                const auto overrides=fc::loadHkxOverrides(lib,argv[2]);
+                require(overrides.loaded==activeMotionCount&&overrides.rejected==0&&overrides.missing==0,
+                    "load every active HKX slot without missing or rejected clips");
+                for(Motion motion:activeMotions)require(lib.hasAnimationOverride(motion),"every active slot installs its HKX override");
+            }
         }
         hiddenUpperTwistNegativeControl(lib);absoluteBraceAnatomy(lib);actualSurfaceWholeArms(lib);
         const auto hang=lib.world(lib.sample(Motion::ledgeCatch,.25f));

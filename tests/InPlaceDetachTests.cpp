@@ -120,7 +120,7 @@ static void poseTransitions(const Library& library,int fps,int kind,bool far,uns
         const auto root=traversal.position;const auto pose=surface.update(library,world,traversal,result.motion,dt,1);
         check((traversal.position-root).length()==0,"exit pose adaptation never modifies the actual player root");
         check(pose.size()==99,"in-place exit retains the complete actual HKX skeleton");
-        const float rate=runMotion(result.motion)||flipMotion(result.motion)||result.motion==Motion::backFlipOut?18.849556f:12.566371f;
+        const float rate=runMotion(result.motion)||result.motion==Motion::backFlipOut?18.849556f:12.566371f;
         for(unsigned bone=0;bone<pose.size();++bone) {
             check(pose[bone].t.finite()&&std::abs(pose[bone].q.dot(pose[bone].q)-1)<.002f,"complete exit output remains finite and normalized");
             if(bone!=0&&bone!=4)check(std::abs(pose[bone].t.length()-library.rest[bone].t.length())<.002f,"every exit transition preserves fixed bone lengths");

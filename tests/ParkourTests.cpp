@@ -449,18 +449,16 @@ try{
         check(t.state!=State::action&&r.staminaCost==0,"a blocked ordinary outward arc is rejected before takeoff or stamina cost");
     }
 
-    for(Motion motion:{Motion::kickUp,Motion::kickLeft,Motion::kickRight,Motion::flipUp,Motion::flipLeft,Motion::flipRight}) {
-        float inverted=1,legChange=0;Pose previous;
+    for(Motion motion:{Motion::kickUp,Motion::kickLeft,Motion::kickRight}) {
+        float legChange=0;Pose previous;
         for(int frame=0;frame<=120;++frame) {
-            const auto pose=lib.sample(motion,frame/120.f),worldPose=lib.world(pose);
+            const auto pose=lib.sample(motion,frame/120.f);
             for(const auto& tr:pose)check(tr.t.finite()&&std::isfinite(tr.q.dot(tr.q))&&std::abs(tr.q.dot(tr.q)-1)<.002f,
                 "retained jump assets remain finite and normalized even though wall-run input does not select them");
-            inverted=std::min(inverted,(worldPose[36].t-worldPose[4].t).unit().z);
             if(!previous.empty())for(int bone:{6,7,9,10})legChange+=angleBetween(previous[bone].q,pose[bone].q);
             previous=pose;
         }
         check(legChange>.1f,"retained jump asset has actual captured leg motion");
-        if(flipMotion(motion))check(inverted<-.55f,"retained flip source preserves its captured torso inversion");
     }
     {
         Wall corridor;corridor.rearObstacle=true;Traversal t;t.cfg.approachSeconds=0;

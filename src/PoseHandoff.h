@@ -9,9 +9,9 @@ class PoseHandoff {
     float displayedTime{},olderTime{};
     float displayedRecovery{},exitWeight=1;
     std::uint64_t revision{};
-    bool exiting{},movingExit{},nativeExit{},seededEntry{},entryClockStarted{},nativeExitGuardReady{};
+    bool exiting{},movingExit{},nativeExit{},seededEntry{},entryClockStarted{},nativeExitGuardReady{},sourceExitGuardReady{},preserveExitSource{};
     float nativeExitAge{},entryOrigin{},entryElapsed{};
-    std::array<bool,2> entryArmGuard{},nativeExitArmGuard{};
+    std::array<bool,2> entryArmGuard{},nativeExitArmGuard{},sourceExitArmGuard{};
     static bool finitePose(const Pose& pose) {
         if(pose.size()!=99)return false;
         for(const auto& bone:pose) {
@@ -55,11 +55,12 @@ public:
     bool hasOutput() const {return !displayed.empty();}
     float exitContribution() const {return exitWeight;}
     bool nativeExitActive() const {return nativeExit&&nativeExitAge<nativeExitSeconds;}
-    bool beginExit(bool continueMotion=false,bool smoothNativeTakeover=false) {
+    bool beginExit(bool continueMotion=false,bool smoothNativeTakeover=false,bool preserveSource=false) {
         if(!hasOutput())return false;
 
         exitSource=displayedSource;exitWeight=1-displayedRecovery;
         movingExit=continueMotion;
+        preserveExitSource=preserveSource;sourceExitGuardReady=false;sourceExitArmGuard={};
         if(movingExit)exitContinuation.begin(displayedSource,olderSource,displayedTime-olderTime);
 
         nativeExit=smoothNativeTakeover&&!continueMotion;nativeExitAge=0;nativeExitGuardReady=false;nativeExitArmGuard={};
@@ -75,8 +76,14 @@ public:
         const float outputElapsed=acknowledgedElapsed>=0?acknowledgedElapsed:elapsed;
         if(!std::isfinite(outputElapsed)||outputElapsed<0)return;
         if(movingExit) {
+            if(preserveExitSource&&!sourceExitGuardReady) {
+                for(int hand=0;hand<2;++hand)sourceExitArmGuard[hand]=library.armBendValid(exitSource,hand);
+                sourceExitGuardReady=true;
+            }
             exitSource=exitContinuation.sample(outputElapsed);
-            library.guardArmBends(exitSource);
+            if(preserveExitSource) {
+                for(int hand=0;hand<2;++hand)if(sourceExitArmGuard[hand])library.guardArmBend(exitSource,hand);
+            } else library.guardArmBends(exitSource);
         }
         if(nativeExit) {
             if(!nativeExitGuardReady) {

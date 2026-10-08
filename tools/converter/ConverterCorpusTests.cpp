@@ -1,0 +1,75 @@
+#include "ConverterEditor.h"
+#include "ConverterSourceMotion.h"
+#include <Windows.h>
+#include <bcrypt.h>
+#include <chrono>
+#include <cwctype>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <map>
+#include <set>
+#include <sstream>
+
+namespace {
+using Json=nlohmann::json;
+using Bytes=std::vector<std::uint8_t>;
+void require(bool ok,const std::string& text){if(!ok)throw std::runtime_error(text);}
+std::string text(const std::filesystem::path& path){const auto value=path.u8string();return {reinterpret_cast<const char*>(value.data()),value.size()};}
+Bytes read(const std::filesystem::path& path){const auto size=std::filesystem::file_size(path);require(size>0&&size<=64*1024*1024,"File is empty or exceeds the 64 MiB limit");std::ifstream file(path,std::ios::binary);Bytes bytes(std::size_t(size),0);require(bool(file.read(reinterpret_cast<char*>(bytes.data()),std::streamsize(bytes.size())))&&file.peek()==std::char_traits<char>::eof(),"File changed while being read");return bytes;}
+struct Hash {
+    BCRYPT_ALG_HANDLE algorithm{};
+    unsigned long size{};
+    Hash(){require(BCryptOpenAlgorithmProvider(&algorithm,BCRYPT_SHA256_ALGORITHM,nullptr,0)>=0,"SHA256 provider unavailable");unsigned long used{};require(BCryptGetProperty(algorithm,BCRYPT_OBJECT_LENGTH,reinterpret_cast<unsigned char*>(&size),sizeof size,&used,0)>=0,"SHA256 object size unavailable");}
+    ~Hash(){if(algorithm)BCryptCloseAlgorithmProvider(algorithm,0);}
+    std::string operator()(const Bytes& bytes){std::vector<unsigned char> object(size);BCRYPT_HASH_HANDLE state{};require(BCryptCreateHash(algorithm,&state,object.data(),size,nullptr,0,0)>=0,"SHA256 creation failed");std::array<unsigned char,32> result{};const auto status=BCryptHashData(state,const_cast<unsigned char*>(bytes.data()),static_cast<unsigned long>(bytes.size()),0);const auto finished=status>=0?BCryptFinishHash(state,result.data(),static_cast<unsigned long>(result.size()),0):status;BCryptDestroyHash(state);require(finished>=0,"SHA256 computation failed");std::ostringstream stream;stream<<std::hex<<std::setfill('0');for(auto byte:result)stream<<std::setw(2)<<unsigned(byte);return stream.str();}
+};
+Json metadata(const Json& row){
+    Json result={{"sha256",row.value("sha256","")},{"kind",row.value("kind","unknown")},{"format",row.value("format","unknown")}};
+    if(row.contains("animations")&&row.at("animations").is_array()&&!row.at("animations").empty()){const auto& animation=row.at("animations")[0];result["layout"]={result["format"],animation.value("encoding",""),animation.value("type",-1),animation.value("transform_tracks",0),animation.value("float_tracks",0),animation.value("mapping_count",0),animation.value("annotation_tracks",0),animation.value("annotation_name_layout","")};}
+    else result["layout"]={result["format"],result["kind"]};return result;
+}
+Json classify(const Bytes& bytes){
+    const std::string_view contents(reinterpret_cast<const char*>(bytes.data()),bytes.size());std::string kind="unknown";
+    if(contents.find("hkaSplineCompressedAnimation\0",0,29)!=std::string_view::npos||contents.find("hkaInterleavedUncompressedAnimation\0",0,36)!=std::string_view::npos)kind="animation";
+    else if(contents.find("hkaSkeleton\0",0,12)!=std::string_view::npos)kind="skeleton";else if(contents.find("hkbBehaviorGraph\0",0,17)!=std::string_view::npos)kind="behavior";
+    const std::string format=bytes.size()>20&&bytes[16]==8&&bytes[17]==1?"SE64":bytes.size()>20&&bytes[16]==4?"LE32":"unknown";return {{"kind",kind},{"format",format},{"layout",{format,kind,"unindexed"}}};
+}
+std::uint64_t compare(const fc::ConverterInputClip& expected,const fc::ConverterInputClip& actual){
+    require(expected.duration==actual.duration&&expected.frames.size()==actual.frames.size()&&actual.boneIndices.size()==99,"Edited HKX timing or mapping differs from preview");std::uint64_t checks=1;
+    for(std::size_t frame=0;frame<expected.frames.size();++frame){require(expected.frames[frame].size()==99&&actual.frames[frame].size()==99,"Edited HKX lacks canonical tracks");for(int bone=0;bone<99;++bone){const auto& a=expected.frames[frame][bone];const auto& b=actual.frames[frame][bone];require((a.t-b.t).length()<.0001f&&fc::angleBetween(a.q,b.q)<.00002f&&(a.s-b.s).length()<.00001f,"Edited HKX differs numerically from the preview");++checks;}}
+    require(!fc::converterExternalMovement(expected)||fc::converterSourceMotionBaked(expected),"Preview still has unapplied source motion");
+    require(expected.annotations.size()==actual.annotations.size(),"Edited annotations changed count");std::array<std::vector<std::pair<float,std::string>>,99> before,after;
+    for(const auto& event:expected.annotations){require(event.track<99,"Preview annotation has noncanonical track");before[event.track].push_back({event.time,event.text});++checks;}
+    for(const auto& event:actual.annotations){require(event.track<99,"Export annotation has noncanonical track");after[event.track].push_back({event.time,event.text});++checks;}require(before==after,"Edited annotations changed per-track order, multiplicity, content or time");
+    const auto& a=expected.referenceFrame;const auto& b=actual.referenceFrame;require(a.samples.size()==b.samples.size(),"Edited root metadata changed count");if(!a.samples.empty()){require(a.duration==b.duration&&(a.up-b.up).length()<.00001f&&(a.forward-b.forward).length()<.00001f&&a.samples==b.samples,"Edited extracted root metadata differs");++checks;}return checks;
+}
+bool hkx(const std::filesystem::path& path){auto extension=path.extension().wstring();for(auto& ch:extension)ch=wchar_t(std::towlower(ch));return extension==L".hkx";}
+void save(const std::filesystem::path& path,const Json& report){std::ofstream stream(path,std::ios::binary);const auto bytes=report.dump(2,' ',false,Json::error_handler_t::replace)+"\n";require(bool(stream.write(bytes.data(),std::streamsize(bytes.size()))),"Cannot write corpus report");}
+int run(const std::filesystem::path& mods,const std::filesystem::path& manifest,const std::filesystem::path& inventory,const std::filesystem::path& output,const std::filesystem::path& prior={}){
+    require(std::filesystem::is_directory(mods)&&std::filesystem::is_directory(output),"Corpus source and output directories must exist");const auto folder=output/("run-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));require(std::filesystem::create_directory(folder),"Cannot allocate corpus evidence directory");
+    std::map<std::string,Json> known;std::ifstream rows(inventory,std::ios::binary);std::string line;while(std::getline(rows,line)){const auto row=Json::parse(line);known.emplace(row.at("path").get<std::string>(),metadata(row));}
+    std::set<std::string> selected,selectedPaths;if(!prior.empty()){std::ifstream previous(prior,std::ios::binary);require(bool(previous),"Cannot read previous corpus results");while(std::getline(previous,line)){const auto row=Json::parse(line);if(row.value("status","")=="rejected"||row.value("representative_export","")=="rejected"){selectedPaths.insert(row.at("path").get<std::string>());if(row.contains("sha256"))selected.insert(row.at("sha256").get<std::string>());}}}
+    auto doc=fc::loadConverterEditor(manifest.parent_path()/"up.hkx",manifest,"up");fc::ConverterEditOptions options;options.autoCalibration=false;options.speed=1.1f;options.bones={{32,{5,0,0},.15f,.85f,.1f}};options.contacts={{0,.2f,.8f,.1f,.5f}};
+    Hash hash;std::set<std::string> seen,representatives;std::map<std::string,std::uint64_t> categories,reasons;std::map<std::string,Json> layouts;std::uint64_t files=0,duplicates=0,passed=0,rejected=0,checks=0,representativePassed=0,representativeRejected=0,changed=0,linksSkipped=0,skipped=0;
+    std::ofstream details(folder/"results.jsonl",std::ios::binary);require(bool(details),"Cannot open corpus details");const auto begin=std::chrono::steady_clock::now();
+    auto iterator=std::filesystem::recursive_directory_iterator(mods,std::filesystem::directory_options::skip_permission_denied);
+    for(;iterator!=std::filesystem::recursive_directory_iterator{};++iterator){const auto& entry=*iterator;const auto attributes=GetFileAttributesW(entry.path().c_str());if(attributes!=INVALID_FILE_ATTRIBUTES&&(attributes&FILE_ATTRIBUTE_REPARSE_POINT)){++linksSkipped;if(entry.is_directory())iterator.disable_recursion_pending();continue;}if(!entry.is_regular_file()||!hkx(entry.path()))continue;++files;Json result={{"path",text(entry.path())}};
+        try{const auto bytes=read(entry.path());const auto sha=hash(bytes);result["sha256"]=sha;if(!seen.insert(sha).second){++duplicates;continue;}if(!prior.empty()&&!selected.contains(sha)){++skipped;continue;}
+            const auto found=known.find(result.at("path").get<std::string>());auto meta=found!=known.end()&&found->second.at("sha256")==sha?found->second:classify(bytes);const auto category=meta.at("format").get<std::string>()+"/"+meta.at("kind").get<std::string>();++categories[category];result["category"]=category;result["layout"]=meta.at("layout");const auto layout=meta.at("layout").dump();auto& group=layouts[layout];if(group.empty())group={{"layout",meta.at("layout")},{"passed",0},{"rejected",0},{"representative",text(entry.path())}};
+            fc::ConverterInputClip raw;std::string error;require(fc::decodeConverterInput(bytes,raw,error),error);std::vector<std::string> warnings;const auto canonicalBytes=fc::writeConverterHkx(raw,doc.base,warnings);fc::ConverterInputClip canonical;require(fc::decodeConverterInput(canonicalBytes,canonical,error),error);
+            std::map<std::pair<float,std::string>,std::size_t> beforeEvents,afterEvents;for(const auto& event:raw.annotations)++beforeEvents[{event.time,event.text}];for(const auto& event:canonical.annotations)++afterEvents[{event.time,event.text}];const auto sourceMotion=fc::inspectConverterSourceMotion(raw);if(sourceMotion.present&&!sourceMotion.alreadyBaked)++beforeEvents[{0,std::string(fc::converterSourceMotionMarker)}];require(beforeEvents==afterEvents,"Canonical import lost or duplicated source annotations");
+            require(raw.referenceFrame.samples==canonical.referenceFrame.samples,"Canonical import changed extracted source samples");if(!raw.referenceFrame.samples.empty())require(raw.referenceFrame.duration==canonical.referenceFrame.duration&&(raw.referenceFrame.up-canonical.referenceFrame.up).length()<.00001f&&(raw.referenceFrame.forward-canonical.referenceFrame.forward).length()<.00001f,"Canonical import changed extracted duration or basis");
+            std::vector<std::string> secondWarnings;const auto secondBytes=fc::writeConverterHkx(canonical,doc.base,secondWarnings);fc::ConverterInputClip second;require(fc::decodeConverterInput(secondBytes,second,error),error);checks+=compare(canonical,second);doc.clip=std::move(canonical);doc.warnings=std::move(warnings);
+            const auto edited=fc::applyConverterEdits(doc,options);std::vector<std::string> exportWarnings;const auto editedBytes=fc::writeConverterHkx(edited.clip,doc.base,exportWarnings);fc::ConverterInputClip exported;require(fc::decodeConverterInput(editedBytes,exported,error),error);checks+=compare(edited.clip,exported);const auto middle=fc::sampleConverterEditor(edited,edited.clip.duration*.5f);require(middle.size()==99,"Live sample has no canonical skeleton");fc::ConverterEditedAnimation unedited;unedited.clip=doc.clip;const auto incoming=fc::sampleConverterEditor(unedited,doc.clip.duration*.5f);require(fc::angleBetween(middle[32].q,incoming[32].q)>.08f,"The requested bounded forearm edit produced no visible correction");const auto contact=fc::sampleConverterContacts(edited,edited.clip.duration*.5f);for(const auto weight:contact)require(weight>=0&&weight<=1&&std::isfinite(weight),"Live contacts exceed range");
+            ++passed;group["passed"]=group["passed"].get<std::uint64_t>()+1;result["status"]="import-edit-roundtrip-pass";result["frames"]=edited.clip.frames.size();result["duration"]=edited.clip.duration;result["warnings"]=edited.warnings;
+            if(representatives.insert(layout).second){try{auto loaded=fc::loadConverterEditor(entry.path(),manifest,"up");auto automatic=options;automatic.autoCalibration=true;const auto ready=fc::applyConverterEdits(loaded,automatic);const auto archive=folder/("representative-"+std::to_string(representatives.size())+".zip");const auto report=fc::exportConverterEditor(loaded,ready,archive);require(report.at("loaded")==fc::activeMotionCount,"Representative full pack failed");result["representative_export"]="pass";result["calibration_confidence"]=ready.confidence;++representativePassed;}catch(const std::exception& e){result["representative_export"]="rejected";result["representative_error"]=e.what();++representativeRejected;}}
+            if(hash(read(entry.path()))!=sha){++changed;throw std::runtime_error("Input changed during corpus read-only test");}
+        }catch(const std::exception& error){if(!prior.empty()&&!result.contains("sha256")&&!selectedPaths.contains(result.at("path").get<std::string>())){++skipped;continue;}++rejected;result["status"]="rejected";result["reason"]=error.what();++reasons[error.what()];if(result.contains("layout")){auto& group=layouts[result.at("layout").dump()];if(!group.empty())group["rejected"]=group["rejected"].get<std::uint64_t>()+1;}}
+        details<<result.dump(-1,' ',false,Json::error_handler_t::replace)<<'\n';require(bool(details),"Cannot append corpus evidence");if((passed+rejected)%250==0){std::cout<<"progress files="<<files<<" distinct="<<seen.size()<<" passed="<<passed<<" rejected="<<rejected<<" duplicate="<<duplicates<<'\n';std::cout.flush();}
+    }
+    const auto elapsed=std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count();Json groups=Json::array();for(const auto& [key,value]:layouts)groups.push_back(value);save(folder/"layouts.json",groups);
+    const Json report={{"hkx_files",files},{"distinct_sha256",seen.size()},{"duplicates",duplicates},{"skipped_reparse_entries",linksSkipped},{"previous_rejections",prior.empty()?Json(nullptr):Json(text(prior))},{"selected_previous_sha256",selected.size()},{"skipped_nonselected",skipped},{"import_edit_roundtrip_passed",passed},{"rejected",rejected},{"numerical_checks",checks},{"representative_full_pack_exports",representativePassed},{"representative_exports_rejected",representativeRejected},{"input_changes",changed},{"categories",categories},{"rejection_reasons",reasons},{"seconds",elapsed},{"output",text(folder)}};save(folder/"summary.json",report);std::cout<<report.dump(2,' ',false,Json::error_handler_t::replace)<<'\n';return changed||representativeRejected?1:0;
+}
+}
+int wmain(int argc,wchar_t** argv){try{if(argc==5)return run(argv[1],argv[2],argv[3],argv[4]);if(argc==7&&std::wstring_view(argv[5])==L"--only-rejections")return run(argv[1],argv[2],argv[3],argv[4],argv[6]);throw std::runtime_error("Need mods-directory pack.json inventory-jsonl output-directory [--only-rejections previous-results.jsonl]");}catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}}

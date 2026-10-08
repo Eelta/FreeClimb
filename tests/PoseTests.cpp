@@ -61,7 +61,7 @@ struct TransitionTrace {
             if(r.motion!=previousMotion) {
                 edges.emplace_back(previousMotion,r.motion);
                 worstStartAngle=std::max(worstStartAngle,angle);worstStartDistance=std::max(worstStartDistance,step);
-                const float limit=(flipMotion(r.motion)?1500.f:runMotion(r.motion)||runMotion(previousMotion)?1100.f:
+                const float limit=(runMotion(r.motion)||runMotion(previousMotion)?1100.f:
                     r.motion==Motion::contextMantle?750.f:600.f)*dt+.6f;
                 if(angle>=.28f||step>limit)std::cerr<<"action boundary from="<<int(previousMotion)<<" to="<<int(r.motion)
                     <<" firstAngle="<<angle<<" firstEndpoint="<<step<<" limit="<<limit<<'\n';
@@ -98,9 +98,9 @@ struct ChangingFoothold:Ledge {
 };
 static void reachableActionTransitions(const Library& lib) {
     Plane wall;
-    for(Motion entry:{Motion::reach,Motion::jumpCatch,Motion::sprintCatch,Motion::ledgeCatch}) {
+    for(Motion entry:{Motion::reach,Motion::jumpCatch,Motion::ledgeCatch}) {
         Traversal t;t.cfg.gap=37;t.cfg.radius=31;TransitionTrace trace(lib);
-        require(t.attach(wall,{0,-42,200},{0,1,0},100),"entry transition attach");t.entry(entry,entry==Motion::sprintCatch);
+        require(t.attach(wall,{0,-42,200},{0,1,0},100),"entry transition attach");t.entry(entry,false);
         for(int frame=0;frame<70;++frame)trace.tick(wall,t,{0,1});
         require(t.active()&&trace.saw(entry,Motion::up),"each real entry reaches continuous climbing");
         trace.report("entry to climb");
@@ -188,20 +188,14 @@ static void progressingActionSources(const Library& lib) {
     float pushLegChange=0;
     for(int bone:{6,7,9,10})pushLegChange=std::max(pushLegChange,angleBetween(pushStart[bone].q,pushEnd[bone].q));
     require(pushLegChange>.06f,"the takeoff interval contains changing captured leg poses, not one held anticipation key");
-    float lastFlight=0,lastPush=0,lastReturn=0;
+    float lastPush=0,lastReturn=0;
     for(int frame=0;frame<=120;++frame) {
-        const float phase=frame/120.f,flight=actionFlightPhase(phase),push=actionPushPhase(phase);
-        const float returning=actionReturnPhase(Motion::flipUp,phase);
-        require(flight>=lastFlight&&flight<=1&&push>=lastPush&&push<=1&&returning>=lastReturn&&returning<=1,
-            "takeoff flight and return sample phases advance monotonically");
-        if(phase<=.70f)require(returning==0,"the return cannot replace the visible flight halfway through");
-        lastFlight=flight;lastPush=push;lastReturn=returning;
+        const float phase=frame/120.f,push=actionPushPhase(phase),returning=actionReturnPhase(phase);
+        require(push>=lastPush&&push<=1&&returning>=lastReturn&&returning<=1,"kick takeoff and return sample phases advance monotonically");
+        if(phase<=.60f)require(returning==0,"the catch cannot replace the captured kick before its return interval");
+        lastPush=push;lastReturn=returning;
     }
-    require(actionFlightPhase(.30f)>.10f&&actionFlightPhase(.80f)>.999f&&lastReturn==1,
-        "the whole flight capture advances before the short landing continuation");
-    for(Motion motion:{Motion::kickUp,Motion::kickLeft,Motion::kickRight})
-        require(actionReturnPhase(motion,.60f)==0&&actionReturnPhase(motion,1)==1,
-            "each kick reserves an advancing push and ends in its selected catch");
+    require(lastPush>.2f&&lastReturn==1,"kick takeoff and landing continuation reach their full endpoints");
     std::cout<<"takeoff captured leg change="<<pushLegChange<<'\n';
 }
 static void visibleBackPush(const Library& lib,const std::filesystem::path& directory) {
@@ -284,7 +278,7 @@ int main(int argc,char** argv) {
         const Vec forward=run[0].q.rotate({0,1,0});
         require(std::abs(forward.dot(up))<.001f,"native run forward stays tangent to wall");
     }
-    for(Motion entry:{Motion::reach,Motion::sprintCatch,Motion::jumpCatch,Motion::ledgeCatch}) {
+    for(Motion entry:{Motion::reach,Motion::jumpCatch,Motion::ledgeCatch}) {
         for(int frame=0;frame<=60;++frame) {
             auto entryWorld=lib.world(lib.sample(entry,frame/60.f));
             require((entryWorld[36].t-entryWorld[4].t).unit().z>.8f,"catch clip must not contain the prone crest of a top-out");

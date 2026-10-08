@@ -3,6 +3,7 @@
 #include "ScenePropagation.h"
 #include "RuntimeSupport.h"
 #include <cstring>
+#include <unordered_set>
 namespace fc {
 using FlatBoneEntry=RE::BSFlattenedBoneTree::BoneEntry;
 inline RE::BSFlattenedBoneTree* flatTree(RE::NiAVObject* root) {
@@ -80,5 +81,121 @@ inline SceneBinding<SceneSlot> bindRuntimeScene(RE::NiAVObject* root,
         }
         return SceneSlot{RE::NiPointer<RE::NiAVObject>(existingNode(root,name)),nullptr};
     });
+}
+inline std::string sceneDiagnosticText(const char* text) {
+    if(!text)return "<empty>";
+    const auto address=reinterpret_cast<std::uintptr_t>(text);
+    constexpr std::size_t limit=80;
+    const bool whole=runtime::readable(address,limit);
+    std::string result;
+    for(std::size_t i=0;i<limit;++i) {
+        if(!whole&&(i>std::numeric_limits<std::uintptr_t>::max()-address||!runtime::readable(address+i,1)))return result+"<unreadable>";
+        const auto c=static_cast<unsigned char>(text[i]);
+        if(!c)return result.empty()?"<empty>":result;
+        result+=c<32||c==127?'?':char(c);
+    }
+    return result+"...";
+}
+inline std::string sceneDiagnosticName(const RE::BSFixedString& value) {
+    static_assert(sizeof(value)==sizeof(const char*));
+    const char* text{};std::memcpy(&text,&value,sizeof(text));
+    return sceneDiagnosticText(text);
+}
+inline std::string sceneDiagnosticClass(RE::NiAVObject* object) {
+    if(!runtime::readable(reinterpret_cast<std::uintptr_t>(object),sizeof(RE::NiAVObject)))return "<unreadable>";
+    std::uintptr_t table{};std::memcpy(&table,object,sizeof(table));
+    if(!runtime::hookSite(table,2))return "<invalid-vtable>";
+    const auto* rtti=object->GetRTTI();
+    if(!runtime::readable(reinterpret_cast<std::uintptr_t>(rtti),sizeof(RE::NiRTTI)))return "<invalid-rtti>";
+    return sceneDiagnosticText(rtti->GetName());
+}
+struct FlatSceneDiagnostic {
+    std::string state="not-flat",samples;
+    std::size_t count{},populated{};
+};
+inline FlatSceneDiagnostic describeFlatScene(RE::NiAVObject* root,std::string_view type,bool samples) {
+    FlatSceneDiagnostic result;
+    if(type!="BSFlattenedBoneTree")return result;
+    result.state="invalid";
+    if(!runtime::readable(reinterpret_cast<std::uintptr_t>(root),sizeof(RE::BSFlattenedBoneTree)))return result;
+    const auto& data=static_cast<RE::BSFlattenedBoneTree*>(root)->GetRuntimeData();
+    result.count=data.numBones;result.populated=data.numPopulatedBones;
+    if(data.numBones>4096||(!data.boneEntries&&data.numBones))return result;
+    if(data.numBones&&!runtime::readable(reinterpret_cast<std::uintptr_t>(data.boneEntries),data.numBones*sizeof(FlatBoneEntry)))return result;
+    const std::span entries(data.boneEntries,data.numBones);
+    if(!validFlatParents(entries))return result;
+    result.state="valid";
+    if(samples)for(std::size_t i=0,named=0;i<entries.size()&&named<6;++i) {
+        const auto name=sceneDiagnosticName(entries[i].nodeName);
+        if(name=="<empty>")continue;
+        if(named++)result.samples+="; ";
+        result.samples+=std::to_string(i)+":"+name;
+    }
+    return result;
+}
+struct SceneLookupDiagnostic {
+    std::string actorClass,rootClass,rootName,ancestorFlatTrees;
+    FlatSceneDiagnostic flat;
+    std::size_t scanned{},inside{},outside{};
+    bool incomplete{},parentChainIncomplete{};
+};
+inline SceneLookupDiagnostic describeSceneLookup(RE::NiAVObject* actorRoot,RE::NiAVObject* root,std::string_view missing) {
+    SceneLookupDiagnostic result;
+    result.actorClass=sceneDiagnosticClass(actorRoot);result.rootClass=sceneDiagnosticClass(root);
+    const bool rootReadable=runtime::readable(reinterpret_cast<std::uintptr_t>(root),sizeof(RE::NiAVObject));
+    result.rootName=rootReadable?sceneDiagnosticName(root->name):"<unreadable>";
+    result.flat=describeFlatScene(root,result.rootClass,true);
+    struct Pending {RE::NiAVObject* node;unsigned depth;bool inside;};
+    std::vector<Pending> pending{{actorRoot,0,false}};
+    std::unordered_set<RE::NiAVObject*> visited;visited.reserve(128);
+    std::size_t edges=0;
+    while(!pending.empty()&&result.scanned<4096) {
+        auto current=pending.back();pending.pop_back();
+        if(!current.node)continue;
+        if(!visited.insert(current.node).second){result.incomplete=true;continue;}
+        ++result.scanned;
+        if(!runtime::readable(reinterpret_cast<std::uintptr_t>(current.node),sizeof(RE::NiAVObject))){result.incomplete=true;continue;}
+        current.inside|=current.node==root;
+        if(sceneDiagnosticName(current.node->name)==missing)++(current.inside?result.inside:result.outside);
+        std::uintptr_t table{};std::memcpy(&table,current.node,sizeof(table));
+        if(!runtime::hookSite(table,3)){result.incomplete=true;continue;}
+        auto* node=current.node->AsNode();
+        if(!node)continue;
+        if(!runtime::readable(reinterpret_cast<std::uintptr_t>(node),sizeof(RE::NiNode))){result.incomplete=true;continue;}
+        const auto& children=node->GetChildren();const auto count=children.capacity();
+        if(count>4096||(count&&!runtime::readable(reinterpret_cast<std::uintptr_t>(children.begin()),count*sizeof(*children.begin())))) {
+            result.incomplete=true;continue;
+        }
+        if(current.depth>=128){result.incomplete|=count!=0;continue;}
+        for(std::size_t i=0;i<count;++i) {
+            if(++edges>8192||pending.size()>=4096){result.incomplete=true;break;}
+            const auto& child=children.begin()[i];
+            if(child)pending.push_back({child.get(),current.depth+1,current.inside});
+        }
+        if(edges>8192)break;
+    }
+    result.incomplete|=!pending.empty();visited.clear();
+    if(rootReadable) {
+        visited.insert(root);
+        auto* parent=root->parent;unsigned depth=0,trees=0;
+        while(parent&&depth<128) {
+            if(!visited.insert(parent).second||!runtime::readable(reinterpret_cast<std::uintptr_t>(parent),sizeof(RE::NiAVObject))) {
+                result.parentChainIncomplete=true;break;
+            }
+            ++depth;
+            const auto type=sceneDiagnosticClass(parent);
+            if(type=="BSFlattenedBoneTree") {
+                if(trees++<6) {
+                    const auto flat=describeFlatScene(parent,type,false);
+                    if(!result.ancestorFlatTrees.empty())result.ancestorFlatTrees+="; ";
+                    result.ancestorFlatTrees+=std::to_string(depth)+":"+sceneDiagnosticName(parent->name)+
+                        "("+flat.state+","+std::to_string(flat.count)+")";
+                } else result.parentChainIncomplete=true;
+            }
+            parent=parent->parent;
+        }
+        result.parentChainIncomplete|=parent!=nullptr;
+    } else result.parentChainIncomplete=true;
+    return result;
 }
 }

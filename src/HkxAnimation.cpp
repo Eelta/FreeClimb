@@ -13,6 +13,7 @@ struct Section {
     std::size_t begin{},local{},global{},virtuals{},exports{},imports{},end{};
 };
 struct ArrayView {std::size_t at{},count{};};
+struct Member {std::string name;std::size_t animation{},binding{};};
 class Packfile {
     std::span<const std::uint8_t> bytes;
     std::array<Section,3> sections{};
@@ -122,16 +123,22 @@ public:
         require(name=="hkRootLevelContainer","HKX root must be an animation root container");
         classIs(object,"hkRootLevelContainer",16);
     }
-    HkxClip decode() {
-        const auto variants=array(object,24,2);require(variants.count>=1,"HKX animation container variant is missing");
+    std::vector<Member> members() {
+        const auto variants=array(object,24,37);require(variants.count>=1,"HKX animation container variant is missing");
         std::size_t container=0;bool resourceSeen=false;
+        std::map<std::string,std::size_t> named;
         for(std::size_t i=0;i<variants.count;++i) {
             const auto variant=variants.at+i*24;
-            pointerString(variant,true);
+            const auto name=pointerString(variant,true);
             const auto type=pointerString(variant+8);const auto target=pointer(variant+16);
             if(type=="hkaAnimationContainer") {
                 require(container==0,"HKX contains duplicate animation containers");container=target;
                 classIs(container,"hkaAnimationContainer",96);
+            } else if(type=="hkaAnimationBinding") {
+                require(!name.empty()&&name.size()<=64&&std::all_of(name.begin(),name.end(),[](unsigned char c){
+                    return (c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_';}),"HKX member name is invalid");
+                require(named.emplace(name,target).second,"HKX contains duplicate member names");
+                classIs(target,"hkaAnimationBinding",72);
             } else if(type=="hkMemoryResourceContainer") {
                 require(!resourceSeen,"HKX contains duplicate resource containers");resourceSeen=true;
                 classIs(target,"hkMemoryResourceContainer",80);
@@ -146,9 +153,30 @@ public:
         require(container!=0,"HKX animation container variant is missing");
         require(array(container+16,8,1).count==0&&array(container+64,8,1).count==0&&array(container+80,8,1).count==0,
             "HKX must be an animation-only file without embedded skeletons or meshes");
-        const auto animations=array(container+32,8,1),bindings=array(container+48,8,1);
-        require(animations.count==1&&bindings.count==1,"HKX must contain one animation and one binding");
-        const auto animation=pointer(animations.at),binding=pointer(bindings.at);classIs(binding,"hkaAnimationBinding",72);
+        const auto animations=array(container+32,8,35),bindings=array(container+48,8,35);
+        require(animations.count>=1&&animations.count==bindings.count,"HKX must contain matching animation and binding arrays");
+        require(named.empty()?animations.count==1:named.size()==animations.count,"HKX members must name every animation binding exactly once");
+        std::vector<Member> result;result.reserve(animations.count);
+        std::map<std::size_t,bool> seenAnimations,seenBindings;
+        for(std::size_t i=0;i<animations.count;++i) {
+            const auto animation=pointer(animations.at+i*8),binding=pointer(bindings.at+i*8);
+            classIs(binding,"hkaAnimationBinding",72);
+            require(pointer(binding+24)==animation,"HKX binding references a different animation");
+            require(seenAnimations.emplace(animation,true).second&&seenBindings.emplace(binding,true).second,"HKX contains duplicate animation or binding members");
+            std::string name;std::size_t matches=0;
+            for(const auto& [candidate,target]:named)if(target==binding){name=candidate;++matches;}
+            require(named.empty()||matches==1,"HKX member references must match the container bindings exactly once");
+            result.push_back({std::move(name),animation,binding});
+        }
+        return result;
+    }
+    void reserveFrames(std::size_t frames,std::size_t tracks,std::size_t& decodedBytes,std::size_t maximumDecodedBytes) const {
+        const auto output=frames*(tracks*(sizeof(Transform)+sizeof(Quat))+sizeof(Pose)+sizeof(std::vector<Quat>));
+        require(decodedBytes<=maximumDecodedBytes&&output<=maximumDecodedBytes-decodedBytes,"HKX decoded member memory exceeds limit");
+        decodedBytes+=output;
+    }
+    HkxClip decodeAnimation(const Member& member,std::size_t& decodedBytes,std::size_t maximumDecodedBytes) {
+        const auto animation=member.animation,binding=member.binding;
         require(pointer(binding+24)==animation,"HKX binding references a different animation");
         require(read<std::uint8_t>(binding+64)==0,"Additive HKX bindings are unsupported");
         require(array(binding+48,2,0).count==0,"HKX float bindings are unsupported");
@@ -187,6 +215,7 @@ public:
             const auto transforms=array(animation+56,48,std::size_t(tracks)*1201);
             require(array(animation+72,4,0).count==0,"HKX interleaved float data is unsupported");
             require(transforms.count%tracks==0&&transforms.count/std::size_t(tracks)>=2,"HKX interleaved frame count is invalid");
+            reserveFrames(transforms.count/std::size_t(tracks),std::size_t(tracks),decodedBytes,maximumDecodedBytes);
             result.rotations.assign(transforms.count/std::size_t(tracks),std::vector<Quat>(tracks));
             result.frames.assign(result.rotations.size(),Pose(tracks));
             for(std::size_t frame=0;frame<result.rotations.size();++frame) {
@@ -208,6 +237,7 @@ public:
             source.maxFramesPerBlock=read<std::uint32_t>(animation+64);source.maskAndQuantizationSize=read<std::uint32_t>(animation+68);
             source.blockDuration=read<float>(animation+72);source.blockInverseDuration=read<float>(animation+76);source.frameDuration=read<float>(animation+80);
             require(source.numFrames>=2&&source.numFrames<=1201&&source.numBlocks>=1&&source.numBlocks<=1201,"HKX spline frame/block count is invalid");
+            reserveFrames(source.numFrames,std::size_t(tracks),decodedBytes,maximumDecodedBytes);
             require(std::isfinite(source.frameDuration)&&std::abs(source.frameDuration*float(source.numFrames-1)-result.duration)<.002f,
                 "HKX spline frame timing disagrees with animation duration");
             source.blockOffsets=words(animation+88,1201);source.floatBlockOffsets=words(animation+104,1201);
@@ -233,11 +263,39 @@ public:
         }
         return result;
     }
+    HkxClip decode(std::string_view selected) {
+        const auto entries=members();
+        require(!selected.empty()||entries.size()==1,"HKX contains multiple animations; select a named member");
+        require(selected.empty()||std::any_of(entries.begin(),entries.end(),[&](const auto& member){return member.name==selected;}),"HKX selected member is missing");
+        HkxClip result;std::size_t decodedBytes=0;
+        for(const auto& member:entries) {
+            auto clip=decodeAnimation(member,decodedBytes,200*1024*1024);
+            if(selected.empty()||member.name==selected)result=std::move(clip);
+        }
+        return result;
+    }
+    std::vector<std::pair<std::string,HkxClip>> decodeMembers(std::size_t maximumDecodedBytes) {
+        require(maximumDecodedBytes>0,"HKX decoded member memory limit is invalid");
+        maximumDecodedBytes=std::min<std::size_t>(maximumDecodedBytes,200*1024*1024);
+        const auto entries=members();std::size_t decodedBytes=0;
+        std::vector<std::pair<std::string,HkxClip>> result;result.reserve(entries.size());
+        for(const auto& member:entries)result.emplace_back(member.name,decodeAnimation(member,decodedBytes,maximumDecodedBytes));
+        return result;
+    }
 };
 }
 bool decodeHkxAnimation(std::span<const std::uint8_t> bytes,HkxClip& clip,std::string& error) {
+    return decodeHkxAnimation(bytes,clip,error,{});
+}
+bool decodeHkxAnimation(std::span<const std::uint8_t> bytes,HkxClip& clip,std::string& error,std::string_view member) {
     clip={};error.clear();
-    try {auto result=Packfile(bytes).decode();clip=std::move(result);return true;}
+    try {auto result=Packfile(bytes).decode(member);clip=std::move(result);return true;}
+    catch(const std::exception& failure){error=failure.what();return false;}
+}
+bool decodeHkxAnimationMembers(std::span<const std::uint8_t> bytes,std::vector<std::pair<std::string,HkxClip>>& clips,
+    std::string& error,std::size_t maximumDecodedBytes) {
+    clips.clear();error.clear();
+    try {auto result=Packfile(bytes).decodeMembers(maximumDecodedBytes);clips=std::move(result);return true;}
     catch(const std::exception& failure){error=failure.what();return false;}
 }
 }

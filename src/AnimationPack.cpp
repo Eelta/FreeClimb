@@ -1,13 +1,37 @@
 #include "AnimationPack.h"
+#include "AnimationConfig.h"
 #include "CanonicalSkeleton.h"
 #include "HkxAnimation.h"
 #include "../external/nlohmann/json.hpp"
 #include <chrono>
+#include <map>
 #include <set>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+#endif
 
 namespace fc {
 namespace {
 using Json=nlohmann::json;
+struct LogicalPathLess {
+    bool operator()(const std::filesystem::path& a,const std::filesystem::path& b) const {
+#ifdef _WIN32
+        return CompareStringOrdinal(a.c_str(),int(a.native().size()),b.c_str(),int(b.native().size()),TRUE)==CSTR_LESS_THAN;
+#else
+        return a<b;
+#endif
+    }
+};
+struct CachedHkx {
+    std::vector<std::pair<std::string,HkxClip>> members;
+    std::string failure;
+    std::size_t bytes{};
+    std::uint64_t contentId{};
+    bool missing{};
+};
 void requirePack(bool valid,const std::string& message) {if(!valid)throw std::runtime_error(message);}
 float scalar(const Json& j,float low,float high) {
     requirePack(j.is_number(),"Expected numeric metadata");
@@ -42,21 +66,39 @@ Json readJson(const std::filesystem::path& path,std::size_t limit,std::size_t& t
     auto result=Json::parse(bytes,callback,true,false);
     requirePack(result.is_object(),"JSON document must be an object");return result;
 }
+void ordinaryPath(const std::filesystem::path& path) {
+#ifdef _WIN32
+    const auto attributes=GetFileAttributesW(path.c_str());
+    if(attributes==INVALID_FILE_ATTRIBUTES) {
+        const auto error=GetLastError();
+        requirePack(error==ERROR_FILE_NOT_FOUND||error==ERROR_PATH_NOT_FOUND,"Cannot inspect animation path");return;
+    }
+    requirePack(!(attributes&FILE_ATTRIBUTE_REPARSE_POINT),"Animation paths cannot use links or reparse points");
+#else
+    std::error_code error;const auto status=std::filesystem::symlink_status(path,error);
+    requirePack(!error||error==std::errc::no_such_file_or_directory,"Cannot inspect animation path");
+    requirePack(!std::filesystem::is_symlink(status),"Animation paths cannot use links");
+#endif
+}
 std::filesystem::path contained(const std::filesystem::path& root,const Json& value) {
     requirePack(value.is_string(),"Expected a relative file path");
     const auto text=value.get<std::string>();
     requirePack(!text.empty()&&text.size()<=240&&text.find(':')==std::string::npos&&text.find('\0')==std::string::npos,"Invalid animation file path");
     const std::filesystem::path child(text);
     requirePack(!child.is_absolute()&&!child.has_root_path(),"Animation paths must be relative");
-    for(const auto& part:child)requirePack(part!="..","Animation paths cannot escape their pack");
-    const auto absolute=std::filesystem::weakly_canonical(root/child);
-    const auto relative=absolute.lexically_relative(root);
-    requirePack(!relative.empty()&&!relative.is_absolute(),"Animation path is outside its pack");
-    for(const auto& part:relative)requirePack(part!="..","Animation path is outside its pack");
-    return absolute;
+    auto path=root;
+    for(const auto& part:child) {
+        requirePack(part!="..","Animation paths cannot escape their pack");
+        if(part==".")continue;
+        const auto component=part.native();
+        requirePack(!component.empty()&&component.back()!='.'&&component.back()!=' ',"Invalid animation path component");
+        path/=part;ordinaryPath(path);
+    }
+    return path;
 }
 void format(const Json& j,const char* expected) {
-    requirePack(j.at("format")==expected&&j.at("version")==1,"Unsupported animation metadata format or version");
+    const bool authored=std::string_view(expected)=="FreeClimbClip"&&j.contains("authoredPlayback");
+    requirePack(j.at("format")==expected&&j.at("version")==int(authored?2:1),"Unsupported animation metadata format or version");
 }
 void skeleton(Library& result,const Json& j) {
     format(j,"FreeClimbSkeleton");const auto& bones=j.at("bones");
@@ -108,6 +150,29 @@ void profile(Library& result,std::size_t slot,const Json& j) {
 void installClip(Library& result,std::size_t slot,const Json& j,const HkxClip& source) {
     auto& clip=result.clips[slot];clip.seconds=source.duration;
     clip.stride=scalar(j.at("stride"),0,500);clip.height=scalar(j.at("height"),-500,500);clip.travel=vector(j.at("travel"),-500,500);
+    if(j.contains("authoredPlayback")) {
+        requirePack(isActiveMotion(Motion(slot+1)),"Authored playback requires an active motion slot");
+        const auto& authored=j.at("authoredPlayback");
+        requirePack(authored.is_object()&&authored.at("version")==1,"Unsupported authored playback contract");
+        clip.authoredPlayback=true;
+        if(authored.contains("trajectory")) {
+            requirePack(authored.value("basis",std::string{})=="root","Authored trajectory must use Root displacement");
+            const auto& path=authored.at("trajectory");
+            requirePack(path.is_array()&&(path.empty()||(path.size()>=2&&path.size()<=65)),"Authored trajectory requires 2..65 knots");
+            clip.trajectory.count=std::uint32_t(path.size());float distance=0;
+            for(std::size_t i=0;i<path.size();++i) {
+                const auto& row=path[i];requirePack(row.is_array()&&row.size()==4,"Authored knots require phase, x, y and z");
+                auto& knot=clip.trajectory.knots[i];knot.phase=scalar(row[0],0,1);
+                knot.displacement={scalar(row[1],-500,500),scalar(row[2],-500,500),scalar(row[3],-500,500)};
+                if(i) {
+                    requirePack(knot.phase-clip.trajectory.knots[i-1].phase>=.0001f,"Authored trajectory phases must strictly increase");
+                    distance+=(knot.displacement-clip.trajectory.knots[i-1].displacement).length();
+                }
+            }
+            if(!path.empty())requirePack(path.front()[0]==0&&path.back()[0]==1&&clip.trajectory.knots[0].displacement.length()<.001f&&distance<=2000,
+                "Authored trajectory requires normalized endpoints and a bounded path");
+        }
+    }
     std::array<int,99> mapping;mapping.fill(-1);
     for(std::size_t track=0;track<source.boneIndices.size();++track) {
         const auto bone=source.boneIndices[track];if(bone>=99)continue;
@@ -125,6 +190,38 @@ void installClip(Library& result,std::size_t slot,const Json& j,const HkxClip& s
         if((bone>=1&&bone<=3)||bone>=97)requirePack(angleBetween(t.q,rest.q)<=.002f,"HKX modifies a protected control or camera rotation");
         clip.frames[frame][bone]=t;
     }
+    if(clip.authoredPlayback&&clip.trajectory.count) {
+        const auto origin=clip.frames.front()[0].t;
+        for(std::uint32_t i=0;i<clip.trajectory.count;++i) {
+            const auto& knot=clip.trajectory.knots[i];const float at=knot.phase*float(clip.frames.size()-1);
+            const auto index=std::min(std::size_t(at),clip.frames.size()-2);auto pose=clip.frames[index];
+            for(std::size_t bone=0;bone<pose.size();++bone)pose[bone]=blend(pose[bone],clip.frames[index+1][bone],at-float(index));
+            requirePack((pose[0].t-origin-knot.displacement).length()<.05f,
+                "Authored trajectory does not match the animation's Root displacement");
+        }
+        for(std::size_t frame=0;frame<clip.frames.size();++frame) {
+            const auto displacement=clip.frames[frame][0].t-origin;
+            requirePack((displacement-clip.trajectory.sample(float(frame)/float(clip.frames.size()-1))).length()<=.25f,
+                "Authored trajectory is too coarse for the animation's Root curve");
+        }
+    }
+    if(clip.authoredPlayback&&!clip.trajectory.count)for(const auto& frame:clip.frames)
+        requirePack((frame[0].t-clip.frames.front()[0].t).length()<=.25f,"Authored Root movement requires its matching trajectory");
+    if(clip.authoredPlayback&&!authoredIdleLoop(Motion(slot+1))) {
+        auto localCom=[&](const Pose& frame){return frame[0].q.inverse().rotate(result.world(frame)[4].t-frame[0].t);};
+        const auto origin=localCom(clip.frames.front());
+        for(const auto& frame:clip.frames)requirePack((localCom(frame)-origin).length()<=96,
+            "Action COM moves too far relative to Root; put travel motion on Root");
+        requirePack((localCom(clip.frames.back())-origin).length()<=64,
+            "Action COM has excessive net travel; put travel motion on Root");
+    }
+    if(clip.authoredPlayback&&authoredIdleLoop(Motion(slot+1))) {
+        const auto origin=result.world(clip.frames.front())[4].t;
+        for(const auto& frame:clip.frames)requirePack((result.world(frame)[4].t-origin).length()<=24,
+            "Wall idle moves too far from its anchor; use an in-place idle animation");
+        requirePack((result.world(clip.frames.back())[4].t-origin).length()<=12,
+            "Wall idle has excessive end-to-start motion; use a looping in-place idle animation");
+    }
     const auto& samples=j.at("contacts");requirePack(samples.is_array()&&samples.size()>=2&&samples.size()<=1201,"Contacts require 2..1201 uniformly spaced weight samples");
     std::vector<std::array<float,4>> weights(samples.size());
     for(std::size_t i=0;i<samples.size();++i) {
@@ -140,6 +237,26 @@ void installClip(Library& result,std::size_t slot,const Json& j,const HkxClip& s
     }
     profile(result,slot,j);
 }
+HkxClip timelineSlice(const HkxClip& source,const Json& config) {
+    const auto range=animationFrameRange(config,source.frames.size());
+    HkxClip clip;
+    clip.duration=source.duration*float(range[1]-range[0])/float(source.frames.size()-1);
+    clip.identityMapping=source.identityMapping;clip.skeletonName=source.skeletonName;
+    clip.boneIndices=source.boneIndices;clip.trackNames=source.trackNames;
+    clip.frames.assign(source.frames.begin()+range[0],source.frames.begin()+range[1]+1);
+    if(!source.rotations.empty()) {
+        requirePack(source.rotations.size()==source.frames.size(),"Timeline rotation frames do not match transforms");
+        clip.rotations.assign(source.rotations.begin()+range[0],source.rotations.begin()+range[1]+1);
+    }
+    if(config.contains("rootShift")) {
+        const auto shift=vector(config.at("rootShift"),-10000,10000);
+        const auto root=std::find(clip.boneIndices.begin(),clip.boneIndices.end(),0);
+        requirePack(root!=clip.boneIndices.end(),"Timeline requires a Root track");
+        const auto index=std::size_t(root-clip.boneIndices.begin());
+        for(auto& frame:clip.frames){requirePack(index<frame.size(),"Timeline Root track is missing");frame[index].t=frame[index].t-shift;}
+    }
+    return clip;
+}
 }
 AnimationPackReport loadAnimationPack(Library& library,const std::filesystem::path& manifest,AnimationOverrideLimits limits) {
     AnimationPackReport report;report.slots.resize(activeMotionCount);
@@ -147,40 +264,127 @@ AnimationPackReport loadAnimationPack(Library& library,const std::filesystem::pa
     try {
         requirePack(limits.totalBytes>0&&limits.totalOutputBytes>0,"Animation pack limits are invalid");
         const auto deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(limits.totalMilliseconds);
-        const auto root=std::filesystem::weakly_canonical(manifest.parent_path());
-        const auto document=readJson(manifest,65536,report.inputBytes,limits.totalBytes);format(document,"FreeClimbAnimationPack");
+        const auto logicalManifest=std::filesystem::absolute(manifest).lexically_normal();
+        const auto root=logicalManifest.parent_path();ordinaryPath(root);ordinaryPath(logicalManifest);
+        const auto document=readJson(logicalManifest,65536,report.inputBytes,limits.totalBytes);format(document,"FreeClimbAnimationPack");
         Library staged;skeleton(staged,readJson(contained(root,document.at("skeleton")),256*1024,report.inputBytes,limits.totalBytes));
-        const auto& motions=document.at("motions");requirePack(motions.is_array()&&motions.size()==activeMotionCount,"Pack must provide all 35 active animation slots");
+        const auto& motions=document.at("motions");requirePack(motions.is_array()&&motions.size()==activeMotionCount,"Pack must provide all 31 active animation slots");
         std::array<const Json*,motionCount> entries{};
         for(const auto& entry:motions) {
             const auto name=entry.at("slot").get<std::string>();const auto found=std::find(motionSlotNames.begin(),motionSlotNames.end(),name);
             requirePack(!name.empty()&&found!=motionSlotNames.end(),"Pack contains an unknown animation slot");
             const auto index=std::size_t(found-motionSlotNames.begin());requirePack(!entries[index],"Pack contains a duplicate animation slot");entries[index]=&entry;
         }
+        std::map<std::filesystem::path,CachedHkx,LogicalPathLess> files;
+        std::map<std::filesystem::path,Json,LogicalPathLess> configs;
+        std::size_t decodedBytes=0;constexpr std::size_t decodedLimit=200*1024*1024;
         for(auto& slot:report.slots) {
             const auto i=std::size_t(int(slot.motion)-1);slot.file=std::string(motionSlotNames[i])+".hkx";
             try {
                 requirePack(std::chrono::steady_clock::now()<deadline,"Animation pack load time budget exceeded");
                 requirePack(entries[i]!=nullptr,"Pack is missing an active animation slot");
-                const auto config=readJson(contained(root,entries[i]->at("config")),256*1024,report.inputBytes,limits.totalBytes);format(config,"FreeClimbClip");
+                const auto configPath=contained(root,entries[i]->at("config"));
+                auto configFile=configs.find(configPath);
+                if(configFile==configs.end())configFile=configs.emplace(configPath,readJson(configPath,2*1024*1024,report.inputBytes,limits.totalBytes)).first;
+                const auto& config=selectAnimationClipConfig(configFile->second,motionSlotNames[i]);format(config,"FreeClimbClip");
                 requirePack(config.at("slot").get<std::string>()==motionSlotNames[i],"Clip configuration is assigned to the wrong slot");
                 slot.file=config.at("file").get<std::string>();const auto path=contained(root,config.at("file"));
-                if(!std::filesystem::is_regular_file(path)){slot.reason="HKX file is missing";++report.missing;continue;}
-                const auto bytes=std::filesystem::file_size(path);
-                requirePack(bytes>=208&&bytes<=limits.fileBytes&&bytes<=limits.totalBytes-report.inputBytes,"HKX input or total size exceeds limit");
-                report.inputBytes+=std::size_t(bytes);std::vector<std::uint8_t> data(std::size_t(bytes),0);
-                std::ifstream file(path,std::ios::binary);requirePack(bool(file.read(reinterpret_cast<char*>(data.data()),std::streamsize(data.size())))&&
-                    file.peek()==std::char_traits<char>::eof(),"HKX file changed while being read");
-                HkxClip clip;std::string failure;const auto start=std::chrono::steady_clock::now();
-                requirePack(decodeHkxAnimation(data,clip,failure),failure);
-                requirePack(std::chrono::steady_clock::now()-start<=std::chrono::milliseconds(limits.fileMilliseconds),"HKX decode time budget exceeded");
-                const auto output=clip.frames.size()*(99*sizeof(Transform)+sizeof(std::array<float,4>));
-                requirePack(clip.frames.size()<=limits.frames&&output<=limits.totalOutputBytes-report.outputBytes,"Animation output memory exceeds limit");
+                const auto utf8=path.u8string();slot.path.assign(utf8.begin(),utf8.end());
+                std::string member;
+                if(config.contains("member")) {
+                    requirePack(config.at("member").is_string(),"HKX member selector must be a string");member=config.at("member").get<std::string>();
+                    requirePack(!member.empty()&&member.size()<=64&&std::all_of(member.begin(),member.end(),[](unsigned char c){
+                        return (c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_';}),"HKX member selector is invalid");
+                }
+                auto [found,first]=files.try_emplace(path);auto& cached=found->second;
+                if(first)try {
+                    if(!std::filesystem::is_regular_file(path))cached.missing=true;
+                    else {
+                        const auto bytes=std::filesystem::file_size(path);
+                        requirePack(bytes>=208&&bytes<=limits.fileBytes&&bytes<=limits.totalBytes-report.inputBytes,"HKX input or total size exceeds limit");
+                        report.inputBytes+=std::size_t(bytes);std::vector<std::uint8_t> data(std::size_t(bytes),0);
+                        std::ifstream file(path,std::ios::binary);requirePack(bool(file.read(reinterpret_cast<char*>(data.data()),std::streamsize(data.size())))&&
+                            file.peek()==std::char_traits<char>::eof(),"HKX file changed while being read");
+                        cached.bytes=data.size();cached.contentId=14695981039346656037ull;
+                        for(const auto byte:data)cached.contentId=(cached.contentId^byte)*1099511628211ull;
+                        std::string failure;const auto start=std::chrono::steady_clock::now();
+                        requirePack(decodeHkxAnimationMembers(data,cached.members,failure,decodedLimit-decodedBytes),failure);
+                        requirePack(std::chrono::steady_clock::now()-start<=std::chrono::milliseconds(limits.fileMilliseconds),"HKX decode time budget exceeded");
+                        for(const auto& item:cached.members)decodedBytes+=item.second.frames.size()*(item.second.boneIndices.size()*(sizeof(Transform)+sizeof(Quat))+sizeof(Pose)+sizeof(std::vector<Quat>));
+                    }
+                } catch(const std::exception& e) {cached.members.clear();cached.failure=e.what();}
+                slot.bytes=cached.bytes;slot.contentId=cached.contentId;
+                if(cached.missing){slot.reason="HKX file is missing";++report.missing;continue;}
+                requirePack(cached.failure.empty(),cached.failure);
+                requirePack(!member.empty()||cached.members.size()==1,"HKX contains multiple animations; select a named member");
+                const auto selected=member.empty()?cached.members.begin():std::find_if(cached.members.begin(),cached.members.end(),[&](const auto& item){return item.first==member;});
+                requirePack(selected!=cached.members.end(),"HKX selected member is missing");
+                const auto range=animationFrameRange(config,selected->second.frames.size());
+                const auto samples=range[1]-range[0]+1,output=samples*(99*sizeof(Transform)+sizeof(std::array<float,4>));
+                requirePack(samples<=limits.frames&&output<=limits.totalOutputBytes-report.outputBytes,"Animation output memory exceeds limit");
+                std::optional<HkxClip> sliced;if(config.contains("frameRange"))sliced=timelineSlice(selected->second,config);
+                const auto& clip=sliced?*sliced:selected->second;
                 installClip(staged,i,config,clip);report.outputBytes+=output;
+                if(config.contains("references")) {
+                    const auto& references=config.at("references");requirePack(references.is_object()&&references.size()<=5,"Invalid private animation references");
+                    constexpr std::array<std::string_view,5> roles{"launchApproach","kickTakeoff","kickLanding","kickRunLanding","kickRunBrace"};
+                    const auto owner=Motion(i+1);
+                    for(const auto& [key,metadata]:references.items()) {
+                        const auto roleIterator=std::find(roles.begin(),roles.end(),key);
+                        requirePack(roleIterator!=roles.end(),"Unknown private animation reference");const auto role=PlaybackReference(roleIterator-roles.begin());
+                        requirePack(role==PlaybackReference::launchApproach?wallRunLaunch(owner):
+                            (owner>=Motion::kickUp&&owner<=Motion::kickRight),"Private animation reference is assigned to the wrong action");
+                        format(metadata,"FreeClimbClip");
+                        requirePack(metadata.at("file")==config.at("file")&&!metadata.contains("references"),"Private animation reference must remain inside its owning action file");
+                        const auto referenceMotion=Library::referenceFallback(owner,role);
+                        requirePack(metadata.at("slot").get<std::string>()==motionSlotNames[int(referenceMotion)-1],"Private reference contains the wrong playback role");
+                        const auto name=metadata.at("member").get<std::string>();
+                        const auto binding=std::find_if(cached.members.begin(),cached.members.end(),[&](const auto& value){return value.first==name;});
+                        requirePack(binding!=cached.members.end(),"Private animation reference binding is missing");
+                        const auto referenceRange=animationFrameRange(metadata,binding->second.frames.size());
+                        const auto referenceSamples=referenceRange[1]-referenceRange[0]+1,referenceBytes=referenceSamples*(99*sizeof(Transform)+sizeof(std::array<float,4>));
+                        requirePack(referenceSamples<=limits.frames&&referenceBytes<=limits.totalOutputBytes-report.outputBytes,"Private animation reference exceeds output limits");
+                        const auto reference=timelineSlice(binding->second,metadata);const auto target=int(referenceMotion)-1;
+                        auto saved=std::move(staged.clips[target]);staged.clips[target]={};installClip(staged,target,metadata,reference);
+                        staged.references[{owner,role}]=std::move(staged.clips[target]);staged.clips[target]=std::move(saved);report.outputBytes+=referenceBytes;
+                    }
+                }
                 slot.status=OverrideStatus::loaded;slot.samples=clip.frames.size();slot.seconds=clip.duration;++report.loaded;
             } catch(const std::exception& e) {staged.clips[i]=Clip{};slot.status=OverrideStatus::rejected;slot.reason=e.what();++report.rejected;}
         }
-        requirePack(report.loaded==activeMotionCount,"Animation pack rejected transactionally: all 35 active slots must load successfully");
+        requirePack(report.loaded==activeMotionCount,"Animation pack rejected transactionally: all 31 active slots must load successfully");
+        for(const auto& [configPath,group]:configs)if(group.value("format",std::string{})=="FreeClimbActionGroup"&&group.value("version",0)==2) {
+            const bool contextHop=group.at("group")=="contextHop";
+            constexpr std::array<std::string_view,5> directions{"runUp","runLeft","runRight","runDiagonalLeft","runDiagonalRight"};
+            for(const auto& sequence:group.at("sequences")) {
+                requirePack(std::chrono::steady_clock::now()<deadline,"Animation pack load time budget exceeded");
+                const auto direction=sequence.at("slot").get<std::string>();
+                const auto found=std::find(directions.begin(),directions.end(),direction);
+                requirePack(contextHop?(direction=="contextHopLeft"||direction=="contextHopRight"):found!=directions.end(),"Unknown complete-action sequence direction");
+                const auto index=contextHop?std::size_t(direction=="contextHopRight"):std::size_t(found-directions.begin());
+                requirePack(!(contextHop?staged.contextHopSequenceValid[index]:staged.wallRunSequenceValid[index]),"Duplicate complete-action sequence definition");
+                for(unsigned part=0;part<(sequence.contains("brace")?3u:2u);++part) {
+                    const auto& config=sequence.at(part==2?"brace":part?"catch":contextHop?"prepare":"launch");format(config,"FreeClimbClip");
+                    const auto file=files.find(contained(root,config.at("file")));
+                    requirePack(file!=files.end()&&file->second.failure.empty()&&!file->second.missing,"Wall-run sequence file was not validated");
+                    const auto member=config.at("member").get<std::string>();const auto& members=file->second.members;
+                    const auto selected=std::find_if(members.begin(),members.end(),[&](const auto& item){return item.first==member;});
+                    requirePack(selected!=members.end(),"Wall-run sequence member is missing");
+                    const auto range=animationFrameRange(config,selected->second.frames.size());
+                    const auto samples=range[1]-range[0]+1,output=samples*(99*sizeof(Transform)+sizeof(std::array<float,4>));
+                    requirePack(samples<=limits.frames&&output<=limits.totalOutputBytes-report.outputBytes,"Wall-run sequence output memory exceeds limit");
+                    const auto source=timelineSlice(selected->second,config);
+                    const auto name=config.at("slot").get<std::string>();const auto stage=std::find(motionSlotNames.begin(),motionSlotNames.end(),name);
+                    requirePack(stage!=motionSlotNames.end(),"Wall-run sequence stage is invalid");const auto slot=std::size_t(stage-motionSlotNames.begin());
+                    auto saved=std::move(staged.clips[slot]);staged.clips[slot]={};installClip(staged,slot,config,source);
+                    auto& target=contextHop?(part?staged.contextHopRecoveries[index]:staged.contextHopPreparations[index]):
+                        (part==2?staged.wallRunBraces[index]:part?staged.wallRunCatches[index]:staged.wallRunLaunches[index]);
+                    target=std::move(staged.clips[slot]);staged.clips[slot]=std::move(saved);
+                    report.outputBytes+=output;
+                }
+                (contextHop?staged.contextHopSequenceValid[index]:staged.wallRunSequenceValid[index])=true;
+            }
+        }
         requirePack(validThreepeatProfile(staged.threepeatProfile),"Captured-action path and support phase profile is invalid");
         staged.calibrateArmBends();staged.animationPack=true;staged.sourceValidated=true;
         Settings calibration;requirePack(staged.configureThreepeat(calibration),"Captured-action geometry calibration is outside supported bounds");

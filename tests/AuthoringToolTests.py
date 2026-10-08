@@ -3,6 +3,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -59,6 +60,7 @@ class FakeNative:
         pack = core.load_template(path)
         self.staged_files = fingerprint(pack.root)
         self.selected = pack.configurations["up"]
+        self.configurations = pack.configurations
         if self.fail:
             raise core.AuthoringError("模拟原生校验拒绝")
         return {"ok": True, "loaded": len(core.ACTIVE_SLOTS), "error": "", "slots": []}
@@ -103,13 +105,13 @@ class AuthoringToolTests(unittest.TestCase):
         hkx_hash = hashlib.sha256(self.hkx.read_bytes()).hexdigest()
         native = FakeNative()
         result = self.export(native=native)
-        self.assertEqual(result["loaded"], 35)
+        self.assertEqual(result["loaded"], 31)
         with zipfile.ZipFile(self.output) as archive:
             self.assertIsNone(archive.testzip())
             self.assertEqual(set(archive.namelist()), {core.PREFIX + "up.hkx", core.PREFIX + "configs/up.json"})
             self.assertEqual(archive.read(core.PREFIX + "up.hkx"), self.hkx.read_bytes())
             self.assertEqual(json.loads(archive.read(core.PREFIX + "configs/up.json")), core.read_json(self.base / "configs/up.json"))
-        self.assertEqual(len(native.staged_files), 72)
+        self.assertEqual(len(native.staged_files), 64)
         self.assertNotIn("unreferenced-large-asset.fbx", native.staged_files)
         self.assertEqual(fingerprint(self.base), before)
         self.assertEqual(hashlib.sha256(self.hkx.read_bytes()).hexdigest(), hkx_hash)
@@ -183,9 +185,9 @@ class AuthoringToolTests(unittest.TestCase):
             self.export(options, native)
 
     def test_active_slots_exclude_removed_animations(self):
-        self.assertEqual(len(core.ACTIVE_SLOTS), 35)
+        self.assertEqual(len(core.ACTIVE_SLOTS), 31)
         self.assertEqual(core.ACTIVE_SLOTS[-1], "contextMantle")
-        self.assertFalse({"mantle", "step", "contextRegrab"} & set(core.ACTIVE_SLOTS))
+        self.assertFalse({"mantle", "step", "contextRegrab", "flipUp", "flipLeft", "flipRight", "sprintCatch"} & set(core.ACTIVE_SLOTS))
         with self.assertRaises(core.AuthoringError):
             self.export(slot="contextRegrab")
         self.assertFalse(self.output.exists())
@@ -200,14 +202,356 @@ class AuthoringToolTests(unittest.TestCase):
         with self.assertRaises(core.AuthoringError):
             core.load_template(self.pack)
 
-    def test_shared_or_case_aliased_files_cannot_change_two_slots(self):
+    def test_shared_files_export_only_the_selected_slot(self):
         config = core.read_json(self.base / "configs/down.json")
-        for name in ("up.hkx", "UP.HKX"):
-            with self.subTest(path=name):
-                config["file"] = name
-                write_json(self.base / "configs/down.json", config)
-                with self.assertRaisesRegex(core.AuthoringError, "文件路径重复"):
-                    core.load_template(self.pack)
+        config["file"] = "up.hkx"
+        write_json(self.base / "configs/down.json", config)
+        native = FakeNative()
+        self.export(native=native)
+        self.assertEqual(native.selected["file"], "converted/up.hkx")
+        self.assertEqual(native.configurations["down"]["file"], "up.hkx")
+        self.assertEqual(native.staged_files["up.hkx"], fingerprint(self.base)["up.hkx"])
+        with zipfile.ZipFile(self.output) as archive:
+            self.assertEqual(set(archive.namelist()), {core.PREFIX + "converted/up.hkx", core.PREFIX + "configs/up.json"})
+        config["file"] = "UP.HKX"
+        write_json(self.base / "configs/down.json", config)
+        with self.assertRaisesRegex(core.AuthoringError, "文件路径重复"):
+            core.load_template(self.pack)
+
+    def test_grouped_base_exports_preserve_all_other_members(self):
+        groups = {"wallRun.hkx": ("runUp", "runLeft", "runRight", "runDiagonalLeft", "runDiagonalRight",
+                                  "runLaunch", "runCatch", "runLaunchLeft", "runLaunchRight", "sideBrace"),
+                  "contextHop.hkx": ("contextHang", "contextHopLeft", "contextHopRight")}
+        for file, slots in groups.items():
+            (self.base / file).write_bytes(("ORIGINAL-GROUP-" + file).encode())
+            for slot in slots:
+                config_path = self.base / f"configs/{slot}.json"
+                config = core.read_json(config_path)
+                config.update(file=file, member=slot)
+                write_json(config_path, config)
+                (self.base / f"{slot}.hkx").unlink()
+        self.assertEqual(len(core.load_template(self.pack).files), 53)
+        before = fingerprint(self.base)
+        for slot in ("runUp", "contextHopLeft"):
+            native = FakeNative()
+            self.export(native=native, slot=slot)
+            self.assertEqual(len(native.staged_files), 54)
+            self.assertEqual(native.configurations[slot]["file"], f"converted/{slot}.hkx")
+            self.assertNotIn("member", native.configurations[slot])
+            for file, slots in groups.items():
+                self.assertEqual(native.staged_files[file], before[file])
+                for other in slots:
+                    if other != slot:
+                        self.assertEqual(native.configurations[other]["file"], file)
+                        self.assertEqual(native.configurations[other]["member"], other)
+            with zipfile.ZipFile(self.output) as archive:
+                self.assertEqual(set(archive.namelist()), {core.PREFIX + f"converted/{slot}.hkx", core.PREFIX + f"configs/{slot}.json"})
+            self.assertEqual(fingerprint(self.base), before)
+
+    def test_shared_override_does_not_reuse_another_slots_converted_path(self):
+        config = core.read_json(self.base / "configs/down.json")
+        (self.base / "converted").mkdir()
+        (self.base / "converted/up.hkx").write_bytes(b"OTHER-SLOT")
+        config["file"] = "converted/up.hkx"
+        write_json(self.base / "configs/down.json", config)
+        up = core.read_json(self.base / "configs/up.json")
+        up.update(file="converted/up.hkx", member="up")
+        write_json(self.base / "configs/up.json", up)
+        native = FakeNative()
+        self.export(native=native)
+        self.assertEqual(native.selected["file"], "converted/up-1.hkx")
+        self.assertEqual(native.staged_files[str(Path("converted/up.hkx"))], fingerprint(self.base)[str(Path("converted/up.hkx"))])
+
+    def test_complete_group_config_delegates_atomic_native_export(self):
+        manifest = core.read_json(self.pack)
+        for group, slots in core.ACTION_GROUPS.items():
+            clips = []
+            for slot in slots:
+                config = core.read_json(self.base / f"configs/{slot}.json")
+                config.update(file=f"{group}.hkx", member=slot)
+                clips.append(config)
+            write_json(self.base / f"configs/{group}.json", {"format": "FreeClimbActionGroup", "version": 1, "group": group, "clips": clips})
+            (self.base / f"{group}.hkx").write_bytes(group.encode())
+            for entry in manifest["motions"]:
+                if entry["slot"] in slots:
+                    entry["config"] = f"configs/{group}.json"
+        write_json(self.pack, manifest)
+        pack = core.load_template(self.pack)
+        self.assertEqual(len(pack.files), 42)
+        before = fingerprint(self.base)
+        native = FakeNative()
+        with patch.object(native, "export_group", create=True, return_value={"files": ["group.hkx", "group.json"], "loaded": 31}) as export:
+            self.export(native=native, slot="runUp")
+            args = export.call_args.args
+            self.assertEqual(args[0], self.pack.resolve())
+            self.assertEqual(args[1], self.hkx.resolve())
+            self.assertEqual(args[2], pack.configurations["runUp"])
+            self.assertEqual(args[3], self.output.resolve())
+        self.assertEqual(fingerprint(self.base), before)
+
+    def test_native_group_job_uses_unicode_and_removes_temporary_job(self):
+        executable = self.directory / "检查工具.exe"
+        executable.write_bytes(b"not executed")
+        native = core.NativeTool(executable)
+        self.work.mkdir()
+        captured = []
+        def call(command, path):
+            captured.append((command, core.read_json(path)))
+            return {"ok": True, "loaded": 31, "files": ["group.hkx", "group.json"]}
+        config = core.load_template(self.pack).configurations["up"]
+        with patch.object(native, "call", side_effect=call):
+            native.export_group(self.pack, self.hkx, config, self.output, self.work)
+        self.assertEqual(captured, [("export-group", {"pack": str(self.pack), "input": str(self.hkx), "config": config, "output": str(self.output), "work": str(self.work)})])
+        self.assertFalse(list(self.work.iterdir()))
+
+    def test_complete_timeline_group_accepts_ranges_and_rejects_wrong_direction(self):
+        source = core.read_json(ROOT / "runtime" / core.PREFIX / "configs/runUp.json")
+        core.group_header(source)
+        self.assertEqual(source["version"], 2)
+        mutations = (
+            lambda value: value["sequences"].pop(),
+            lambda value: value["sequences"][0]["launch"].update(member="runLeft"),
+            lambda value: value["sequences"][0]["launch"].update(frameRange=[0, 1201]),
+            lambda value: value["sequences"][0]["catch"].update(frameRange=[0, 1]),
+            lambda value: value["sequences"][0]["launch"].update(rootShift=[0, float("nan"), 0]),
+            lambda value: value["clips"][0].update(frameRange=[True, 2]),
+            lambda value: value["sequences"][0]["launch"].update(file="other.hkx"),
+        )
+        for mutation in mutations:
+            invalid = copy.deepcopy(source)
+            mutation(invalid)
+            with self.assertRaises(core.AuthoringError):
+                core.group_header(invalid)
+        clip = copy.deepcopy(source["clips"][0])
+        clip.update(version=2, authoredPlayback={"version": 1})
+        edited = core.configure_clip(clip, 2, core.EditOptions(stride=81))
+        self.assertEqual(edited["stride"], 81)
+        self.assertEqual(edited["authoredPlayback"], {"version": 1})
+        edited["authoredPlayback"]["version"] = 2
+        with self.assertRaises(core.AuthoringError):
+            core.clip_header(edited, edited["slot"])
+
+    def contextual_groups(self):
+        manifest = core.read_json(self.pack)
+        for direction in ("contextHopLeft", "contextHopRight"):
+            preparation = core.read_json(self.base / "configs/contextHang.json")
+            preparation.update(file=f"{direction}.hkx", member=direction, frameRange=[0, 16])
+            main = core.read_json(self.base / f"configs/{direction}.json")
+            main.update(file=f"{direction}.hkx", member=direction, frameRange=[16, 94])
+            ending = copy.deepcopy(preparation)
+            ending["frameRange"] = [94, 105]
+            document = {"format": "FreeClimbActionGroup", "version": 2, "group": "contextHop",
+                        "direction": direction, "clips": [preparation, main],
+                        "sequences": [{"slot": direction, "prepare": preparation, "catch": ending}]}
+            write_json(self.base / f"configs/{direction}.json", document)
+            for entry in manifest["motions"]:
+                if entry["slot"] == direction or entry["slot"] == "contextHang" and direction == "contextHopLeft":
+                    entry["config"] = f"configs/{direction}.json"
+        write_json(self.pack, manifest)
+
+    def test_private_wall_brace_stays_in_its_direction_file(self):
+        template = core.read_json(ROOT / "runtime" / core.PREFIX / "configs/runUp.json")
+        for direction in ("runLeft", "runRight", "runDiagonalLeft", "runDiagonalRight"):
+            source = copy.deepcopy(template)
+            source["direction"] = direction
+            source["sequences"][0]["slot"] = direction
+            launch = "runLaunchLeft" if "Left" in direction else "runLaunchRight"
+            for part in source["clips"] + [source["sequences"][0]["launch"], source["sequences"][0]["catch"]]:
+                part.pop("references", None)
+                part["slot"] = direction if part["slot"] == "runUp" else launch if part["slot"] == "runLaunch" else part["slot"]
+                part.update(file=f"{direction}.hkx", member=direction)
+            brace = core.read_json(self.base / "configs/sideBrace.json")
+            brace.update(file=f"{direction}.hkx", member=direction + "Brace")
+            source["sequences"][0]["brace"] = brace
+            if direction == "runLeft":
+                source["clips"].append(copy.deepcopy(brace))
+            core.group_header(source)
+            for field, value in (("file", "sideBrace.hkx"), ("member", "otherBrace"), ("slot", "runUp")):
+                invalid = copy.deepcopy(source)
+                invalid["sequences"][0]["brace"][field] = value
+                with self.assertRaises(core.AuthoringError):
+                    core.group_header(invalid)
+            if direction == "runLeft":
+                invalid = copy.deepcopy(source)
+                invalid["sequences"][0].pop("brace")
+                with self.assertRaises(core.AuthoringError):
+                    core.group_header(invalid)
+                invalid = copy.deepcopy(source)
+                invalid["clips"][-1]["stride"] += 1
+                with self.assertRaises(core.AuthoringError):
+                    core.group_header(invalid)
+
+    def test_contextual_directions_select_private_groups_and_keep_legacy_reading(self):
+        self.contextual_groups()
+        pack = core.load_template(self.pack)
+        for side in ("contextHopLeft", "contextHopRight"):
+            self.assertEqual(pack.config_paths[side], f"configs/{side}.json")
+            self.assertEqual(pack.configurations[side]["file"], f"{side}.hkx")
+            self.assertEqual(pack.configurations[side]["member"], side)
+            own = pack.groups[pack.config_paths[side]]
+            self.assertEqual({clip["slot"] for clip in own["clips"]}, {"contextHang", side})
+            self.assertEqual(own["sequences"][0]["prepare"], own["clips"][0])
+            self.assertNotEqual(own["sequences"][0]["catch"]["frameRange"], own["clips"][0]["frameRange"])
+        self.assertEqual(len(pack.files), 62)
+        before = fingerprint(self.base)
+        for side in ("contextHopLeft", "contextHopRight"):
+            native = FakeNative()
+            files = [core.PREFIX + f"{side}.hkx", core.PREFIX + f"configs/{side}.json"]
+            with patch.object(native, "export_group", create=True, return_value={"files": files, "loaded": 31}) as export:
+                result = self.export(native=native, slot=side)
+                self.assertEqual(export.call_args.args[2], pack.configurations[side])
+                self.assertEqual(result["files"], files)
+        self.assertEqual(fingerprint(self.base), before)
+
+    def test_contextual_timeline_rejects_cross_direction_and_invalid_sections(self):
+        self.contextual_groups()
+        original = core.read_json(self.base / "configs/contextHopLeft.json")
+        mutations = (
+            lambda value: value.pop("direction"),
+            lambda value: value.update(direction="runLeft"),
+            lambda value: value["clips"][1].update(slot="contextHopRight"),
+            lambda value: value["clips"][1].update(member="contextHopRight"),
+            lambda value: value["clips"][1].update(file="contextHopRight.hkx"),
+            lambda value: value["sequences"][0].update(slot="contextHopRight"),
+            lambda value: value["sequences"][0]["prepare"].update(stride=5),
+            lambda value: value["sequences"][0]["catch"].update(member="contextHopRight"),
+            lambda value: value["sequences"][0]["catch"].update(file="contextHopRight.hkx"),
+            lambda value: value["sequences"][0]["catch"].update(slot="contextHopRight"),
+            lambda value: value["sequences"][0]["catch"].update(frameRange=[15, 104]),
+            lambda value: value["sequences"][0]["catch"].update(rootShift=[0, float("nan"), 0]),
+            lambda value: value["sequences"][0]["catch"].update(frameRange=[0, 1201]),
+            lambda value: value["clips"].append(copy.deepcopy(value["clips"][0])),
+        )
+        for mutation in mutations:
+            invalid = copy.deepcopy(original)
+            mutation(invalid)
+            with self.assertRaises(core.AuthoringError):
+                core.group_header(invalid)
+
+    def test_contextual_full_source_keeps_private_calibration_members(self):
+        self.contextual_groups()
+        for direction in ("contextHopLeft", "contextHopRight"):
+            source = core.read_json(self.base / f"configs/{direction}.json")
+            for part in source["clips"] + [source["sequences"][0]["prepare"], source["sequences"][0]["catch"]]:
+                part.pop("frameRange", None)
+                part.update(version=2, authoredPlayback={"version": 1})
+            source["clips"][0]["member"] = direction + "Prepare"
+            source["sequences"][0]["prepare"] = copy.deepcopy(source["clips"][0])
+            source["sequences"][0]["catch"]["member"] = direction + "Catch"
+            core.group_header(source)
+            for mutation in (
+                lambda value: value["clips"][1].pop("authoredPlayback"),
+                lambda value: value["clips"][0].update(member=direction),
+                lambda value: value["sequences"][0]["catch"].update(member=direction),
+                lambda value: value["sequences"][0]["catch"].update(file="another.hkx"),
+                lambda value: value["sequences"][0]["prepare"].update(member=direction + "Catch"),
+            ):
+                invalid = copy.deepcopy(source)
+                mutation(invalid)
+                with self.assertRaises(core.AuthoringError):
+                    core.group_header(invalid)
+
+    def test_private_playback_references_remain_inside_the_owner_file(self):
+        for owner, role, slot in (("runLaunch", "launchApproach", "runUp"),
+                                  ("kickLeft", "kickTakeoff", "kickUp"),
+                                  ("kickLeft", "kickLanding", "hopLeft"),
+                                  ("kickRight", "kickLanding", "hopRight"),
+                                  ("kickUp", "kickLanding", "hopUp"),
+                                  ("kickLeft", "kickRunBrace", "sideBrace"),
+                                  ("kickUp", "kickRunLanding", "runUp")):
+            source = core.read_json(self.base / f"configs/{owner}.json")
+            reference = core.read_json(self.base / f"configs/{slot}.json")
+            reference.update(file=source["file"], member=owner + role)
+            source["references"] = {role: reference}
+            core.clip_header(source, owner)
+            for field, value in (("file", "other.hkx"), ("slot", "hang"), ("member", "bad/name"), ("references", {})):
+                invalid = copy.deepcopy(source)
+                invalid["references"][role][field] = value
+                with self.assertRaises(core.AuthoringError):
+                    core.clip_header(invalid, owner)
+            invalid = copy.deepcopy(source)
+            invalid["references"] = {"unexpected": reference}
+            with self.assertRaises(core.AuthoringError):
+                core.clip_header(invalid, owner)
+
+    @unittest.skipUnless(os.environ.get("FREECLIMB_AUTHORING_EXE"), "Native group integration requires the built authoring executable")
+    def test_native_complete_group_export_roundtrip(self):
+        native = core.NativeTool(os.environ["FREECLIMB_AUTHORING_EXE"])
+        source = ROOT / "runtime" / core.PREFIX
+        before = fingerprint(source)
+        hop_packages = []
+        for group, slot in (("wallRun", "runUp"), ("wallRun", "runCatch"), ("wallRun", "runLaunchLeft"), ("contextHop", "contextHopLeft"), ("contextHop", "contextHopRight")):
+            owner = {"runUp": "runUp", "runCatch": "runUp", "runLaunchLeft": "runLeft", "contextHopLeft": "contextHopLeft", "contextHopRight": "contextHopRight"}[slot]
+            output = self.directory / f"{group}-{slot}.zip"
+            try:
+                result = core.export_override(source / "pack.json", slot, source / "up.hkx", output,
+                                              core.EditOptions(stride=91), native, self.work)
+            except core.AuthoringError as error:
+                self.fail(f"{slot}: {error}")
+            self.assertEqual(result["loaded"], 31)
+            target = self.directory / f"{group}-{slot}"
+            shutil.copytree(source, target / core.PREFIX)
+            with zipfile.ZipFile(output) as archive:
+                self.assertEqual(len(archive.namelist()), 2)
+                configs = [name for name in archive.namelist() if name.endswith(".json")]
+                self.assertEqual(configs, [core.PREFIX + f"configs/{owner}.json"])
+                document = json.loads(archive.read(configs[0]))
+                archive.extractall(target)
+            original = core.read_json(source / f"configs/{owner}.json")
+            self.assertEqual(len(document["clips"]), len(original["clips"]))
+            self.assertEqual(len({clip["file"] for clip in document["clips"]}), 1)
+            old = {clip["slot"]: clip for clip in original["clips"]}
+            for clip in document["clips"]:
+                expected = copy.deepcopy(old[clip["slot"]])
+                expected["file"] = clip["file"]
+                for reference in expected.get("references", {}).values():
+                    reference["file"] = clip["file"]
+                if clip["slot"] == slot:
+                    expected["stride"] = 91
+                self.assertEqual({k: v for k, v in clip.items() if k not in ("frameRange", "rootShift")},
+                                 {k: v for k, v in expected.items() if k not in ("frameRange", "rootShift")})
+            if group == "wallRun":
+                for sequence, old_sequence in zip(document["sequences"], original["sequences"]):
+                    for role in ("launch", "catch"):
+                        part, expected = sequence[role], copy.deepcopy(old_sequence[role])
+                        expected["file"] = part["file"]
+                        for reference in expected.get("references", {}).values():
+                            reference["file"] = part["file"]
+                        if old[slot]["member"] == sequence["slot"] and expected["slot"] == slot:
+                            expected["stride"] = 91
+                        self.assertEqual({k: v for k, v in part.items() if k not in ("frameRange", "rootShift")},
+                                         {k: v for k, v in expected.items() if k not in ("frameRange", "rootShift")})
+            self.assertEqual(native.validate(target / core.PREFIX / "pack.json")["loaded"], 31)
+            if group == "contextHop":
+                opposite = "contextHopRight" if slot == "contextHopLeft" else "contextHopLeft"
+                for name in (f"{opposite}.hkx", f"configs/{opposite}.json"):
+                    self.assertEqual((target / core.PREFIX / name).read_bytes(), (source / name).read_bytes())
+                hop_packages.append(output)
+        with zipfile.ZipFile(hop_packages[0]) as left, zipfile.ZipFile(hop_packages[1]) as right:
+            self.assertFalse(set(left.namelist()) & set(right.namelist()))
+        results = []
+        for index, archives in enumerate((hop_packages, list(reversed(hop_packages)))):
+            target = self.directory / f"both-directions-{index}"
+            shutil.copytree(source, target / core.PREFIX)
+            for archive in archives:
+                with zipfile.ZipFile(archive) as opened:
+                    opened.extractall(target)
+            self.assertEqual(native.validate(target / core.PREFIX / "pack.json")["loaded"], 31)
+            results.append(fingerprint(target))
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(fingerprint(source), before)
+
+    def test_action_group_rejects_missing_duplicate_and_unknown_stages(self):
+        manifest = core.read_json(self.pack)
+        clips = [core.read_json(self.base / f"configs/{slot}.json") for slot in core.ACTION_GROUPS["contextHop"]]
+        for entry in manifest["motions"]:
+            if entry["slot"] in core.ACTION_GROUPS["contextHop"]:
+                entry["config"] = "configs/contextHop.json"
+        write_json(self.pack, manifest)
+        for invalid in (clips[:-1], clips + [clips[0]], [clips[0], clips[0], clips[2]], [clips[0], clips[1], dict(clips[2], slot="hang")]):
+            write_json(self.base / "configs/contextHop.json", {"format": "FreeClimbActionGroup", "version": 1, "group": "contextHop", "clips": invalid})
+            with self.assertRaises(core.AuthoringError):
+                core.load_template(self.pack)
 
     def test_incomplete_or_retired_slots_and_duplicate_json_rejected(self):
         manifest = core.read_json(self.pack)
@@ -318,7 +662,7 @@ class AuthoringToolTests(unittest.TestCase):
     def test_native_rejection_includes_bounded_slot_reasons(self):
         executable = self.directory / "validator.exe"
         executable.write_bytes(b"not executed")
-        report = {"ok": False, "loaded": 30, "error": "all 35 active slots must load successfully",
+        report = {"ok": False, "loaded": 30, "error": "all 31 active slots must load successfully",
                   "slots": [{"slot": "up", "status": "rejected", "file": "up.hkx", "reason": "Animated joint translation/scale is unsupported"},
                             {"slot": "hang", "status": "loaded", "file": "hang.hkx", "reason": "THIS MUST NOT APPEAR"}] +
                            [{"slot": f"bad-{i}", "status": "missing", "file": f"missing-{i}.hkx", "reason": "X" * 2000} for i in range(6)]}

@@ -39,7 +39,7 @@ static MovingResult movingAutomatic(const Library& lib,int fps,Input input,bool 
             check(t.automaticActionCount()==counted+1,"one automated start counts exactly once");
             counted=t.automaticActionCount();result.starts.push_back(float(frame+1)/fps);
             check(out.staminaCost>=15&&out.staminaCost<16,"automatic jump pays existing fifteen-point action cost once");
-            check(hopMotion(out.motion)&&!flipMotion(out.motion)&&!t.runningAction(),"automatic selection only makes same-mode ordinary hops");
+            check((threepeatHop(out.motion)||out.motion==Motion::hopUp||out.motion==Motion::hopLeft||out.motion==Motion::hopRight)&&!t.runningAction(),"automatic selection only makes same-mode ordinary or contextual hops");
             if(lip)check(out.motion==(input.x<0?Motion::contextHopLeft:Motion::contextHopRight),
                 "matching real source and destination lips always prefer the new Manny action");
             else check(out.motion==(input.x<0?Motion::hopLeft:input.x>0?Motion::hopRight:Motion::hopUp),

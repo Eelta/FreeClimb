@@ -3,6 +3,7 @@
 bool tryRecessedWallTransfer(World& originalWorld,Input intent,bool wallRun,float speed,float stamina) {
     if(intent.y<=.5f||std::abs(intent.x)>=.5f||intent.release||intent.backDrop||
         (wallRun&&!cfg.wallRunObstacleJumps)||!position.finite()||std::abs(surfaceNormal.z)>.12f)return false;
+    const bool sourceRoute=authored(Motion::hopUp)||(wallRun&&authored(Motion::kickUp));
     struct BudgetWorld final:World {
         World& source;unsigned calls{},limit{};bool exhausted{};
         BudgetWorld(World& world,unsigned budget):source(world),limit(budget){}
@@ -10,7 +11,7 @@ bool tryRecessedWallTransfer(World& originalWorld,Input intent,bool wallRun,floa
             if(calls>=limit){exhausted=true;return Hit{a,(a-b).unit(),false};}
             ++calls;return source.ray(a,b);
         }
-    } w(originalWorld,wallRun?4096:1800);
+    } w(originalWorld,sourceRoute?12288:wallRun?4096:1800);
     const auto source=support(w,position,normal*-1);
     if(!source||!gripSupport(w,position,*source,true)||w.exhausted)return false;
     const auto edge=findGripEdge(w,position,normal,cfg,50,130);
@@ -39,7 +40,25 @@ bool tryRecessedWallTransfer(World& originalWorld,Input intent,bool wallRun,floa
             if(w.exhausted)return false;
             if(outward>cfg.reach)continue;
             const Vec outside=position+normal*outward,over=outside+Vec{0,0,delta.z};
-            if((target-over).length()>cfg.reach||!clearPath(w,position,outside)||!roofPathClear(w,position,outside)||
+            if((target-over).length()>cfg.reach)continue;
+            if(sourceRoute) {
+                const float peak=1.5f*std::max({(outside-position).length()*4,(over-outside).length()*2,(target-over).length()*4});
+                bool accepted=false;
+                for(const auto motion:{Motion::kickUp,Motion::hopUp}) {
+                    if(motion==Motion::kickUp&&(!wallRun||!kickClearance(w,position)))continue;
+                    const float seconds=std::max(wallRun?.58f:.72f,peak/(motion==Motion::kickUp?680.f:420.f));
+                    if(stamina<(wallRun?30.f+2*cfg.drain*(motionDuration(motion,seconds)+.05f):15.f))continue;
+                    if(commitAuthoredRoute(w,motion,target,seconds,normal,true,outside,over,true,anchor->hit.normal.unit(),0,wallRun?speed:0)){accepted=true;break;}
+                    if(w.exhausted)return false;
+                }
+                if(!accepted)continue;
+                if(wallRun) {
+                    actionBeganRunning=true;actionRunSpeed=speed;obstacleJump=true;++obstacleJumps;
+                    obstacleProbeCooldown=.5f;runClearanceCooldown=0;
+                }
+                blockedReason=wallRun?"checked recessed wall-run catch":"checked recessed climb catch";return true;
+            }
+            if(!clearPath(w,position,outside)||!roofPathClear(w,position,outside)||
                 !clearPath(w,outside,over)||!roofPathClear(w,outside,over)||
                 !clearPath(w,over,target)||!roofPathClear(w,over,target))continue;
             auto point=[&](float phase) {

@@ -28,13 +28,14 @@ static void supportedRest(const Library& lib,int fps,float scale,int kind) {
     }
     SurfacePose surface;
     const float dt=1.f/fps;Pose previous,initial;Vec restPosition=t.position;
-    float minCOM=1e9f,maxCOM=-1e9f,chestTravel=0,palmError=0,wristAngle=0;
+    float minCOM=1e9f,maxCOM=-1e9f,chestTravel=0,headTravel=0,palmError=0,wristAngle=0;
     bool captured=false,realLip=false;
     auto toWorld=[&](Vec p){return t.position+(Vec{-t.normal.y,t.normal.x,0}*p.x-t.normal*p.y+Vec{0,0,p.z})*scale;};
-    for(int frame=0;frame<fps*10;++frame) {
+    const int frameCount=kind==0?fps*10:std::max(2,int(std::ceil(.26f*fps)));
+    for(int frame=0;frame<frameCount;++frame) {
         Result result;
         if(kind==0)result=t.update(world,{},dt,1000);
-        else result.motion=Motion::contextHang;
+        else {result=t.update(world,{1,0},dt,1000);if(result.motion!=Motion::contextHang)break;}
         const auto pose=surface.update(lib,world,t,result.motion,dt,scale),body=lib.world(pose);
         captured|=result.motion==Motion::contextHang;
         realLip|=t.usesEdgeTargets(result.motion)&&!t.usesWallTargets(result.motion);
@@ -43,11 +44,12 @@ static void supportedRest(const Library& lib,int fps,float scale,int kind) {
         check((t.position-restPosition).length()<.001f,"resting output never moves the actor or collider");
         if(!previous.empty())for(std::size_t bone=0;bone<pose.size();++bone)
             check(angleBetween(previous[bone].q,pose[bone].q)<=12.566371f*dt+.001f,"resting output keeps the original bone-rate budget");
-        if(frame==fps*2)initial=pose;
+        if(frame==(kind==0?fps*2:0))initial=pose;
         if(!initial.empty()) {
             minCOM=std::min(minCOM,pose[4].t.z);maxCOM=std::max(maxCOM,pose[4].t.z);
             chestTravel=std::max(chestTravel,angleBetween(initial[26].q,pose[26].q));
-            const auto authored=lib.sample(result.motion,surface.sampledPhase());
+            headTravel=std::max(headTravel,angleBetween(initial[35].q,pose[35].q));
+            const auto authored=lib.sample(result.motion,surface.sampledPhase(),t.poseDirection(result.motion));
             for(int bone:{35,36})check(angleBetween(pose[bone].q,authored[bone].q)<.00001f,"idle adds no independent head or neck turn");
             for(int hand=0;hand<2;++hand) {
                 check(lib.armBendValid(pose,hand),"resting hands preserve both original elbow branches");
@@ -72,7 +74,7 @@ static void supportedRest(const Library& lib,int fps,float scale,int kind) {
         previous=pose;
     }
     if(kind==0)check(chestTravel<.0001f&&maxCOM-minCOM<.0001f,"ordinary supported idle has no added chest or pelvis cycle");
-    else check(captured&&chestTravel>.001f,"necessary preparation retains its authored source movement");
+    else check(captured&&headTravel>.001f,"The actual brief preparation retains its authored head motion without additional turning");
     if(kind==2)check(realLip,"the ledge case exercises a real top/front descriptor");
     const Vec before=t.position;
     for(int frame=0;frame<fps/2;++frame) {
@@ -84,7 +86,7 @@ static void supportedRest(const Library& lib,int fps,float scale,int kind) {
     }
     check((t.position-before).length()>scale,"resuming movement requires no idle release or regrip wait");
     std::cout<<"SUPPORTED_IDLE fps="<<fps<<" scale="<<scale<<" kind="<<kind<<" chest="<<chestTravel<<" comRange="<<maxCOM-minCOM<<
-        " palms="<<palmError<<" wrist="<<wristAngle<<'\n';
+        " head="<<headTravel<<" palms="<<palmError<<" wrist="<<wristAngle<<'\n';
 }
 
 static void supportChanges(const Library& lib,int fps,float scale,int missing) {

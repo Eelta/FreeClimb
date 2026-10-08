@@ -111,14 +111,16 @@ private:
     bool entryPending{};
     std::uint64_t nativeFrame{};
     std::uint32_t pendingScenePasses{};
-    float exitAge{},sampleTime{};
+    float exitAge{},sampleTime{},exitWatchStartAge{};
+    bool suspended{};
     std::uint64_t exitStartedAt{};
     std::uint32_t exitAppliedBase{},exitTicks{},exitSteps{};
     float publishedYaw{},displayedYaw{};
     bool hasWallFrame{},hasDisplayedYaw{};
     Orientation orientation;
     OutputAudit outputAudit;
-    Motion publishedMotion=Motion::none;
+    Motion publishedMotion=Motion::none,publishedWallRunDirection=Motion::none;
+    bool publishedContextRecovery{};
     std::uint64_t generation{},lastSuccessfulOutput{};
     PoseBlendEnvelope envelope;
     PoseFrameClock exitClock;
@@ -554,7 +556,8 @@ private:
             const volatile auto* timer=frameTimer;
             const auto stamp=timer->runTimeMS;
             const auto delta=timer->delta,realDelta=timer->realTimeDelta;
-            const bool paused=timer->pauseCount!=0;
+            const auto* main=RE::Main::GetSingleton();
+            const bool paused=suspended||timer->pauseCount!=0||(main&&main->GetRuntimeData().freezeTime);
             const bool stable=stamp==timer->runTimeMS;
             traceFrame.stamp=stamp;traceFrame.delta=delta;traceFrame.realDelta=realDelta;
             traceFrame.paused=paused;traceFrame.stable=stable;
@@ -793,14 +796,14 @@ private:
         ++generation;lastSuccessfulOutput=0;
         target=nullptr;
         restoreFootIKLocked();
-        bindings.clear();published.clear();handoff.clear();exitAge=sampleTime=0;reusedBindings=0;
+        bindings.clear();published.clear();handoff.clear();exitAge=sampleTime=exitWatchStartAge=0;reusedBindings=0;
         nativeHistory.clear();entryPending=false;
         exitTrace.reset();
         exitStartedAt=0;exitAppliedBase=exitTicks=exitSteps=0;
         if(!library.rig.source().empty())library.clearRig();
         exitClock.clear();
         publishedYaw=displayedYaw=0;hasWallFrame=hasDisplayedYaw=false;orientation={};
-        publishedMotion=Motion::none;outputAudit={};
+        publishedMotion=publishedWallRunDirection=Motion::none;publishedContextRecovery=false;outputAudit={};
         envelope.clear();fading=ownsPose=nativeFootIK=false;lastCallback=0;
     }
     bool bindLocked(RE::PlayerCharacter* player,bool* changed=nullptr) {
@@ -850,6 +853,10 @@ private:
                 bindingFailure="required model bone missing";
                 SKSE::log::warn("Pose binding rejected: {}: index={} name='{}' actorRoot='{}' project='{}' mapped={}",
                     bindingFailure,next.scene.missing,library.names[next.scene.missing],actorRoot->name.c_str(),g->projectName.c_str(),next.scene.count);
+                const auto detail=describeSceneLookup(actorRoot,next.root.get(),library.names[next.scene.missing]);
+                SKSE::log::warn("Scene lookup diagnostic: actorClass='{}' selectedRoot='{}' rootClass='{}' flat={} bones={} populated={} samples=[{}]; actualInside={} actualOutside={} scanned={} incomplete={}; ancestorFlat=[{}] parentChainIncomplete={}",
+                    detail.actorClass,detail.rootName,detail.rootClass,detail.flat.state,detail.flat.count,detail.flat.populated,detail.flat.samples,
+                    detail.inside,detail.outside,detail.scanned,detail.incomplete,detail.ancestorFlatTrees,detail.parentChainIncomplete);
                 continue;
             }
             for(std::size_t i=0;i<99;++i)if(next.animation.indices[i]<0&&next.scene.nodes[i]) {
@@ -938,7 +945,7 @@ public:
         }
         auto report=loadAnimationPack(candidate,"Data/meshes/actors/character/animations/FreeClimb/pack.json");
         for(const auto& slot:report.slots)if(traceOutput||slot.status!=OverrideStatus::loaded)
-            SKSE::log::info("HKX pack slot={} file={} status={} frames={} seconds={} reason={}",int(slot.motion),slot.file,int(slot.status),slot.samples,slot.seconds,slot.reason);
+            SKSE::log::info("HKX pack slot={} file={} status={} frames={} seconds={} reason={} path={} bytes={} contentId={:016x}",int(slot.motion),slot.file,int(slot.status),slot.samples,slot.seconds,slot.reason,slot.path,slot.bytes,slot.contentId);
         if(!report.committed) {
             SKSE::log::error("Animation pack rejected; previous library preserved: {}",report.error);
             packReport=std::move(report);return false;
@@ -996,12 +1003,12 @@ public:
         skinBodyInputs=skinOwnedInputs=skinCacheHits=skinMismatchCalls=0;
         skinAuditSamples=skinAuditSkipped=skinAuditLockSkips=skinAuditInputs=skinAuditAncestors=skinAuditBudgetStops=0;
         skinBodyMismatches=skinBridgeMismatches=skinExtraMismatches=skinAuditMicros=skinAuditPeakMicros=0;
-        surface.reset();published.clear();handoff.clear();exitAge=sampleTime=0;
+        surface.reset();published.clear();handoff.clear();exitAge=sampleTime=exitWatchStartAge=0;
         entryPending=true;
         exitTrace.reset();
         exitClock.clear();
         publishedYaw=displayedYaw=0;hasWallFrame=hasDisplayedYaw=false;orientation={};
-        publishedMotion=Motion::none;outputAudit={};
+        publishedMotion=publishedWallRunDirection=Motion::none;publishedContextRecovery=false;outputAudit={};
         applied=0;rejected=0;matched=0;retiredOutputs=0;envelope.beginEntry();
         fading=nativeFootIK=false;ownsPose=true;
         for(auto& b:bindings){b.footIK=b.graph->doFootIK;b.graph->doFootIK=0;b.footOwned=true;}
@@ -1024,7 +1031,8 @@ public:
         if(rigInvalidated.load())return;
         published=std::move(pose);
         if(std::isfinite(dt)&&dt>0)sampleTime+=std::min(dt,.05f);
-        publishedMotion=motion;
+        publishedMotion=motion;publishedWallRunDirection=t.poseDirection(motion);
+        publishedContextRecovery=motion==Motion::contextHang&&t.holdsDestinationEdge(motion);
         if(const auto yaw=facingWallYaw(t.normal)){publishedYaw=*yaw;hasWallFrame=true;}
         envelope.advanceEntry(applied.load(),dt);fading=false;
     }
@@ -1033,7 +1041,8 @@ public:
         if(rigInvalidated.load()){clearLocked();return;}
         restoreFootIKLocked();
         const bool nativeTakeover=completedTop&&!physicalFall;
-        if(fade&&envelope.weight()>0&&handoff.beginExit(physicalFall,nativeTakeover)) {
+        const bool authoredExit=isActiveMotion(publishedMotion)&&library.clip(publishedMotion,publishedWallRunDirection,publishedContextRecovery).authoredPlayback;
+        if(fade&&envelope.weight()>0&&handoff.beginExit(physicalFall,nativeTakeover,authoredExit)) {
             const float remaining=handoff.exitContribution();
 
             publishedYaw=displayedYaw;hasWallFrame=hasDisplayedYaw;
@@ -1045,17 +1054,23 @@ public:
             else {
                 exitAppliedBase=applied.load();envelope.beginExit(exitAppliedBase,seconds,nativeTakeover||physicalFall);
                 exitClock.clear();
-                exitAge=0;exitTicks=exitSteps=0;exitStartedAt=GetTickCount64();fading=true;
+                exitAge=exitWatchStartAge=0;exitTicks=exitSteps=0;exitStartedAt=GetTickCount64();fading=true;
                 finishExitTraceLocked("exit restarted");exitTrace.reset(traceOutput);
             }
         } else clearLocked();
     }
+    void suspend(bool value) {
+        std::scoped_lock lock(mutex);
+        if(suspended==value)return;
+        suspended=value;exitClock.clear();
+        if(!value)exitWatchStartAge=exitAge;
+    }
     void tick(float dt) {
-        std::scoped_lock lock(mutex);++nativeFrame;
+        std::scoped_lock lock(mutex);if(suspended)return;++nativeFrame;
         if(!fading||rigInvalidated.load())return;
         if(std::isfinite(dt)&&dt>0){exitAge+=std::min(dt,.05f);++exitTicks;}
 
-        if(!pendingScenePasses&&exitAge>.75f&&!recentPoseCallback(GetTickCount64(),lastSuccessfulOutput)){clearLocked("callback timeout");return;}
+        if(!pendingScenePasses&&exitAge-exitWatchStartAge>.75f&&!recentPoseCallback(GetTickCount64(),lastSuccessfulOutput)){clearLocked("callback timeout");return;}
         if(!pendingScenePasses&&envelope.exitComplete(applied.load())){clearLocked("native handoff complete");return;}
         if(!frameTimer) {
             const auto before=envelope.elapsedExitSeconds();
@@ -1066,3 +1081,4 @@ public:
     }
 };
 }
+

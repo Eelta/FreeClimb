@@ -1,0 +1,132 @@
+{
+  "format": "FreeClimbAnimationPack",
+  "motions": [
+    {
+      "config": "configs/hang.json",
+      "slot": "hang"
+    },
+    {
+      "config": "configs/up.json",
+      "slot": "up"
+    },
+    {
+      "config": "configs/down.json",
+      "slot": "down"
+    },
+    {
+      "config": "configs/left.json",
+      "slot": "left"
+    },
+    {
+      "config": "configs/right.json",
+      "slot": "right"
+    },
+    {
+      "config": "configs/reach.json",
+      "slot": "reach"
+    },
+    {
+      "config": "configs/hopLeft.json",
+      "slot": "hopLeft"
+    },
+    {
+      "config": "configs/hopRight.json",
+      "slot": "hopRight"
+    },
+    {
+      "config": "configs/hopUp.json",
+      "slot": "hopUp"
+    },
+    {
+      "config": "configs/drop.json",
+      "slot": "drop"
+    },
+    {
+      "config": "configs/jumpCatch.json",
+      "slot": "jumpCatch"
+    },
+    {
+      "config": "configs/dropBack.json",
+      "slot": "dropBack"
+    },
+    {
+      "config": "configs/ledgeCatch.json",
+      "slot": "ledgeCatch"
+    },
+    {
+      "config": "configs/runUp.json",
+      "slot": "runUp"
+    },
+    {
+      "config": "configs/runLeft.json",
+      "slot": "runLeft"
+    },
+    {
+      "config": "configs/runRight.json",
+      "slot": "runRight"
+    },
+    {
+      "config": "configs/runDiagonalLeft.json",
+      "slot": "runDiagonalLeft"
+    },
+    {
+      "config": "configs/runDiagonalRight.json",
+      "slot": "runDiagonalRight"
+    },
+    {
+      "config": "configs/runUp.json",
+      "slot": "runLaunch"
+    },
+    {
+      "config": "configs/runUp.json",
+      "slot": "runCatch"
+    },
+    {
+      "config": "configs/kickUp.json",
+      "slot": "kickUp"
+    },
+    {
+      "config": "configs/kickLeft.json",
+      "slot": "kickLeft"
+    },
+    {
+      "config": "configs/kickRight.json",
+      "slot": "kickRight"
+    },
+    {
+      "config": "configs/runLeft.json",
+      "slot": "runLaunchLeft"
+    },
+    {
+      "config": "configs/runRight.json",
+      "slot": "runLaunchRight"
+    },
+    {
+      "config": "configs/runLeft.json",
+      "slot": "sideBrace"
+    },
+    {
+      "config": "configs/backFlipOut.json",
+      "slot": "backFlipOut"
+    },
+    {
+      "config": "configs/contextHopLeft.json",
+      "slot": "contextHang"
+    },
+    {
+      "config": "configs/contextHopLeft.json",
+      "slot": "contextHopLeft"
+    },
+    {
+      "config": "configs/contextHopRight.json",
+      "slot": "contextHopRight"
+    },
+    {
+      "config": "configs/contextMantle.json",
+      "slot": "contextMantle"
+    }
+  ],
+  "name": "FreeClimb default",
+  "skeleton": "skeleton.json",
+  "version": 1
+}

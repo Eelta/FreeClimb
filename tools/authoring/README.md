@@ -2,6 +2,8 @@
 
 English | [简体中文](README.zh-CN.md)
 
+For importing, previewing and adjusting an HKX in one window, use the [Animation Tool](../converter/README.md). This optional configuration helper is not required by that workflow.
+
 Create a single-animation override package from an HKX already adapted for FreeClimb. Keep the existing contact curve, or generate one by specifying which hand or foot provides support, when support begins, and when it releases.
 
 ## Getting started
@@ -17,7 +19,7 @@ Extract the complete source package and double-click `Start.cmd` in this directo
 3. Keep the template contacts, or add support intervals for individual limbs. Leave the optional `stride`, `height`, and `travel X/Y/Z` fields empty to retain their original values.
 4. Choose a ZIP location outside the base pack directory, then click **校验并导出 MO2 覆盖包** (Validate and export the override package). The ZIP is written only after validation succeeds; a failed operation does not replace an existing ZIP.
 
-The ZIP contains only the selected slot's HKX and JSON, under `meshes/actors/character/animations/FreeClimb/`. Install it as a separate mod in MO2 and place it after the complete FreeClimb mod so it overrides those files. Keep the base pack installed: it supplies the other 34 animations, skeleton, and manifest. After leaving the wall, safely reload the animation pack through the in-game menu, then check entry, looping, stopping, switching, and exit.
+The ZIP contains an HKX and its action JSON, under `meshes/actors/character/animations/FreeClimb/`. Wall runs and contextual side leaps export only the selected direction, including its transitions and required references. Left and right packages can be installed together without replacing each other. Re-export old shared `contextHop` overrides with the updated Animation Tool. Install after the complete FreeClimb mod in MO2 and keep the base pack enabled. After leaving the wall, safely reload and test entry, movement, stopping, transitions and exit.
 
 ## Marking contacts
 
@@ -29,7 +31,7 @@ The assistant generates four columns at the new HKX's actual decoded frame count
 
 ## Special animations and advanced configuration
 
-The first-frame hand and foot positions in `contextHang` contribute to lateral leap calibration. The `path`, `sourceHands`, `targetHands`, and `verticalBlend` fields in `contextHopLeft/Right`, and the `unplant`, `replant`, `releaseHands`, and `replantSamplePhase` fields in `contextMantle`, must match the new animation.
+Each contextual side leap owns its internal `contextHang` preparation and ending; their hand and foot positions calibrate that direction only. For base clips, the `path`, `sourceHands`, `targetHands`, and `verticalBlend` fields in `contextHopLeft/Right`, and the `unplant`, `replant`, `releaseHands`, and `replantSamplePhase` fields in `contextMantle`, must match the animation. The Animation Tool generates the configuration for imported complete actions without requiring separate helper replacements.
 
 These fields are preserved in full by default and shown on the **高级配置与特殊动作** (Advanced configuration and special animations) tab. Enable advanced JSON when you need to edit them; `slot` and `file` cannot be changed. Basic parameter inputs override their corresponding JSON fields, and manual contact mode overrides `contacts`. All advanced changes must also pass complete native validation. Changing limb contact markers alone does not automatically update dedicated grip/release windows or paths.
 

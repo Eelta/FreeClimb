@@ -1,4 +1,4 @@
-#include "AnimationOverrides.h"
+#include "AnimationPack.h"
 #include "PoseHandoff.h"
 #include "PoseBlendEnvelope.h"
 #include "PoseOutput.h"
@@ -439,10 +439,19 @@ static void lateCallbackConfirmation(){
 int main(int argc,char** argv){try{
     Library library;require(argc>=2&&argc<=3&&library.load(argv[1]),"load current runtime motion library");
     if(argc==3) {
-        const auto overrides=fc::loadHkxOverrides(library,argv[2]);
-        require(overrides.loaded==activeMotionCount&&overrides.rejected==0&&overrides.missing==0,
-            "load every active HKX slot without missing or rejected clips");
-        for(Motion motion:activeMotions)require(library.hasAnimationOverride(motion),"every active slot installs its HKX override");
+        const auto manifest=std::filesystem::path(argv[2])/"pack.json";
+        if(std::filesystem::exists(manifest)) {
+            const auto pack=fc::loadAnimationPack(library,manifest);
+            require(pack.committed&&pack.loaded==activeMotionCount&&pack.rejected==0&&pack.missing==0,
+                "load every active HKX slot through the complete animation pack");
+            for(Motion motion:activeMotions)require(library.clip(motion).frames.size()>=2&&library.clip(motion).seconds>0,
+                "every active slot loads its complete HKX animation");
+        } else {
+            const auto overrides=fc::loadHkxOverrides(library,argv[2]);
+            require(overrides.loaded==activeMotionCount&&overrides.rejected==0&&overrides.missing==0,
+                "load every active HKX slot without missing or rejected clips");
+            for(Motion motion:activeMotions)require(library.hasAnimationOverride(motion),"every active slot installs its HKX override");
+        }
     }
     singleLayerWeight(library);
     for(int fps:{30,40,60,120})for(bool moving:{false,true})for(float height:{45.f,80.f,120.f})completeAuthoredTakeover(library,fps,moving,height);

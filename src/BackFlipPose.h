@@ -37,6 +37,11 @@ inline void placeBackFlipOut(const Library& lib,Pose& pose,float slope,float gap
 
 inline Pose sampleBackFlipOut(const Library& lib,float phase,float slope,float gap,float scale) {
     auto pose=lib.sample(Motion::backFlipOut,std::clamp(phase,0.f,1.f));
+    const auto& clip=lib.clip(Motion::backFlipOut);
+    if(clip.authoredPlayback) {
+        if(clip.trajectory.sample(1).length()>=2.f)pose[0].t=pose[0].t-clip.trajectory.sample(phase);
+        return pose;
+    }
     placeBackFlipOut(lib,pose,slope,gap,scale);
     return pose;
 }
@@ -45,16 +50,17 @@ struct BackFlipSweepStats {unsigned casts{};};
 
 inline bool backFlipBodyClear(World& world,const Library& lib,Vec from,Vec to,
         float fromPhase,float toPhase,Vec outward,float slope,float gap,float scale,
-        BackFlipSweepStats* stats=nullptr) {
+        BackFlipSweepStats* stats=nullptr,std::optional<Vec> sourceMiddle={}) {
     if(lib.rest.size()<99||lib.parents.size()<99||lib.clip(Motion::backFlipOut).frames.size()<2||
         !from.finite()||!to.finite()||!outward.finite()||!std::isfinite(fromPhase)||!std::isfinite(toPhase)||
         !std::isfinite(slope)||!std::isfinite(gap)||!std::isfinite(scale)||scale<.5f||scale>2.f||gap<=0||
-        fromPhase<0||toPhase>1||toPhase<fromPhase||toPhase-fromPhase>1.f/backFlipExitSegments+.001f)return false;
+        fromPhase<0||toPhase>1||toPhase<fromPhase||toPhase-fromPhase>1.f/backFlipExitSegments+.001f||
+        (sourceMiddle&&!sourceMiddle->finite()))return false;
     outward=Vec{outward.x,outward.y,0}.unit();if(outward.length()<.9f)return false;
     const Vec side{-outward.y,outward.x,0},up{0,0,1};
     const float middlePhase=(fromPhase+toPhase)*.5f;
 
-    const Vec middle=(from+to)*.5f+backFlipExitPoint({},outward,middlePhase)-
+    const Vec middle=sourceMiddle?*sourceMiddle:(from+to)*.5f+backFlipExitPoint({},outward,middlePhase)-
         (backFlipExitPoint({},outward,fromPhase)+backFlipExitPoint({},outward,toPhase))*.5f;
     std::array<BackFlipBody,3> bodies;
     const std::array<float,3> phases={fromPhase,middlePhase,toPhase};

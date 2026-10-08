@@ -41,7 +41,7 @@ int main(){try {
             "entry targets the upper support plane and clears the projecting plinth");
         check((grounded.position-start).length()<.02f&&grounded.lastAttachDistance<=60.01f,
             "coherent entry preserves approach distance and never teleports");
-        grounded.entry(Motion::sprintCatch,true);
+        grounded.entry(Motion::reach,true);
         while(grounded.state==State::approach) {
             const auto result=grounded.update(world,{},1.f/fps,1000);
             check(!result.released,"verified raised route retains its real support during playback");
@@ -74,7 +74,7 @@ int main(){try {
         auto world=recessedWall(12,{},0);auto traversal=coherentTraversal();
         check(traversal.attach(world,{0,-55,0},{0,1,0},1000,60,false,true),
             "dynamic recessed-wall route starts with a clear real endpoint");
-        traversal.entry(Motion::sprintCatch,true);
+        traversal.entry(Motion::reach,true);
         while(traversal.reachProgress()<.65f)check(!traversal.update(world,{},1.f/fps,1000).released,
             "live entry advances through its original checked route");
         world.boxes[1].high.z=62;

@@ -6,9 +6,9 @@ namespace fc {
 inline constexpr std::array<std::string_view,motionCount> motionSlotNames{{
     "hang","up","down","left","right","","","reach",
     "hopLeft","hopRight","hopUp","","","","drop",
-    "jumpCatch","sprintCatch","dropBack","ledgeCatch","runUp","runLeft",
+    "jumpCatch","","dropBack","ledgeCatch","runUp","runLeft",
     "runRight","runDiagonalLeft","runDiagonalRight","runLaunch","runCatch",
-    "kickUp","kickLeft","kickRight","flipUp","flipLeft","flipRight",
+    "kickUp","kickLeft","kickRight","","","",
     "","runLaunchLeft","runLaunchRight","sideBrace","backFlipOut",
     "","contextHang","contextHopLeft","contextHopRight","contextMantle"
 }};

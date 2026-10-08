@@ -111,7 +111,7 @@ try {
     }
     Run-Checked 'cmake' $configure
     $build = @('--build', $output, '--config', $Configuration, '--parallel', "$Parallel")
-    if (!$Tests) { $build += @('--target', 'FreeClimb'); if ($AuthoringTools) { $build += 'FreeClimbAuthoring' } }
+    if (!$Tests) { $build += @('--target', 'FreeClimb'); if ($AuthoringTools) { $build += @('FreeClimbAuthoring', 'FreeClimbHKXConverter', 'FreeClimbConverter') } }
     Run-Checked 'cmake' $build
     if ($Tests) { Run-Checked 'ctest' @('--test-dir', $output, '-C', $Configuration, '--output-on-failure') }
     Write-Output "Built $output\$Configuration\FreeClimb.dll"

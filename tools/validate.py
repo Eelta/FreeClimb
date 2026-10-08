@@ -182,7 +182,8 @@ def validate_animation_pack(root, manifest):
         require(path.relative_to(root).as_posix() in manifest['files'], f'Unlisted animation input: {name}')
         return path
     def format_check(value, expected):
-        require(isinstance(value, dict) and value.get('format') == expected and value.get('version') == 1, f'Invalid {expected} document')
+        versions = (1, 2) if expected == 'FreeClimbActionGroup' else (1,)
+        require(isinstance(value, dict) and value.get('format') == expected and value.get('version') in versions, f'Invalid {expected} document')
     def numeric(value):
         return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
     pack = read_json(directory / 'pack.json')
@@ -199,17 +200,105 @@ def validate_animation_pack(root, manifest):
         require(abs(sum(v*v for v in bone['q']) - 1) < .002, 'Invalid skeleton quaternion')
     slot_source = (package.ROOT / 'src/MotionSlots.h').read_text(encoding='utf-8')
     slots = re.findall(r'"([A-Za-z]+)"', slot_source.split('motionSlotNames', 1)[1])
-    require(len(slots) == 35 and len(set(slots)) == 35, 'Invalid canonical motion-slot source')
+    require(len(slots) == 31 and len(set(slots)) == 31, 'Invalid canonical motion-slot source')
     motions = pack['motions']
-    require(len(motions) == 35 and {item['slot'] for item in motions} == set(slots), 'Pack must assign all 35 active slots exactly once')
+    require(len(motions) == 31 and {item['slot'] for item in motions} == set(slots), 'Pack must assign all 31 active slots exactly once')
     seen = {directory / 'pack.json', relative(pack['skeleton'], '.json')}
+    directions = {'runUp', 'runLeft', 'runRight', 'runDiagonalLeft', 'runDiagonalRight'}
+    owners = {name: name for name in directions}
+    owners.update(runLaunch='runUp', runCatch='runUp', runLaunchLeft='runLeft', runLaunchRight='runRight', sideBrace='runLeft')
+    contextual = {'contextHopLeft', 'contextHopRight'}
+    owners.update(contextHang='contextHopLeft', contextHopLeft='contextHopLeft', contextHopRight='contextHopRight')
+    group_documents = {}
+    def timeline_range(clip):
+        frames = clip.get('frameRange')
+        require(isinstance(frames, list) and len(frames) == 2 and all(type(v) is int for v in frames)
+                and 0 <= frames[0] < frames[1] <= 1200, 'Invalid timeline frame range')
+        shift = clip.get('rootShift', [0, 0, 0])
+        require(isinstance(shift, list) and len(shift) == 3 and all(numeric(v) and abs(v) <= 10000 for v in shift), 'Invalid timeline Root shift')
+        return frames
+    def private_references(value, owner_file):
+        if isinstance(value, dict):
+            if value.get('format') == 'FreeClimbClip':
+                format_check(value, 'FreeClimbClip')
+                require(value.get('file') == owner_file, 'Action stages and references must use their own HKX file')
+            references = value.get('references')
+            if references is not None:
+                require(isinstance(references, dict) and 0 < len(references) <= 5
+                        and set(references) <= {'launchApproach', 'kickTakeoff', 'kickLanding', 'kickRunLanding', 'kickRunBrace'}, 'Invalid private action references')
+                require(all(isinstance(reference, dict) and reference.get('format') == 'FreeClimbClip'
+                            and isinstance(reference.get('member'), str) and reference['member']
+                            for reference in references.values()), 'Private references require named HKX members')
+            for child in value.values():
+                private_references(child, owner_file)
+        elif isinstance(value, list):
+            for child in value:
+                private_references(child, owner_file)
     for item in motions:
         config_path = relative(item['config'], '.json')
-        config = read_json(config_path)
+        owner = owners.get(item['slot'])
+        if owner:
+            group = owner
+            require(item['config'] == f'configs/{group}.json', 'Grouped slot must use its complete direction config')
+            if group not in group_documents:
+                document = read_json(config_path)
+                format_check(document, 'FreeClimbActionGroup')
+                clips = document.get('clips')
+                hop = owner in contextual
+                launch = 'contextHang' if hop else 'runLaunch' if owner == 'runUp' else 'runLaunchLeft' if owner.endswith('Left') else 'runLaunchRight'
+                expected = {owner, launch} if hop else {owner, launch, 'runCatch'}
+                if owner == 'runLeft':
+                    expected.add('sideBrace')
+                require(document.get('group') == ('contextHop' if hop else 'wallRun') and isinstance(clips, list) and len(clips) == len(expected), 'Invalid direction action group')
+                require(all(isinstance(clip, dict) for clip in clips) and {clip.get('slot') for clip in clips} == expected, 'Action group must contain each stage exactly once')
+                group_documents[group] = {clip['slot']: clip for clip in clips}
+                require(document['version'] == 2 and document.get('direction') == owner, 'Invalid independent action direction')
+                sequences = document.get('sequences')
+                require(isinstance(sequences, list) and len(sequences) == 1 and isinstance(sequences[0], dict)
+                        and sequences[0].get('slot') == owner, 'Independent action requires its own timeline')
+                cycle = group_documents[group][owner]
+                require(cycle.get('member') == owner, 'Grouped slot must select its matching animation member')
+                loop = timeline_range(cycle)
+                ranges = []
+                roles = (('prepare', 'contextHang'), ('catch', 'contextHang')) if hop else (('launch', launch), ('catch', 'runCatch'))
+                for role, slot in roles:
+                    clip = sequences[0].get(role)
+                    format_check(clip, 'FreeClimbClip')
+                    require(hop and role == 'catch' or clip == group_documents[group][slot], 'Direction stages must match their timeline entries')
+                    require(clip.get('slot') == slot and clip.get('file') == f'{owner}.hkx'
+                            and clip.get('member') == owner, 'Grouped slot must select its matching animation member')
+                    ranges.append(timeline_range(clip))
+                require(ranges[0][1] <= loop[0] and loop[1] <= ranges[1][0], 'Action ranges must follow start, main, end order')
+                if not hop and owner != 'runUp':
+                    brace = sequences[0].get('brace')
+                    format_check(brace, 'FreeClimbClip')
+                    require(brace.get('slot') == 'sideBrace' and brace.get('file') == f'{owner}.hkx'
+                            and brace.get('member') == owner + 'Brace', 'Wall-run brace must be private to its direction')
+                    if owner == 'runLeft':
+                        require(brace == group_documents[group]['sideBrace'], 'Canonical brace must match its direction reference')
+                private_references(document, f'{owner}.hkx')
+                if owner == 'runUp':
+                    require(set(group_documents[group]['runLaunch'].get('references', {})) == {'launchApproach'}, 'Run entry requires its own approach reference')
+            config = group_documents[group][item['slot']]
+        else:
+            require(config_path not in seen, 'Independent slots must have independent configs')
+            config = read_json(config_path)
         format_check(config, 'FreeClimbClip')
         require(config['slot'] == item['slot'], 'Clip metadata slot mismatch')
         hkx_path = relative(config['file'], '.hkx')
-        require(config_path not in seen and hkx_path not in seen, 'Each default slot must have independent config and HKX files')
+        if owner:
+            member = owner + 'Brace' if item['slot'] == 'sideBrace' else owner
+            if item['slot'] != 'sideBrace':
+                timeline_range(config)
+            require(config['file'] == f'{owner}.hkx' and config.get('member') == member, 'Grouped slot must select its matching animation member')
+        else:
+            require(hkx_path not in seen and config.get('member', item['slot']) == item['slot'], 'Other default slots must have independent HKX files')
+            private_references(config, config['file'])
+            if item['slot'] in ('kickUp', 'kickLeft', 'kickRight'):
+                expected_references = {'kickLanding', 'kickRunLanding', 'kickRunBrace'}
+                if item['slot'] != 'kickUp':
+                    expected_references.add('kickTakeoff')
+                require(set(config.get('references', {})) == expected_references, 'Kick action requires its own takeoff and landing references')
         seen.update((config_path, hkx_path))
         blob = hkx_path.read_bytes()
         require(len(blob) >= 208 and blob[:8] == bytes.fromhex('57e0e05710c0c010') and b'hk_2010.2.0-r1' in blob[:64], 'Invalid Skyrim SE HKX header')
@@ -222,7 +311,7 @@ def validate_animation_pack(root, manifest):
         if item['slot'] == 'contextMantle':
             require({'releaseHands', 'unplant', 'replant', 'replantSamplePhase'} <= config.keys(), 'Missing contextual mantle profile')
     require({p.relative_to(root).as_posix() for p in seen} == set(manifest['files']), 'Pack references do not exactly cover the default manifest')
-    return {'clips': 35, 'bones': 99, 'pack_files': len(seen), 'pack_name': pack.get('name', ''), 'format': manifest.get('format')}
+    return {'clips': 31, 'bones': 99, 'pack_files': len(seen), 'pack_name': pack.get('name', ''), 'format': manifest.get('format')}
 
 
 def main():

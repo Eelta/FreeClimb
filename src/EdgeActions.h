@@ -3,10 +3,10 @@
     bool capturedHangFeetSupported(World& w,Vec origin,const GripEdge& edge) const {
         const float scale=std::clamp(cfg.contextScale,.5f,2.f);
         const Vec right{-normal.y,normal.x,0};
-        for(const auto calibrated:cfg.threepeatHangToes) {
+        for(const auto calibrated:contextHangToes()) {
             if(!calibrated.finite()||calibrated.z<10||calibrated.z>100)return false;
             const Vec toe=origin+(right*calibrated.x-normal*(calibrated.y+
-                cfg.gap/scale+(edge.wallPatch?-capturedWallPalmOffset:gripEdgeDetail::palmInset)-cfg.threepeatHangForward)+Vec{0,0,calibrated.z})*scale;
+                cfg.gap/scale+(edge.wallPatch?-capturedWallPalmOffset:gripEdgeDetail::palmInset)-contextHangForward())+Vec{0,0,calibrated.z})*scale;
             for(const auto offset:{Vec{},right*(2*scale),right*(-2*scale),Vec{0,0,2*scale},Vec{0,0,-2*scale}}) {
                 const Vec from=toe+offset;
                 const auto hit=w.ray(from+normal*(14*scale),from-normal*(20*scale));
@@ -18,7 +18,7 @@
     }
     bool idle39FeetSupported(World& w,Vec origin,const GripEdge& edge) const {
 
-        const auto a=cfg.threepeatHangToes[0],b=cfg.threepeatHangToes[1];
+        const auto a=contextHangToes()[0],b=contextHangToes()[1];
         const bool geometryOnly=a.x==0&&a.y==0&&a.z==0&&b.x==0&&b.y==0&&b.z==0;
         return geometryOnly?edgeFeetSupported(w,origin,edge.normal):
             capturedHangFeetSupported(w,origin,edge);
@@ -40,8 +40,8 @@
             }
         } w(world);
         const float scale=std::clamp(cfg.contextScale,.5f,2.f);
-        const float height=cfg.threepeatHangHeight*scale;
-        const float halfSpan=cfg.threepeatHandHalfWidth*scale;
+        const float height=contextHangHeight(motion)*scale;
+        const float halfSpan=contextHangHalfWidth(motion)*scale;
         const Vec right{-normal.y,normal.x,0};
         const float distance=cfg.threepeatHopDistance[direction.x<0?0:1]*scale;
         const Vec destination=position+right*(direction.x<0?-distance:distance)+Vec{0,0,capturedSideRise(direction,distance,scale)};
@@ -165,6 +165,7 @@
         return foot&&foot->climbable&&foot->normal.unit().dot(facing)>.95f;
     }
     bool edgeRouteClear(World& w,Motion motion,Vec from,Vec to) {
+        if(authoredPath(motion))return checkedHop(w,from,to,cfg.hopOut,motion);
         if(threepeatHop(motion)) {
             Vec previous=from;
             for(int sample=1;sample<=32;++sample) {
@@ -174,7 +175,7 @@
             }
             return true;
         }
-        return checkedHop(w,from,to,cfg.hopOut);
+        return checkedHop(w,from,to,cfg.hopOut,motion);
     }
     void commitEdgeAction(const EdgePreparation& plan) {
 
@@ -202,8 +203,8 @@
             motion=motion==Motion::hopLeft?Motion::contextHopLeft:Motion::contextHopRight;
         }
         const float scale=std::clamp(cfg.contextScale,.5f,2.f);
-        const float handHeight=(candidateThreepeat?cfg.threepeatHangHeight:138.12f)*scale;
-        const float halfWidth=(candidateThreepeat?cfg.threepeatHandHalfWidth:25.14f)*scale;
+        const float handHeight=(candidateThreepeat?contextHangHeight(motion):138.12f)*scale;
+        const float halfWidth=(candidateThreepeat?contextHangHalfWidth(motion):25.14f)*scale;
         const bool sideways=legacySide||threepeatHop(motion);
 
         if(direction.length()<.1f)direction=motion==Motion::hopLeft?Vec{-1,0,0}:motion==Motion::hopRight?Vec{1,0,0}:Vec{0,1,0};
@@ -300,10 +301,10 @@
             Result result;result.motion=stableMotion;result.staminaCost=cfg.drain*dt;return result;
         }
         if(!edgeFeetSupported(w,position,edgePreparation.source.normal)) {cancel(5);return {};}
-        moveDirection={};stableMotion=threepeatHop(edgePreparation.motion)?Motion::contextHang:Motion::hang;edgePreparation.status=8;
+        moveDirection={};stableMotion=threepeatHop(edgePreparation.motion)&&!authored(edgePreparation.motion)?Motion::contextHang:Motion::hang;edgePreparation.status=8;
         if(threepeatHop(edgePreparation.motion))threepeatPlanStatus=8;
         edgePreparation.settle+=dt;
-        if(edgePreparation.settle<(threepeatHop(edgePreparation.motion)?.26f:.20f)) {
+        if(edgePreparation.settle<(authored(edgePreparation.motion)?0.f:threepeatHop(edgePreparation.motion)?.26f:.20f)) {
             Result result;result.motion=stableMotion;return result;
         }
 

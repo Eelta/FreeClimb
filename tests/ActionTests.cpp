@@ -81,10 +81,10 @@ static void normalClimbingJumps() {
         const float dt=1.f/fps;Input moving{direction.x,direction.y};Result r;
         for(int frame=0;frame<fps;++frame)r=t.update(wall,moving,dt,100);
         const auto start=t.position;auto launch=moving;launch.hop=true;r=t.update(wall,launch,dt,100);
-        check(t.state==State::action&&hopMotion(r.motion)&&!flipMotion(r.motion)&&!t.runningAction(),
+        check(t.state==State::action&&(r.motion==Motion::hopUp||r.motion==Motion::hopLeft||r.motion==Motion::hopRight)&&!t.runningAction(),
             "ordinary climbing retains its checked directional hop after running jumps are removed");
         const Motion action=r.motion;const float duration=t.actionDuration();
-        check(duration>=.50f&&duration<=.55f&&duration==jumpActionSeconds(false,false),
+        check(duration>=.50f&&duration<=.55f&&duration==jumpActionSeconds(false),
             "ordinary hop retains its independent half-second playback window");
         float elapsed=0,cost=r.staminaCost,maxOutward=0;
         while(t.state==State::action&&elapsed<1.f) {
@@ -278,10 +278,12 @@ static void checkedBackFlipExit() {
             "S+Space cancels an airborne action through the short push without attempting another flip takeoff");
     }
 }
+#include "ManualHopTests.h"
 int main(int argc,char**argv) {
  try {
     check(argc==2,"motion path");Library lib;check(lib.load(argv[1]),"FCM4 input");
     normalClimbingJumps();intermediateHopObstacle();continuousBackPush();checkedBackFlipExit();
+    repeatedManualHops(lib);repeatedHopSafety();manualHopAfterContext(lib);
     {
         Mountain mountain;Traversal t;t.cfg.approachSeconds=0;t.cfg.radius=31;t.cfg.gap=37;t.cfg.height=138;
         check(t.attach(mountain,mountain.origin+Vec{0,-45,0},{0,1,0},100),"mountain base attach");

@@ -13,6 +13,7 @@ class PoseHealth {
     bool seen{};
 public:
     void reset(){last=0;silence=0;seen=false;}
+    void resume(std::uint32_t count){last=count;silence=.13f;}
     void sample(std::uint32_t count,float dt) {
         if(count!=last){seen=true;silence=0;last=count;}
         else if(std::isfinite(dt)&&dt>0)silence+=std::clamp(dt,0.f,.05f);
@@ -23,3 +24,4 @@ public:
     float stale()const{return silence;}
 };
 }
+

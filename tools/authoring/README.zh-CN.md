@@ -2,6 +2,8 @@
 
 [English](README.md) | 简体中文
 
+需要在一个窗口里导入、预览和调整 HKX，请使用[动作工具](../converter/README.zh-CN.md)。下方配置助手是可选工具，不是该流程的必需步骤。
+
 为已适配 FreeClimb 的 HKX 制作单动作覆盖包。可以保留原接触曲线，也可以用“哪只手脚、何时开始支撑、何时松开”生成曲线。
 
 ## 启动
@@ -17,7 +19,7 @@
 3. 选择保留模板接触，或逐条添加四肢支撑区间。可选的 `stride`、`height`、`travel X/Y/Z` 留空即保留原值。
 4. 选择基础包目录以外的 ZIP 位置，点击“校验并导出 MO2 覆盖包”。校验通过才写入 ZIP；失败不替换已有 ZIP。
 
-ZIP 只包含所选槽的 HKX 和 JSON，路径从 `meshes/actors/character/animations/FreeClimb/` 开始。将其作为独立模组安装到 MO2，放在完整 FreeClimb 之后覆盖。仍须保留基础包，其余 34 个动作、骨架和清单由基础包提供。脱墙后在游戏菜单安全重载，再检查进入、循环、停止、切换和退出。
+ZIP 包含一个 HKX 和配套动作 JSON，路径从 `meshes/actors/character/animations/FreeClimb/` 开始。墙跑和情境侧跃仅导出当前方向，包含自己的过渡和所需参考。左右包可以一起安装，互不覆盖。旧 `contextHop` 共享覆盖包需用新版动作工具重新导出。安装到 MO2 的完整 FreeClimb 之后，保持基础包启用；离墙后安全重载，检查进入、移动、停止、切换和退出。
 
 ## 怎样标记接触
 
@@ -29,7 +31,7 @@ ZIP 只包含所选槽的 HKX 和 JSON，路径从 `meshes/actors/character/anim
 
 ## 特殊动作与高级配置
 
-`contextHang` 的首帧手脚位置参与侧跃标定。`contextHopLeft/Right` 的 `path`、`sourceHands`、`targetHands`、`verticalBlend`，以及 `contextMantle` 的 `unplant`、`replant`、`releaseHands`、`replantSamplePhase`，需要和新动画匹配。
+每个情境侧跃都保留自己的内部 `contextHang` 准备和收尾，手脚位置仅标定当前方向。基础片段中，`contextHopLeft/Right` 的 `path`、`sourceHands`、`targetHands`、`verticalBlend`，以及 `contextMantle` 的 `unplant`、`replant`、`releaseHands`、`replantSamplePhase`，需要和动画匹配。导入完整动作时，动作工具会自动生成配置，无需另外替换辅助片段。
 
 这些字段默认完整保留，并在“高级配置与特殊动作”页展示。需要修改时勾选高级 JSON；不能改变 `slot` 或 `file`。基本参数输入会覆盖对应 JSON 字段，手工接触模式会覆盖 `contacts`。所有高级修改同样必须通过完整原生校验。仅修改四肢接触标记不会自动改动专用抓放窗口或路径。
 

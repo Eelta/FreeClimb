@@ -147,7 +147,8 @@ public:
     void update(const Library& library,const Traversal& traversal,const Result& result,float phase,float dt,bool outputReady) {
         if(!enabled||!installed||volume<=0){timing.reset();return;}
         const auto cues=timing.update(result.motion,phase,traversal.position,
-            library.contactWeights(result.motion,phase),dt,outputReady,result.completed);
+            library.contactWeights(result.motion,phase,traversal.poseDirection(result.motion),
+                result.motion==Motion::contextHang&&traversal.holdsDestinationEdge(result.motion)),dt,outputReady,result.completed);
         for(unsigned i=0;i<cues.count;++i) {
             const auto cue=cues.items[i];
             const float height=cue.cue==SoundCue::grip?traversal.cfg.grip:cue.cue==SoundCue::push?30.f:12.f;

@@ -17,11 +17,11 @@ class TraversalCapture {
 public:
     static constexpr std::size_t capacity=8192;
     static constexpr std::size_t maxTextBytes=4*1024*1024;
-    static constexpr std::string_view coreVersion="active35-6";
-    enum class Kind {ray,body};
+    static constexpr std::string_view coreVersion="active31-4";
+    enum class Kind {ray,body,bodyPath};
     struct Call {
         Kind kind=Kind::ray;
-        Vec from{},to{},outward{};
+        Vec from{},to{},outward{},midpoint{};
         Hit hit{};
         Motion motion=Motion::none;
         float fromPhase{},toPhase{};
@@ -105,7 +105,12 @@ private:
         }
         void operator()(Vec& value){(*this)(value.x);(*this)(value.y);(*this)(value.z);}
     };
-    template<class Visitor> static void fields(Visitor& v,Traversal& t) {
+    template<class Visitor> static void authoredFields(Visitor& v,AuthoredMotion& motion) {
+        v(motion.enabled);v(motion.seconds);v(motion.stride);v(motion.trajectory.count);
+        for(auto& knot:motion.trajectory.knots){v(knot.phase);v(knot.displacement);}
+        for(auto& sample:motion.contacts)for(auto& value:sample)v(value);
+    }
+    template<class Visitor> static void fields(Visitor& v,Traversal& t,bool wallRunSetting=true,bool legacyArc=false,bool wallRunSequences=true,bool mantleRoutes=true,bool contextSequences=true) {
         auto& s=t.cfg;
         v(s.reach);v(s.gap);v(s.radius);v(s.height);v(s.chest);v(s.grip);
         v(s.climbSpeed);v(s.sideSpeed);v(s.downSpeed);v(s.maxNormalZ);
@@ -122,8 +127,13 @@ private:
         v(t.actionFrom);v(t.actionTo);v(t.actionTime);v(t.actionSeconds);v(t.actionCooldown);v(t.stalled);
         v(t.clearanceMargin);v(t.runBlend);v(t.diagonalRunBlend);v(t.hopDistance);v(t.actionMotion);v(t.entryMotion);v(t.stableMotion);
         v(t.running);v(t.jumpEntry);v(t.detour);v(t.actionBeganRunning);
+        v(t.authoredActionChecked);v(t.authoredActionRejected);v(t.authoredBackFlipPrechecked);v(t.entryPose);
         v(t.actionDirection);v(t.actionLandingNormal);v(t.missingSurface);v(t.runClearanceCooldown);
-        v(t.moveDirection);v(t.detourOut);v(t.detourOver);v(t.detourProbe);v(t.flipArc);
+        v(t.moveDirection);v(t.detourOut);v(t.detourOver);v(t.detourProbe);
+        if(legacyArc) {
+            bool retiredArc{};v(retiredArc);
+            if(retiredArc)throw std::runtime_error("retired motion arc is not replayable");
+        }
         v(t.roofTransfer);v(t.actionStartSurface);v(t.actionTargetSurface);v(t.roofProbeCooldown);
         v(t.mantleCrest);
         v(s.contextActions);v(s.contextScale);v(t.edgeAction);v(t.edgeSettled);v(t.edgeProbeCooldown);
@@ -165,6 +175,53 @@ private:
         for(auto& hand:profile.mantleRelease)for(auto& edge:hand)v(edge);
         for(auto& edge:profile.mantleUnplant)v(edge);for(auto& edge:profile.mantleReplant)v(edge);
         v(profile.replantSamplePhase);for(auto& side:profile.rise)for(auto& edge:side)v(edge);
+        v(s.authoredMantle);v(s.authoredMantleTrajectory.count);
+        for(auto& knot:s.authoredMantleTrajectory.knots){v(knot.phase);v(knot.displacement);}
+        for(auto& sample:s.authoredMantleContacts)for(auto& value:sample)v(value);
+        bool authored=bool(s.authoredMotions);v(authored);
+        if(authored) {
+            auto data=std::make_shared<std::array<AuthoredMotion,42>>();
+            if constexpr(std::is_same_v<Visitor,Writer>)*data=*s.authoredMotions;
+            for(auto& motion:*data)authoredFields(v,motion);
+            if constexpr(std::is_same_v<Visitor,Reader>)s.authoredMotions=std::move(data);
+        } else if constexpr(std::is_same_v<Visitor,Reader>)s.authoredMotions.reset();
+        if(wallRunSetting)v(s.wallRunEnabled);
+        else if constexpr(std::is_same_v<Visitor,Reader>)s.wallRunEnabled=true;
+        if(wallRunSequences) {
+            v(t.actionWallRunDirection);bool present=bool(s.authoredWallRunSequences);v(present);
+            if(present) {
+                auto data=std::make_shared<AuthoredWallRunSequences>();
+                if constexpr(std::is_same_v<Visitor,Writer>)*data=*s.authoredWallRunSequences;
+                for(auto& valid:data->valid)v(valid);
+                for(auto& motion:data->launches)authoredFields(v,motion);
+                for(auto& motion:data->catches)authoredFields(v,motion);
+                if constexpr(std::is_same_v<Visitor,Reader>)s.authoredWallRunSequences=std::move(data);
+            } else if constexpr(std::is_same_v<Visitor,Reader>)s.authoredWallRunSequences.reset();
+        } else if constexpr(std::is_same_v<Visitor,Reader>) {
+            t.actionWallRunDirection=Motion::none;s.authoredWallRunSequences.reset();
+        }
+        if(mantleRoutes) {
+            v(t.mantleRoute.count);
+            for(auto& knot:t.mantleRoute.knots){v(knot.phase);v(knot.displacement);}
+        } else if constexpr(std::is_same_v<Visitor,Reader>)t.mantleRoute={};
+        if(contextSequences) {
+            bool present=bool(s.contextHopReferences);v(present);
+            if(present) {
+                auto data=std::make_shared<std::array<ContextHopReference,2>>();
+                if constexpr(std::is_same_v<Visitor,Writer>)*data=*s.contextHopReferences;
+                for(auto& reference:*data) {
+                    v(reference.valid);v(reference.height);v(reference.halfWidth);v(reference.forward);
+                    for(auto& toe:reference.toes)v(toe);
+                    authoredFields(v,reference.preparation);authoredFields(v,reference.recovery);
+                }
+                if constexpr(std::is_same_v<Visitor,Reader>)s.contextHopReferences=std::move(data);
+            } else if constexpr(std::is_same_v<Visitor,Reader>)s.contextHopReferences.reset();
+        } else if constexpr(std::is_same_v<Visitor,Reader>)s.contextHopReferences.reset();
+        if(contextSequences&&s.authoredWallRunSequences) {
+            auto data=std::make_shared<AuthoredWallRunSequences>(*s.authoredWallRunSequences);
+            for(auto& motion:data->braces)authoredFields(v,motion);
+            if constexpr(std::is_same_v<Visitor,Reader>)s.authoredWallRunSequences=std::move(data);
+        }
     }
     template<class Visitor> static void inputFields(Visitor& v,Input& input) {
         v(input.x);v(input.y);v(input.release);v(input.mantle);v(input.hop);v(input.backDrop);v(input.run);v(input.modeBlend);
@@ -185,9 +242,39 @@ private:
         out<<label;auto value=snapshot.value;Writer writer{out};fields(writer,value);
         out<<' '<<std::quoted(snapshot.blocked.data())<<' '<<std::quoted(snapshot.ledge.data())<<'\n';
     }
-    static void readSnapshot(std::istream& in,std::string_view label,Snapshot& snapshot) {
-        token(in,label);Reader reader{in};fields(reader,snapshot.value);
+    static void readSnapshot(std::istream& in,std::string_view label,Snapshot& snapshot,bool wallRunSetting,bool legacyArc,bool wallRunSequences,bool mantleRoutes,bool contextSequences) {
+        token(in,label);Reader reader{in};fields(reader,snapshot.value,wallRunSetting,legacyArc,wallRunSequences,mantleRoutes,contextSequences);
         if(!validThreepeatProfile(snapshot.value.cfg.threepeatProfile))throw std::runtime_error("invalid animation profile");
+        const auto& settings=snapshot.value.cfg;
+        if(!settings.authoredMantleTrajectory.valid()||!snapshot.value.mantleRoute.valid())
+            throw std::runtime_error("invalid authored trajectory");
+        for(const auto& sample:settings.authoredMantleContacts)for(float value:sample)
+            if(!std::isfinite(value)||value<0||value>1)throw std::runtime_error("invalid authored support weights");
+        if(settings.authoredMotions)for(std::size_t index=0;index<settings.authoredMotions->size();++index) {
+            const auto& motion=(*settings.authoredMotions)[index];
+            if(motion.enabled&&!isActiveMotion(Motion(index+1)))throw std::runtime_error("retired authored motion is not replayable");
+            if(!motion.trajectory.valid()||(motion.enabled&&(motion.seconds<=0||motion.stride<0||motion.stride>500)))throw std::runtime_error("invalid authored motion");
+            for(const auto& sample:motion.contacts)for(float value:sample)
+                if(!std::isfinite(value)||value<0||value>1)throw std::runtime_error("invalid authored motion contacts");
+        }
+        if(snapshot.value.actionWallRunDirection!=Motion::none&&!runMotion(snapshot.value.actionWallRunDirection))
+            throw std::runtime_error("invalid wall-run action direction");
+        if(settings.contextHopReferences)for(const auto& reference:*settings.contextHopReferences) {
+            if(reference.valid&&(reference.height<=90||reference.height>=175||reference.halfWidth<=8||reference.halfWidth>=40||
+                std::abs(reference.forward)>500||!reference.toes[0].finite()||!reference.toes[1].finite()))
+                throw std::runtime_error("invalid side-hop reference geometry");
+            for(const auto* motion:{&reference.preparation,&reference.recovery}) {
+                if(!motion->trajectory.valid()||(reference.valid&&motion->seconds<=0))throw std::runtime_error("invalid side-hop reference motion");
+                for(const auto& sample:motion->contacts)for(float value:sample)if(value<0||value>1)throw std::runtime_error("invalid side-hop reference contacts");
+            }
+        }
+        if(settings.authoredWallRunSequences)for(const auto* group:{&settings.authoredWallRunSequences->launches,&settings.authoredWallRunSequences->catches,&settings.authoredWallRunSequences->braces})
+            for(const auto& motion:*group) {
+                if(!motion.trajectory.valid()||(motion.enabled&&(motion.seconds<=0||motion.stride<0||motion.stride>500)))
+                    throw std::runtime_error("invalid wall-run authored motion");
+                for(const auto& sample:motion.contacts)for(float value:sample)
+                    if(value<0||value>1)throw std::runtime_error("invalid wall-run authored contacts");
+            }
         text(in,snapshot.blocked);text(in,snapshot.ledge);snapshot.bindReasons();
     }
     static std::string snapshotText(const Traversal& traversal) {
@@ -225,6 +312,11 @@ public:
             call.kind=Kind::body;call.motion=motion;call.from=from;call.to=to;call.fromPhase=a;call.toPhase=b;call.outward=outward;call.answer=result;
             capture.record(call);return result;
         }
+        bool actionBodyPathClear(Motion motion,Vec from,Vec to,float a,float b,Vec outward,Vec midpoint)override {
+            const bool result=source.actionBodyPathClear(motion,from,to,a,b,outward,midpoint);Call call;
+            call.kind=Kind::bodyPath;call.motion=motion;call.from=from;call.to=to;call.fromPhase=a;call.toPhase=b;call.outward=outward;call.midpoint=midpoint;call.answer=result;
+            capture.record(call);return result;
+        }
     };
     std::string serialize()const {
         if(!begun_||!finished_)return {};
@@ -234,9 +326,9 @@ public:
         writeSnapshot(out,"BEFORE",before_);writeSnapshot(out,"AFTER",after_);
         out<<"RESULT";auto result=result_;resultFields(writer,result);out<<' '<<std::quoted(resultReason_.data())<<'\n';
         for(std::size_t i=0;i<count_;++i) {
-            auto call=calls_[i];out<<(call.kind==Kind::ray?"R":"B");writer(call.from);writer(call.to);
+            auto call=calls_[i];out<<(call.kind==Kind::ray?"R":call.kind==Kind::body?"B":"P");writer(call.from);writer(call.to);
             if(call.kind==Kind::ray){writer(call.hasHit);if(call.hasHit){writer(call.hit.point);writer(call.hit.normal);writer(call.hit.climbable);}}
-            else {writer(call.motion);writer(call.fromPhase);writer(call.toPhase);writer(call.outward);writer(call.answer);}
+            else {writer(call.motion);writer(call.fromPhase);writer(call.toPhase);writer(call.outward);if(call.kind==Kind::bodyPath)writer(call.midpoint);writer(call.answer);}
             out<<'\n';
         }
         out<<"FCGEO_END\n";return out.str();
@@ -251,17 +343,21 @@ public:
             if(end+9<data.size()&&data[end+9]!='\r'&&data[end+9]!='\n')throw std::runtime_error("invalid capture end marker");
             std::istringstream in(std::string(data.substr(begin,end-begin+9)));in.imbue(std::locale::classic());
             token(in,"FCGEO_BEGIN");int schema{};std::string version;
-            if(!(in>>schema>>version)||schema!=1||version!=coreVersion)throw std::runtime_error("unsupported capture/Core version");
+            if(!(in>>schema>>version)||schema!=1||(version!=coreVersion&&version!="active31-3"&&version!="active31-2"&&version!="active31-1"&&version!="active35-9"&&version!="active35-10"))throw std::runtime_error("unsupported capture/Core version");
             token(in,"META");bool markedComplete{};Reader reader{in};reader(count_);reader(observed_);reader(markedComplete);
             if(count_>capacity||observed_<count_||markedComplete!=(count_==observed_))throw std::runtime_error("invalid call count");
             token(in,"INPUT");inputFields(reader,input_);reader(dt_);reader(stamina_);
-            readSnapshot(in,"BEFORE",before_);readSnapshot(in,"AFTER",after_);
+            const bool legacyArc=version=="active35-9"||version=="active35-10";
+            const bool sequences=version==coreVersion||version=="active31-3"||version=="active31-2";
+            const bool routes=version==coreVersion||version=="active31-3";
+            readSnapshot(in,"BEFORE",before_,version!="active35-9",legacyArc,sequences,routes,version==coreVersion);
+            readSnapshot(in,"AFTER",after_,version!="active35-9",legacyArc,sequences,routes,version==coreVersion);
             token(in,"RESULT");resultFields(reader,result_);text(in,resultReason_);result_.reason=resultReason_.data();
             for(std::size_t i=0;i<count_;++i) {
-                auto& call=calls_[i];call=Call{};std::string type;if(!(in>>type)||(type!="R"&&type!="B"))throw std::runtime_error("unknown World call");
+                auto& call=calls_[i];call=Call{};std::string type;if(!(in>>type)||(type!="R"&&type!="B"&&type!="P"))throw std::runtime_error("unknown World call");
                 reader(call.from);reader(call.to);
                 if(type=="R"){reader(call.hasHit);if(call.hasHit){reader(call.hit.point);reader(call.hit.normal);reader(call.hit.climbable);}}
-                else {call.kind=Kind::body;reader(call.motion);reader(call.fromPhase);reader(call.toPhase);reader(call.outward);reader(call.answer);}
+                else {call.kind=type=="P"?Kind::bodyPath:Kind::body;reader(call.motion);reader(call.fromPhase);reader(call.toPhase);reader(call.outward);if(call.kind==Kind::bodyPath)reader(call.midpoint);reader(call.answer);}
             }
             token(in,"FCGEO_END");begun_=finished_=true;return true;
         }catch(const std::exception& e){error=e.what();begun_=finished_=false;return false;}
@@ -285,6 +381,12 @@ public:
             const auto& call=next(Kind::body,from,to);
             if(call.motion!=motion||call.fromPhase!=a||call.toPhase!=b||!same(call.outward,outward))
                 throw std::runtime_error("body query mismatch at call "+std::to_string(index-1));
+            return call.answer;
+        }
+        bool actionBodyPathClear(Motion motion,Vec from,Vec to,float a,float b,Vec outward,Vec midpoint)override {
+            const auto& call=next(Kind::bodyPath,from,to);
+            if(call.motion!=motion||call.fromPhase!=a||call.toPhase!=b||!same(call.outward,outward)||!same(call.midpoint,midpoint))
+                throw std::runtime_error("body path query mismatch at call "+std::to_string(index-1));
             return call.answer;
         }
     };

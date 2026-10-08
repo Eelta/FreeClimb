@@ -230,11 +230,11 @@ $manifest = Read-Map $manifestPath
 $dependencyLock = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'dependencies.json') -Raw | ConvertFrom-Json
 $animationLock = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'animation-runtime.json') -Raw | ConvertFrom-Json
 $animationFiles = @($animationLock.files.PSObject.Properties)
-if ($animationLock.schema -ne 2 -or $animationLock.version -ne $releaseVersion -or $animationLock.motions -ne 35 -or $animationLock.skeletonBones -ne 99 -or $animationFiles.Count -ne 72) { throw 'Invalid animation pack manifest' }
+if ($animationLock.schema -ne 2 -or $animationLock.version -ne $releaseVersion -or $animationLock.motions -ne 31 -or $animationLock.skeletonBones -ne 99 -or $animationFiles.Count -ne 52) { throw 'Invalid animation pack manifest' }
 foreach ($entry in $animationFiles) {
     if ($entry.Name -notmatch '^meshes/actors/character/animations/FreeClimb/(?:configs/)?[A-Za-z]+\.(?:json|hkx)$' -or $entry.Value -notmatch '^[0-9a-f]{64}$') { throw "Unsafe animation manifest entry: $($entry.Name)" }
 }
-if (@($animationFiles | Where-Object Name -Like '*.hkx').Count -ne 35 -or @($animationFiles | Where-Object Name -Like '*/configs/*.json').Count -ne 35) { throw 'Missing independent HKX clips or clip configurations' }
+if (@($animationFiles | Where-Object Name -Like '*.hkx').Count -ne 25 -or @($animationFiles | Where-Object Name -Like '*/configs/*.json').Count -ne 25 -or 'meshes/actors/character/animations/FreeClimb/runUp.hkx' -notin $animationFiles.Name -or 'meshes/actors/character/animations/FreeClimb/contextHopLeft.hkx' -notin $animationFiles.Name -or 'meshes/actors/character/animations/FreeClimb/contextHopRight.hkx' -notin $animationFiles.Name) { throw 'Missing grouped HKX files or clip configurations' }
 $translationFiles = @('Interface/Translations/FreeClimb_english.txt', 'Interface/Translations/FreeClimb_chinese.txt')
 $baselineFiles = @($dependencyLock.runtime_baseline.PSObject.Properties | Where-Object { $_.Name -notin $publication.excluded_runtime_files })
 $allowed = @($baselineFiles.Name) + @($animationFiles.Name) + @('SKSE/Plugins/FreeClimb.dll', 'SKSE/Plugins/FreeClimb.ini') + $translationFiles
@@ -255,7 +255,7 @@ foreach ($name in $translationFiles) {
     if ($manifest[$name] -ne (File-Hash $source)) { throw "Translation resource changed: $name" }
 }
 foreach ($entry in $publication.removed_runtime_files.PSObject.Properties) {
-    if ($entry.Name -notmatch '^meshes/actors/character/animations/FreeClimb/(?:configs/)?(?:mantle|step|toFree|toBraced|freeHang|runDown|dropCatch|contextRegrab)\.(?:hkx|json)$' -or $entry.Value -notmatch '^[0-9a-f]{64}$') { throw 'Unsafe retired asset entry' }
+    if ($entry.Name -notmatch '^meshes/actors/character/animations/FreeClimb/(?:(?:configs/)?(?:mantle|step|toFree|toBraced|freeHang|runDown|dropCatch|contextRegrab|flipUp|flipLeft|flipRight|sprintCatch|wallRun|contextHop)\.(?:hkx|json)|(?:configs/)?(?:runUp|runLeft|runRight|runDiagonalLeft|runDiagonalRight|runLaunch|runCatch|runLaunchLeft|runLaunchRight|sideBrace|contextHang)\.(?:hkx|json))$' -or $entry.Value -notmatch '^[0-9a-f]{64}$') { throw 'Unsafe retired asset entry' }
 }
 if ($ValidateOnly) { Write-Output "Verified $($manifest.Count)-file deployment payload $releaseVersion"; return }
 if (Get-Process -Name SkyrimSE -ErrorAction SilentlyContinue) { throw 'Exit Skyrim before deploying' }

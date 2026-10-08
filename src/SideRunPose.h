@@ -55,7 +55,7 @@ inline bool limitSideRunUpperRoll(const Library& lib,Pose& pose,int hand,float w
 }
 
 inline void applySideRunBrace(const Library& lib,Pose& pose,const SideRunFrame& frame,
-        float gaitPhase,float weight=1.f) {
+        float gaitPhase,float weight=1.f,Motion direction=Motion::none,const Pose* privateReference=nullptr) {
     if(pose.size()<99||!std::isfinite(gaitPhase)||!std::isfinite(weight))return;
     weight=std::clamp(weight,0.f,1.f);if(weight<=0)return;
     const Pose before=pose;
@@ -70,7 +70,7 @@ inline void applySideRunBrace(const Library& lib,Pose& pose,const SideRunFrame& 
     const int elbow=hand==0?29:32,wrist=hand==0?38:39,base=hand==0?67:82;
     sideRunWorldRotation(lib,pose,clavicle,Quat::axis(frame.forward,side*(.06981317f+.01047198f*wave)));
 
-    const auto reference=lib.sample(Motion::sideBrace,.5f+.10f*wave);
+    const auto reference=privateReference?*privateReference:lib.clip(Motion::sideBrace,direction).authoredPlayback?before:lib.sample(Motion::sideBrace,.5f+.10f*wave,direction);
     const auto world=lib.world(pose);
     const Vec wallUp=(Vec{0,0,1}-frame.normal*frame.normal.z).unit();
 

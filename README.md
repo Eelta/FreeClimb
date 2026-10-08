@@ -43,11 +43,15 @@ Climbing upward toward a suitable platform can trigger an automatic mantle. Cont
 
 When stamina consumption is enabled, wall running costs **twice** as much stamina per second as climbing.
 
+Climbing uses the game's sneaking state without playing a crouch animation. Wall running, completed mantles and both ways of leaving the wall clear that state. Sneaking from before the climb is not restored; you can crouch normally afterward.
+
+Menus, the console and recognized game-time freezes pause climbing while keeping the character attached. Movement, animation progress and stamina costs resume with gameplay. Release held action buttons before pressing them again after closing a menu.
+
 ### Rebinding controls
 
 The Keys page provides Forward, Backward, Left, Right, Wall entry, Wall run modifier and Hop bindings. Click a binding button, release all controls, hold the desired 1–4 keys together, then release them all to record the combination. Left and right modifier keys are kept distinct.
 
-Esc or gamepad Back cancels either keyboard or controller recording. Only combinations held together are recorded, up to four keys/buttons; invalid input keeps the previous binding. Recording edits the draft; choose **Save settings** to apply and save it.
+Esc or gamepad Back cancels either keyboard or controller recording. Only combinations held together are recorded, up to four keys/buttons; invalid input keeps the previous binding. A valid completed recording is applied and saved automatically.
 
 Wall entry uses its complete configured binding; no additional Forward key is required. Entry always starts climbing. Press the wall run modifier after grabbing to switch to wall running; if it was already held during entry, release and press it again. Backward + Hop pushes away from the wall, and Left + Backward + Right + Hop lets go in place.
 
@@ -76,14 +80,16 @@ The interface defaults to **English** and includes **Simplified Chinese**. Menu 
 | Page | Settings |
 | --- | --- |
 | General | Main toggle, operation notifications, low stamina warning, automatic mantling |
-| Movement | Climbing speeds in all four directions, wall run speed, diagonal wall run multiplier |
+| Movement | Wall running toggle, climbing speeds in all four directions, wall run speed, diagonal wall run multiplier |
 | Automatic actions | Contextual sideways leaps, automatic wall run obstacle jumps, contextual mantling, attempt intervals, left/right opportunity rates |
 | Stamina | Stamina consumption toggle, climbing and resting costs, stamina required to grab |
 | Audio | Sound toggle and volume |
 | Keys | Keyboard and controller bindings, controller toggle and thresholds |
 | Animations and diagnostics | Safe animation pack reload, file validation results, action statistics, detailed diagnostic toggle |
 
-The bottom buttons are **Save settings** and **Restore default settings**. Both write `Data/SKSE/Plugins/FreeClimb.ini` and apply the settings; movement and binding changes wait until a safe detached state. Restore default settings resets and saves only the controls on the current tab. Other tabs, the interface language and INI-only options are retained; unsaved edits on other tabs remain in the editor. Audio changes preview on subsequent traversal sounds.
+Settings changes are applied and saved automatically to `Data/SKSE/Plugins/FreeClimb.ini`. Movement, stamina, automatic actions and diagnostics update immediately, including while paused on a wall. Input settings and animation-dependent settings wait until safely detached; audio changes affect subsequent sounds. **Restore default settings** resets and saves only the current tab. Other tabs, the interface language and INI-only options are retained.
+
+Hover over an option to show its explanation below the page. Wall running is enabled by default; disabling it keeps normal climbing available and prevents the modifier from switching modes.
 
 Disabling **Consume stamina** removes both FreeClimb's stamina requirement for grabbing a wall and all traversal stamina costs.
 
@@ -91,21 +97,21 @@ A left/right opportunity rate of `1` retains every eligible opportunity in that 
 
 ## Menu translation
 
-Translation files contain fixed keys and text values. Copy `FreeClimb_english.txt` and name it after a language ID, such as `FreeClimb_french.txt`. Keep the keys, translate only the text after each tab, and set `$FC_LANGUAGE_NAME` to the language's own name. Install the file in `Data/Interface/Translations/`, restart Skyrim, select the language, then choose Save settings. Translation loading errors are recorded in `Data/SKSE/FreeClimb.log`.
+Translation files contain fixed keys and text values. Copy `FreeClimb_english.txt` and name it after a language ID, such as `FreeClimb_french.txt`. Keep the keys, translate only the text after each tab, and set `$FC_LANGUAGE_NAME` to the language's own name. Install the file in `Data/Interface/Translations/`, restart Skyrim and select the language; the selection is saved automatically. Translation loading errors are recorded in `Data/SKSE/FreeClimb.log`.
 
 FreeClimb reads these files itself. The menu uses ImGui and does not rely on automatic translation discovery through the game's Scaleform system. The framework navigation entry remains **FreeClimb → Settings**. Translation covers FreeClimb menu text; HUD operation notifications and raw technical diagnostics are outside this interface.
 
 ## Custom animations
 
-Animations are stored in `Data/meshes/actors/character/animations/FreeClimb/`: `pack.json`, `skeleton.json`, 35 HKX files and 35 animation configuration files.
+Animations are stored in `Data/meshes/actors/character/animations/FreeClimb/`: `pack.json`, `skeleton.json`, 25 HKX files and their configurations. Each wall-run and contextual-leap direction has its own independently replaceable HKX and JSON, containing its transitions and required references. Left and right replacement packages can be installed together without overwriting each other.
 
 **Replacing animations and their parameters in existing slots does not require recompiling the DLL.** You can override selected files through MO2 while keeping the complete default pack for the remaining slots. Adding slots or new trigger logic requires plugin changes.
 
-HKX files must be retargeted to the specified 99-bone skeleton and use a supported Skyrim SE 64-bit Havok 2010.2 animation format. FreeClimb still controls character movement, collisions and handholds. Some actions use fixed controller timing, so changing HKX duration does not change every action's speed in the same way.
+The runtime uses FreeClimb's 99-track HKX format. The converter below maps supported standard Skyrim SE humanoid HKX files into that format without manual track conversion; other skeletons must first be retargeted. FreeClimb controls character movement, collisions and handholds. Some actions use fixed controller timing, so changing HKX duration does not change every action's speed in the same way.
 
 See the **[Animation DIY guide](docs/ANIMATION-DIY.md)** for replacement steps, the main configuration fields, slot purposes and troubleshooting.
 
-The source archive includes an **[Animation Authoring Helper](tools/authoring/README.md)** (Chinese interface). Run `tools/authoring/Start.cmd` with Python 3.10+ and Tkinter installed. Select a compatible HKX and slot, mark limb support intervals, then validate and export a two-file MO2 override ZIP. The native validator is included; no compiler is needed to use it. Skeleton retargeting remains an animation-editor task.
+Use the **[Animation Tool](tools/converter/README.md)** in the source archive: open `tools/converter/bin/FreeClimbConverter.exe`, import a supported Skyrim SE humanoid HKX, preview it and export an MO2 ZIP. Timing adaptation and optional pose, contact and route adjustments are handled in the same window; no hand-written JSON, Python or compilation is needed. Preview uses the edited skeleton animation; final game collisions and clothing physics still need an in-game check.
 
 ## Logs and issue reports
 
@@ -120,7 +126,7 @@ Diagnostics=0
 
 With detailed diagnostics disabled, the log still records basic startup information, animation pack loading summaries, errors and warnings, and brief wall-entry and exit reasons. Enabling diagnostics adds action transitions, route failures and observed pose output, which can help investigate getting stuck, incorrect handholds or missing actions.
 
-If the menu is available, enable **Detailed diagnostic log** under **Animations and diagnostics**, then choose Save settings. Without the menu, exit the game, set `Diagnostics` to `1`, then restart. Existing custom INI values are preserved during upgrades.
+If the menu is available, enable **Detailed diagnostic log** under **Animations and diagnostics**; the change is saved automatically. Without the menu, exit the game, set `Diagnostics` to `1`, then restart. Existing custom INI values are preserved during upgrades.
 
 **The log is overwritten each time the game starts.** To capture a problem, enable detailed diagnostics, reproduce it, then copy the log before starting the game again. Reports should include the exact game version, FreeClimb version, location, inputs, symptoms and any modified animation pack. For visual issues, include a video or screenshots. Crashes also require a crash logger report; the FreeClimb log does not contain a complete crash dump.
 
@@ -137,6 +143,8 @@ powershell -ExecutionPolicy Bypass -File tools/build.ps1
 The output is `build-multiruntime/Release/FreeClimb.dll`. `FreeClimb-source.zip` includes CommonLibSSE-NG, spdlog, rapidcsv, DirectXTK, MinHook, nlohmann/json and the menu API header. Pinned versions and file hashes are recorded in `tools/dependencies.json` and `DEPENDENCY-SOURCES.json`. Compiling the DLL does not require the game directory or animation assets.
 
 To rebuild the helper, add `-AuthoringTools` to the build command. Copy `build-multiruntime/Release/FreeClimbAuthoring.exe` to `tools/authoring/bin/FreeClimbAuthoring.exe` before distributing the source bundle.
+
+The same build creates `FreeClimbConverter.exe` and `FreeClimbHKXConverter.exe`; put both in `tools/converter/bin/`. The [converter guide](tools/converter/README.md#command-line-and-build) also covers building the tools without the SKSE plugin.
 
 To run tests that do not depend on animation files:
 

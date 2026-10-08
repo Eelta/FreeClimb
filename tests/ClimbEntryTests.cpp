@@ -9,22 +9,24 @@ static void require(bool value,const char* message){if(!value)throw std::runtime
 static std::ofstream samples;static unsigned sampleCount{};
 static Keys entryKeys(bool shift=false){Keys keys;keys.w=keys.a=keys.d=keys.space=true;keys.shift=shift;return keys;}
 
-static void climbEntry(const Library& library,int fps,bool falling,bool heldRunModifier,bool far,bool stopDuringEntry=false,int side=0) {
+static void climbEntry(const Library& library,int fps,bool falling,bool heldRunModifier,bool far,bool stopDuringEntry=false,int side=0,float entrySpeed=-1,bool nativePrediction=false) {
     fc_test::CornerWorld world;world.boxes.push_back({{-4000,0,-2000},{4000,400,8000}});
     if(far){world.origin={132858.95f,38433.08f,-11268.09f};world.yaw=.63f;}
     Traversal traversal;traversal.cfg=fc_test::settings();traversal.cfg.approachSeconds=.36f;traversal.cfg.runSpeed=379.5f;
     traversal.cfg.automaticClimbActions=false;traversal.cfg.contextActions=false;
-    const Vec start=world.global({0,falling?-60.f:-90.f,300});const float dt=1.f/fps;
-    const auto flight=grabFlight(falling,false,false,false,falling?-300.f:0.f);
+    const Vec start=world.global({0,falling?-60.f:entrySpeed>=0&&entrySpeed<180?-55.f:-90.f,300});const float dt=1.f/fps;
+    const auto flight=grabFlight(falling,false,false,nativePrediction,falling?-300.f:0.f);
     Keys keys=entryKeys(heldRunModifier);ClimbEntryIntent entry;JumpGrabGate gate;WallRunEntryGate runGate;
     const auto request=entry.sample(keys,false,false,dt,flight.confirmedAirborne);
     require(request.requested&&request.fresh,"full chord immediately requests climbing before pose preparation");
     gate.hold(world.direction({0,1,0}),false,request.airborneAtBegin,request.fresh);
-    require(gate.pending()&&traversal.attach(world,start,gate.facing(),1000,60,gate.explicitAirCatch(flight),!falling),"entry uses an actual checked ground or air approach");
+    require(gate.pending()&&traversal.attach(world,start,gate.facing(),1000,60,gate.explicitAirCatch(flight),!flight.airborne),"entry uses an actual checked ground or air approach");
     require((traversal.position-start).length()<.001f,"acquisition keeps the current native root before entry output");
-    const auto catchMotion=grabEntryMotion(flight);
-    require(catchMotion==(falling?Motion::ledgeCatch:Motion::jumpCatch),"every entry selects a climbing catch, never a running launch");
-    traversal.entry(catchMotion,!flight.airborne);entry.blockUntilRelease();gate.cancel();runGate.begin(keys);
+    const auto catchMotion=entrySpeed<0?grabEntryMotion(flight):grabEntryMotion(flight,entrySpeed,(traversal.entryTarget()-start).length(),!falling);
+    require(catchMotion==(falling?Motion::ledgeCatch:entrySpeed<0||entrySpeed>=180?Motion::jumpCatch:Motion::reach),
+        "physical flight and grounded approach choose the matching climbing entry without starting a wall run");
+    require(traversal.entry(world,catchMotion,!flight.airborne),"selected entry retains the final source-path preflight");
+    entry.blockUntilRelease();gate.cancel();runGate.begin(keys);
     SurfacePose surface;Pose previous;Motion last=Motion::none;
     Vec oldPosition=traversal.position;float maxAngleRate=0,maxLocalTranslationStep=0,maxRootSpeed=0;
     bool catchSeen=false,runSeen=false,climbSeen=false,firstLoop=false,previousSpace=false;unsigned fullRunFrames=0,frameIndex=0;
@@ -97,7 +99,7 @@ static void climbEntry(const Library& library,int fps,bool falling,bool heldRunM
     for(int frame=0;frame<fps;++frame)tick(false,true);
     require(last==Motion::up&&!traversal.wallRunning()&&distanceClimb>10,"run modifier release returns to climbing without stale running pose ownership");
     std::cout<<"entry fps="<<fps<<" falling="<<falling<<" heldRunModifier="<<heldRunModifier<<" far="<<far
-        <<" stopped="<<stopDuringEntry<<" side="<<side<<" angleRate="<<maxAngleRate<<" localTranslationStep="<<maxLocalTranslationStep<<" rootSpeed="<<maxRootSpeed<<'\n';
+        <<" stopped="<<stopDuringEntry<<" side="<<side<<" entry="<<int(catchMotion)<<" angleRate="<<maxAngleRate<<" localTranslationStep="<<maxLocalTranslationStep<<" rootSpeed="<<maxRootSpeed<<'\n';
 }
 
 static void changedEntryCollision(int fps) {
@@ -140,8 +142,55 @@ static void nativeJumpCatch(const Library& library,int fps) {
     }
     require(climbed&&traversal.state==State::wall,"native jump catch completes into ordinary upward climbing");
 }
+static void changedEntryMotionPreflight(Motion initial) {
+    auto motions=std::make_shared<std::array<AuthoredMotion,42>>();
+    auto& source=(*motions)[int(initial)-1];source.enabled=true;source.seconds=2.4f;
+    source.trajectory.count=5;
+    source.trajectory.knots[0]={0,{}};
+    source.trajectory.knots[1]={.2f,{90,0,0}};
+    source.trajectory.knots[2]={.5f,{90,35,0}};
+    source.trajectory.knots[3]={.8f,{90,70,0}};
+    source.trajectory.knots[4]={1,{0,70,0}};
+    require(source.trajectory.valid(),"changed-entry fixture has a checked source trajectory");
+    for(Motion selected:{Motion::reach,Motion::jumpCatch,Motion::ledgeCatch})for(bool jump:{false,true}) {
+        if(selected==initial)continue;
+        fc_test::CornerWorld world;world.boxes.push_back({{-4000,0,-2000},{4000,400,8000}});
+        world.boxes.push_back({{-5,-67,305},{5,-63,350},false});
+        Traversal t;t.cfg.authoredMotions=motions;t.cfg.approachSeconds=.36f;
+        const Vec from{0,-100,300};
+        require(t.attach(world,from,{0,1,0},1000,80,false,jump,initial),
+            "the initial v2 entry safely passes around an obstruction in the final v1 route");
+        require(std::abs(t.entryDuration()-source.seconds)<.00001f,"initial v2 entry retains its source duration");
+        Traversal unchanged=t;
+        require(unchanged.entry(world,initial,jump)&&unchanged.entrySelection()==initial&&
+            std::abs(unchanged.entryDuration()-source.seconds)<.00001f&&(unchanged.position-from).length()<.00001f,
+            "retaining the actual v2 source rechecks its clear route without replacing its duration or moving the player");
+        require(!t.entry(world,selected,jump),"switching to a different default entry checks its actual route before ownership");
+        require((t.position-from).length()<.00001f&&t.state==State::approach,
+            "rejected final entry cannot move the player or leave the prepared entry state");
+        require(std::abs(t.entryDuration()-t.cfg.approachSeconds)<.00001f,
+            "a final v1 entry restores the checked geometry duration rather than inheriting another slot's source clock");
+        world.boxes.pop_back();
+        Traversal clear;clear.cfg=t.cfg;
+        require(clear.attach(world,from,{0,1,0},1000,80,false,jump,initial),"unobstructed source entry is available");
+        require(clear.entry(world,selected,jump),"unobstructed final v1 entry passes its own complete route preflight");
+        float elapsed=0;bool seen=false;
+        while(clear.state==State::approach&&elapsed<1) {
+            const auto result=clear.update(world,{},1.f/120,1000);elapsed+=1.f/120;
+            require(!result.released,"final v1 route preflight agrees with live checked movement");
+            seen|=result.motion==selected;
+        }
+        require(seen&&clear.state==State::wall&&std::abs(elapsed-.36f)<.009f,
+            "changed final v1 entry plays its selected clip and finishes at the geometry clock");
+        Traversal same;
+        require(same.attach(world,from,{0,1,0},1000,80,false,jump,selected),"same-slot legacy entry obtains its existing route validation");
+        const auto before=world.rays;
+        require(same.entry(world,selected,jump)&&world.rays==before,"unchanged legacy entry does not repeat its complete route preflight");
+    }
+}
 int main(int argc,char** argv){try {
     Library library;require((argc==2||argc==3)&&library.load(argv[1]),"load actual bundled motion library");
+    for(Motion initial:{Motion::jumpCatch,Motion::ledgeCatch})changedEntryMotionPreflight(initial);
     if(argc==3){samples.open(argv[2]);require(samples.good(),"open diagnostic sample output");samples<<"{\"samples\":[";}
     for(int fps:{30,60,120}) {
         for(bool falling:{false,true})for(bool heldRunModifier:{false,true})for(bool far:{false,true})
@@ -149,6 +198,8 @@ int main(int argc,char** argv){try {
         changedEntryCollision(fps);nativeJumpCatch(library,fps);
         climbEntry(library,fps,false,false,false,true);
         for(int side:{-1,1})climbEntry(library,fps,false,false,false,false,side);
+        for(float speed:{0.f,240.f})for(bool heldRunModifier:{false,true})for(bool nativePrediction:{false,true})
+            climbEntry(library,fps,false,heldRunModifier,false,false,0,speed,nativePrediction);
     }
     if(samples.is_open())samples<<"]}";
     std::cout<<"PASS: real Core/SurfacePose ground and airborne chord catch, climb-first transition and attached wall run, complete-pose budgets, native jump and live collision\n";

@@ -12,6 +12,7 @@ struct UserSettings {
     bool enabled=true,notifications=true,lowStaminaNotifications=true,jumpToAttach=true,autoMantle=true;
     bool contextActions=true,threepeatAnimations=true,automaticClimbActions=true,legacyAutomaticHops=false;
     bool surfaceActionVariants=true,wallRunObstacleJumps=true,contextualMantleEnabled=true,diagnostics=false,fancyJumps=true;
+    bool wallRunEnabled=true;
     bool audioEnabled=true,staminaEnabled=true;
     float upSpeed=100,downSpeed=78,sideSpeed=82,wallRunSpeed=379.5f,diagonalRunMultiplier=1.15f;
     float autoActionMinSeconds=.8f,autoActionMaxSeconds=1.25f,audioVolume=.75f;

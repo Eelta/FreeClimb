@@ -1,5 +1,6 @@
 #include "GamepadInput.h"
 #include "MenuInterruption.h"
+#include "TraversalSuspension.h"
 #include <array>
 #include <iostream>
 #include <stdexcept>
@@ -37,6 +38,7 @@ struct Session {
     JumpGrabGate request;
     EntryPreparationGrace preparation;
     bool fromGamepad{},attached{true};
+    TraversalSuspension suspension;
     unsigned releases{};
     explicit Session(bool pad):fromGamepad(pad) {
         for(unsigned scan:{0x11u,0x1eu,0x20u,0x39u,0x2au})keyboard.set(scan,true);
@@ -47,7 +49,7 @@ struct Session {
     Keys keys()const{return fromGamepad?gamepad.keys(settings.bindings):mapKeys(keyboard,InputBindings{});}
     void interrupt() {
         keyboard.reset();gamepad.blockUntilButtonsReleased();runGate.reset();
-        releases+=attached;attached=false;entry.blockUntilRelease();request.cancel();preparation.cancel();
+        suspension.suspend();entry.blockUntilRelease();request.cancel();preparation.cancel();
     }
     void event(std::string_view name,bool opening,MenuInputState state={}) {
         if(menuInterruptsTraversal(name,opening,state))interrupt();
@@ -73,7 +75,7 @@ static void harmlessEventsPreserveInput() {
         check(!session.runGate.filter(session.keys()).shift,"closing a menu cannot enable a held wall-run modifier");
     }
 }
-static void blockingMenusReleaseSafely() {
+static void blockingMenusPauseSafely() {
     struct Case {std::string_view name;MenuInputState state;};
     constexpr std::array cases{
         Case{"Console",{}},Case{"Dialogue Menu",{}},Case{"Loading Menu",{}},Case{"TweenMenu",{}},
@@ -83,7 +85,7 @@ static void blockingMenusReleaseSafely() {
     for(bool pad:{false,true})for(const auto& value:cases) {
         Session session(pad);
         session.event(value.name,true,value.state);
-        check(!session.attached&&session.releases==1,"a blocking menu releases traversal exactly once");
+        check(session.attached&&session.releases==0&&session.suspension.active(),"a blocking menu holds traversal without a release");
         check(!mapKeys(session.keyboard,InputBindings{}).entry,"blocking menus clear stale keyboard input");
         check(session.gamepad.waitingForButtonsRelease()&&!session.gamepad.keys(session.settings.bindings).entry,
             "blocking menus suspend controller actions without inventing releases");
@@ -91,7 +93,7 @@ static void blockingMenusReleaseSafely() {
             "blocking menus cancel pending grabs and pose preparation");
         check(session.entry.waitingForRelease(),"blocking menus require a fresh entry gesture");
         session.event(value.name,false,value.state);
-        check(!session.attached&&session.releases==1,"closing the menu does not automatically reacquire the wall");
+        check(session.attached&&session.releases==0&&session.suspension.active(),"closing events wait for the complete live menu stack before resuming");
         check(!session.gamepad.resumeIfButtonsReleased(),"closing the menu with held entry buttons remains blocked");
         session.gamepad.sampleXInput(0,255,0,0,32767,session.settings);
         check(!session.gamepad.resumeIfButtonsReleased(),"a held left trigger prevents premature controller recovery");
@@ -104,7 +106,7 @@ static void blockingMenusReleaseSafely() {
         session.entry.sample(session.keys());
         if(pad)session.gamepad.sampleXInput(0x8100,0,0,0,32767,session.settings);
         else for(unsigned scan:{0x11u,0x1eu,0x20u,0x39u})session.keyboard.set(scan,true);
-        check(session.entry.sample(session.keys()).fresh,"a fresh complete chord works after a real menu interruption");
+        check(!session.entry.sample(session.keys(),session.attached).requested,"an already attached character does not reattach after a menu");
     }
 }
 static void syntheticOverlayTimingRegression() {
@@ -116,7 +118,7 @@ static void syntheticOverlayTimingRegression() {
         Session session(index<28),legacy(index<28);
         for(unsigned ms=0;ms<delaysMs[index];++ms)session.request.tick(.001f);
         session.event("SyntheticNotificationOverlay",true);
-        if(legacyPolicy("SyntheticNotificationOverlay",true))legacy.interrupt();
+        if(legacyPolicy("SyntheticNotificationOverlay",true)){legacy.interrupt();legacy.attached=false;++legacy.releases;}
         interruptions+=session.releases;legacyInterruptions+=legacy.releases;
         check(session.attached&&session.keys().entry&&session.request.pending(),
             "synthetic early overlay openings retain attachment and input across both devices");
@@ -127,6 +129,6 @@ static void syntheticOverlayTimingRegression() {
     check(interruptions==0&&legacyInterruptions==36,"harmless synthetic events reproduce only the old unconditional drop policy");
 }
 int main()try {
-    classification();harmlessEventsPreserveInput();blockingMenusReleaseSafely();syntheticOverlayTimingRegression();
+    classification();harmlessEventsPreserveInput();blockingMenusPauseSafely();syntheticOverlayTimingRegression();
     std::cout<<"Menu interruption checks passed: "<<checks<<'\n';return 0;
 }catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}

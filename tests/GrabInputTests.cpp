@@ -1,4 +1,5 @@
 #include "Controls.h"
+#include "EntryInputDiagnostics.h"
 #include "NativeWalkableApproach.h"
 #include <algorithm>
 #include <array>
@@ -145,7 +146,54 @@ static void currentPositionCatchAndDistantHold() {
         check(!absent.attach(world,{0,-30,300},{0,1,0},100,60,true)&&!absent.active(),"input does not manufacture absent walls");
     }
 }
+static void contextualEntrySelection() {
+    const auto ground=grabFlight(false,false,false,false,0);
+    check(grabEntryMotion(ground,0,12)==Motion::reach,"stationary near-wall entry uses the supported standing reach");
+    check(grabEntryMotion(ground,90,40)==Motion::reach,"slow grounded approach reaches without a sprint or native jump");
+    check(grabEntryMotion(ground,240,60)==Motion::jumpCatch,"fast ground entry keeps the climbing catch rather than adding a sprint pose");
+    check(grabEntryMotion(ground,240)==Motion::jumpCatch,"speed alone cannot select a different entry pose");
+    check(grabEntryMotion(ground,240,12)==Motion::reach,"a fast but physically near entry uses the same supported reach");
+    check(grabEntryMotion(ground,90,80)==Motion::jumpCatch,"a distant slow entry retains the jumping catch");
+    check(grabEntryMotion(ground)==Motion::jumpCatch&&grabEntryMotion(ground,90)==Motion::jumpCatch,
+        "callers without measured close-wall geometry retain the existing entry fallback");
+    const auto predicted=grabFlight(false,false,false,true,0);
+    check(grabEntryMotion(predicted,0,12,true)==Motion::reach,
+        "the unchanged default Space chord can reach while independent physics still verifies ground support");
+    check(grabEntryMotion(predicted,240,60,true)==Motion::jumpCatch,
+        "native jump prediction and speed cannot restore the removed sprint catch");
+    check(grabEntryMotion(grabFlight(false,false,false,true,-20),0,12,true)==Motion::reach,
+        "downhill grounded motion cannot turn native jump prediction into a physical falling catch");
+    for(float speed:{0.f,90.f,240.f})for(float distance:{0.f,40.f,80.f}) {
+        check(grabEntryMotion(grabFlight(false,true,true,true,120),speed,distance)==Motion::jumpCatch,
+            "actual rising flight takes precedence over grounded reach styling");
+        check(grabEntryMotion(grabFlight(true,false,false,false,-160),speed,distance)==Motion::ledgeCatch,
+            "actual descending flight retains its airborne catch at any approach speed");
+        check(grabEntryMotion(grabFlight(false,false,false,true,0),speed,distance)==Motion::jumpCatch,
+            "pending native jump remains a jump catch and cannot be restyled into a grounded reach");
+        check(grabEntryMotion(grabFlight(false,true,true,true,120),speed,distance,true)==Motion::jumpCatch,
+            "confirmed rising physics cannot be overridden by contradictory grounded styling context");
+        check(grabEntryMotion(grabFlight(true,false,false,false,-160),speed,distance,true)==Motion::ledgeCatch,
+            "confirmed descending physics cannot be overridden by contradictory grounded styling context");
+    }
+    for(float speed:{-240.f,std::numeric_limits<float>::quiet_NaN(),std::numeric_limits<float>::infinity(),-std::numeric_limits<float>::infinity()})
+        check(grabEntryMotion(ground,speed,12)==Motion::jumpCatch,"retreating or invalid approach speed cannot request an approach-specific clip");
+    for(float distance:{-2.f,-.5f,std::numeric_limits<float>::quiet_NaN(),std::numeric_limits<float>::infinity(),-std::numeric_limits<float>::infinity()})
+        for(float speed:{0.f,240.f})check(grabEntryMotion(ground,speed,distance)==Motion::jumpCatch,
+            "invalid distance retains the conservative catch instead of choosing a grounded variant");
+    check(grabEntryMotion(grabFlight(true,false,false,false,-160),std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::infinity())==Motion::ledgeCatch,"invalid horizontal context cannot override physical descent");
+}
 static void wallRunSpaceRoutingAndEntryGate() {
+    for(bool enabled:{false,true})for(bool shift:{false,true})for(bool wasRunning:{false,true})for(bool attached:{false,true}) {
+        Keys k;k.w=true;k.space=true;k.shift=shift;
+        const auto input=wallInput(k,true,true,attached,wasRunning,enabled);
+        check(input.run==(enabled&&shift),"master switch changes attached run input without changing movement keys");
+        check(input.hop==(!attached&&!wasRunning&&!(enabled&&shift)),"disabled wall running permits stable climbing hops but preserves entry and exit guards");
+        k.s=true;const auto exit=wallInput(k,true,true,false,wasRunning,enabled);
+        check(exit.release&&exit.backDrop&&!exit.run&&!exit.hop,"master switch cannot interfere with backward departure");
+        k.letGo=true;const auto drop=wallInput(k,false,true,false,wasRunning,enabled);
+        check(drop.release&&!drop.backDrop&&!drop.run&&!drop.hop,"master switch preserves independent let-go priority");
+    }
     for(bool shift:{false,true})for(bool wasRunning:{false,true}) {
         Keys k;k.w=true;k.shift=shift;k.space=true;const auto input=wallInput(k,true,true,false,wasRunning);
         check(input.hop==(!shift&&!wasRunning),"wall running suppresses Space including same-frame Shift release");
@@ -162,6 +210,11 @@ static void wallRunSpaceRoutingAndEntryGate() {
     run.reset();keys.shift=false;run.begin(keys);keys.shift=true;
     check(run.filter(keys).shift,"an entry without the run modifier does not block a new attached run command");
     run.reset();keys.shift=true;check(run.filter(keys).shift,"reset cannot leave a stale run suppression");
+    run.begin(keys);
+    check(!wallInput(run.filter(keys),false,true,false,false,false).run,"disabled mode retains the physical held-at-entry gate");
+    check(!wallInput(run.filter(keys),false,true,false,false,true).run,"enabling wall running cannot turn an unreleased entry modifier into a run");
+    keys.shift=false;run.filter(keys);keys.shift=true;
+    check(wallInput(run.filter(keys),false,true,false,false,true).run,"physical release and repress still rearms after a disabled entry");
     run.begin(keys);keys.s=true;
     const auto released=wallInput(run.filter(keys),true);
     check(released.release&&!released.backDrop,"entry run gate does not swallow the in-place let-go chord");
@@ -315,8 +368,45 @@ static void preparationProbeCadence() {
     drop.space=false;intent.sample(drop);drop.space=true;
     check(intent.sample(drop).fresh,"release and repress of an entry member rearms after explicit drop");
 }
+static void entryDiagnosticSnapshotsAndCadence() {
+    InputBindings bindings;
+    std::array<std::uint8_t,256> raw{};
+    raw[0x11]=0x80;
+    auto snapshot=diagnosticKeyboardSnapshot(raw);
+    check(entryHeldMask(snapshot,bindings.entry)==1&&!chordHeld(snapshot,bindings.entry),"raw W alone stays a partial entry witness");
+    EntryInputDiagnostics diagnostic;
+    for(std::uint64_t now=0;now<10000;++now)
+        check(diagnostic.sample(chordHeld(snapshot,bindings.entry),now)==EntryDiagnosticEvent::none,"ordinary movement never emits entry diagnostic events");
+    raw[0x1e]=raw[0x20]=0x80;raw[0x39]=1;
+    snapshot=diagnosticKeyboardSnapshot(raw);
+    check(entryHeldMask(snapshot,bindings.entry)==7&&!chordHeld(snapshot,bindings.entry),"snapshot requires the actual DirectInput pressed bit for Space");
+    raw[0x39]=0x80;snapshot=diagnosticKeyboardSnapshot(raw);
+    check(entryHeldMask(snapshot,bindings.entry)==15&&chordHeld(snapshot,bindings.entry),"all four raw chord members are recorded independently of mapped input");
+    InputState mapped;
+    check(!mapKeys(mapped,bindings).entry&&diagnostic.sample(true,10000)==EntryDiagnosticEvent::began,"raw complete chord remains observable when mapped input is suppressed");
+    for(std::uint64_t now=10001;now<12000;++now)
+        check(diagnostic.sample(true,now)==EntryDiagnosticEvent::none,"held diagnostics cannot flood within two seconds");
+    check(diagnostic.sample(true,12000)==EntryDiagnosticEvent::held,"held chord reports at the bounded interval");
+    check(diagnostic.sample(true,12000)==EntryDiagnosticEvent::none,"duplicate timestamps cannot duplicate a held report");
+    check(diagnostic.sample(false,12001)==EntryDiagnosticEvent::released,"release is reported immediately for rearming diagnosis");
+    check(diagnostic.sample(false,12002)==EntryDiagnosticEvent::none,"released chords do not keep reporting");
+    check(diagnostic.sample(true,12003)==EntryDiagnosticEvent::began,"a released and repressed chord starts a new observation immediately");
+    check(diagnostic.sample(true,14003,false)==EntryDiagnosticEvent::none,"disabled diagnostics suppress held reports and clear prior state");
+    check(diagnostic.sample(false,14004)==EntryDiagnosticEvent::none,"re-enabling diagnostics does not invent a release");
+    check(diagnostic.sample(true,14005)==EntryDiagnosticEvent::began,"diagnostics can resume on a currently complete chord");
+    bindings.entry=parseKeyChord("Shift+W").value();raw.fill(0);raw[0x36]=raw[0x11]=0x80;
+    snapshot=diagnosticKeyboardSnapshot(raw);
+    check(chordHeld(snapshot,bindings.entry)&&entryHeldMask(snapshot,bindings.entry)==3,"generic Shift witness accepts the actual right modifier");
+    bindings.entry=parseKeyChord("LShift+W").value();
+    check(!chordHeld(snapshot,bindings.entry),"exact left Shift witness does not substitute right Shift");
+    raw[0x2a]=0x80;
+    check(chordHeld(diagnosticKeyboardSnapshot(raw),bindings.entry),"exact modifier witness accepts the configured physical key");
+    EntryInputDiagnostics keyboard,gamepad;
+    check(keyboard.sample(true,0)==EntryDiagnosticEvent::began&&gamepad.sample(true,0)==EntryDiagnosticEvent::began,"device diagnostic histories remain independent");
+    check(keyboard.sample(false,1)==EntryDiagnosticEvent::released&&gamepad.sample(true,1)==EntryDiagnosticEvent::none,"one device release cannot reset the other device throttle");
+}
 int main(){try {
     chordTruthTableAndNativeSpace();heldApproachAndReleaseRearming();flightClassificationAndFreshAirBypass();
-    currentPositionCatchAndDistantHold();wallRunSpaceRoutingAndEntryGate();nativeJumpWindow();preparationGrace();preparationProbeCadence();
+    currentPositionCatchAndDistantHold();contextualEntrySelection();wallRunSpaceRoutingAndEntryGate();nativeJumpWindow();preparationGrace();preparationProbeCadence();entryDiagnosticSnapshotsAndCadence();
     std::cout<<"PASS: full configurable climb chord, all 24 key orders, held retry and release rearm, physical-air provenance, native jump expiry, bounded verified preparation grace and attached run gate\n";
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

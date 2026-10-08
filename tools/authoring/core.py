@@ -13,10 +13,10 @@ from dataclasses import dataclass, field
 
 ACTIVE_SLOTS = (
     "hang", "up", "down", "left", "right", "reach",
-    "hopLeft", "hopRight", "hopUp", "drop", "jumpCatch", "sprintCatch",
+    "hopLeft", "hopRight", "hopUp", "drop", "jumpCatch",
     "dropBack", "ledgeCatch", "runUp", "runLeft", "runRight", "runDiagonalLeft",
     "runDiagonalRight", "runLaunch", "runCatch", "kickUp", "kickLeft", "kickRight",
-    "flipUp", "flipLeft", "flipRight", "runLaunchLeft", "runLaunchRight",
+    "runLaunchLeft", "runLaunchRight",
     "sideBrace", "backFlipOut", "contextHang", "contextHopLeft", "contextHopRight",
     "contextMantle",
 )
@@ -25,6 +25,10 @@ TOOL_DIRECTORY = Path(__file__).resolve().parent
 MAX_HKX_BYTES = 64 * 1024 * 1024
 MAX_PACK_BYTES = 256 * 1024 * 1024
 LIMBS = ("左手", "右手", "左脚", "右脚")
+ACTION_GROUPS = {
+    "wallRun": ("runUp", "runLeft", "runRight", "runDiagonalLeft", "runDiagonalRight", "runLaunch", "runCatch", "runLaunchLeft", "runLaunchRight", "sideBrace"),
+    "contextHop": ("contextHang", "contextHopLeft", "contextHopRight"),
+}
 
 
 class AuthoringError(ValueError):
@@ -103,10 +107,113 @@ class TemplatePack:
     configurations: dict
     config_paths: dict
     files: dict
+    groups: dict = field(default_factory=dict)
 
     @property
     def root(self):
         return self.path.parent
+
+
+def clip_header(config, name):
+    require(isinstance(config, dict) and config.get("format") == "FreeClimbClip"
+            and type(config.get("version")) is int and config["version"] in (1, 2)
+            and config.get("slot") == name, f"动作配置与槽名不匹配：{name}")
+    if config["version"] == 2:
+        authored = config.get("authoredPlayback")
+        require(isinstance(authored, dict) and type(authored.get("version")) is int
+                and authored["version"] == 1, "源动作播放配置不正确。")
+    if "frameRange" in config:
+        bounds = config["frameRange"]
+        require(isinstance(bounds, list) and len(bounds) == 2 and all(type(v) is int for v in bounds)
+                and 0 <= bounds[0] < bounds[1] <= 1200, "时间轴范围必须是有效的两个帧编号。")
+    if "rootShift" in config:
+        shift = config["rootShift"]
+        require("frameRange" in config and isinstance(shift, list) and len(shift) == 3,
+                "时间轴偏移必须对应帧范围且含三个分量。")
+        for value in shift:
+            number(value, "时间轴偏移", -10000, 10000)
+    if "references" in config:
+        references = config["references"]
+        roles = {"launchApproach": "runUp", "kickTakeoff": "kickUp", "kickRunLanding": "runUp", "kickRunBrace": "sideBrace",
+                 "kickLanding": {"kickLeft": "hopLeft", "kickRight": "hopRight"}.get(name, "hopUp")}
+        require(isinstance(references, dict) and len(references) <= 5, "动作内部参考配置不正确。")
+        for role, reference in references.items():
+            require(role in roles and (name in ("runLaunch", "runLaunchLeft", "runLaunchRight") if role == "launchApproach"
+                    else name in ("kickUp", "kickLeft", "kickRight")), "内部参考不属于当前动作。")
+            require(isinstance(reference, dict) and "references" not in reference
+                    and relative_file(reference.get("file")) == relative_file(config.get("file")),
+                    "内部参考必须保存在当前动作的 HKX 中。")
+            member = reference.get("member", "")
+            require(isinstance(member, str) and 1 <= len(member) <= 64
+                    and all(value in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_" for value in member),
+                    "内部参考缺少有效的 HKX 动作名称。")
+            clip_header(reference, roles[role])
+
+
+def group_header(config):
+    group, clips, version = config.get("group"), config.get("clips"), config.get("version")
+    require(type(version) is int and version in (1, 2) and group in ACTION_GROUPS
+            and isinstance(clips, list), "动作组格式不正确。")
+    directions = ("runUp", "runLeft", "runRight", "runDiagonalLeft", "runDiagonalRight")
+    launches = dict(zip(directions, ("runLaunch", "runLaunchLeft", "runLaunchRight", "runLaunchLeft", "runLaunchRight")))
+    direction = config.get("direction", "")
+    contextual = group == "contextHop" and version == 2
+    require(not direction or version == 2 and direction in
+            (("contextHopLeft", "contextHopRight") if contextual else directions), "完整动作必须指定有效方向。")
+    require(not contextual or direction, "完整侧跃必须指定左侧或右侧。")
+    expected = (("contextHang", direction) if contextual else
+                (launches[direction], direction, "runCatch") if direction else ACTION_GROUPS[group])
+    private_brace = bool(direction and group == "wallRun" and any(isinstance(clip, dict) and clip.get("slot") == "sideBrace" for clip in clips))
+    if private_brace:
+        require(direction == "runLeft", "共用槽位只能登记左侧墙跑自己的扶墙参考。")
+        expected += ("sideBrace",)
+    require(len(clips) == len(expected) and all(isinstance(clip, dict) for clip in clips)
+            and {clip.get("slot") for clip in clips} == set(expected), "动作文件必须包含全部阶段，且不能重复。")
+    files = {relative_file(clip.get("file")) for clip in clips}
+    require(len(files) == 1, "完整动作组必须共用一个 HKX。")
+    for clip in clips:
+        clip_header(clip, clip["slot"])
+    if version == 1:
+        require(all(clip.get("member") == clip.get("slot") for clip in clips),
+                "动作组必须通过 member 选择对应阶段。")
+        return
+    aliases = {"runLaunch": "runUp", "runCatch": "runUp", "runLaunchLeft": "runLeft", "runLaunchRight": "runRight"}
+    selected = {clip["slot"]: clip for clip in clips}
+    complete_source = bool(contextual and isinstance(selected[direction].get("authoredPlayback"), dict)
+                           and "frameRange" not in selected[direction])
+    for clip in clips:
+        member = direction + "Brace" if private_brace and clip["slot"] == "sideBrace" else direction or aliases.get(clip["slot"], clip["slot"])
+        if complete_source and clip["slot"] == "contextHang":
+            member += "Prepare"
+        require(clip.get("member") == member, "动作阶段未选择匹配的完整时间轴。")
+        require(complete_source or clip["slot"] == "sideBrace" or "frameRange" in clip, "动作阶段缺少时间轴范围。")
+    sequences = config.get("sequences")
+    expected_directions = (direction,) if direction else directions
+    require(isinstance(sequences, list) and len(sequences) == len(expected_directions) and all(isinstance(value, dict) for value in sequences)
+            and {value.get("slot") for value in sequences} == set(expected_directions), "动作时间轴与文件方向不一致。")
+    for sequence in sequences:
+        direction = sequence["slot"]
+        roles = (("prepare", "contextHang"), ("catch", "contextHang")) if contextual else (("launch", launches[direction]), ("catch", "runCatch"))
+        for role, slot in roles:
+            part = sequence.get(role)
+            clip_header(part, slot)
+            member = direction + ("Prepare" if role == "prepare" else "Catch") if complete_source else direction
+            require(part.get("member") == member and relative_file(part.get("file")) in files
+                    and (complete_source or "frameRange" in part), "起步和收尾必须属于同方向的完整时间轴。")
+            require(not config.get("direction") or contextual and role == "catch" or selected[slot] == part,
+                    "动作阶段的配置与时间轴不一致。")
+        if not complete_source:
+            first, loop, last = sequence["prepare" if contextual else "launch"]["frameRange"], selected[direction]["frameRange"], sequence["catch"]["frameRange"]
+            require(first[1] <= loop[0] and loop[1] <= last[0], "准备、主要动作和收尾的范围顺序不正确。")
+        if "brace" in sequence:
+            require(group == "wallRun" and direction != "runUp", "只有侧向墙跑包含自己的扶墙参考。")
+            brace = sequence["brace"]
+            clip_header(brace, "sideBrace")
+            require(brace.get("member") == direction + "Brace" and relative_file(brace.get("file")) in files,
+                    "扶墙参考必须属于当前方向的 HKX。")
+            require(not private_brace or brace == selected["sideBrace"], "扶墙参考配置与动作文件不一致。")
+        else:
+            require(not private_brace, "当前方向缺少自己的扶墙参考。")
 
 
 def load_template(pack_path, slot=None):
@@ -120,16 +227,24 @@ def load_template(pack_path, slot=None):
     files = {"pack.json": path}
     file_names = {"pack.json"}
     source_names = {str(path).casefold()}
+    animation_names = set()
+    group_documents = {}
     configurations, config_paths = {}, {}
 
-    def add_file(relative):
+    def add_file(relative, shared=False):
         name = relative_file(relative)
+        if shared:
+            require(name.lower().endswith(".hkx"), "动画文件必须使用 .hkx 扩展名。")
+        if shared and name in animation_names:
+            return name
         require(name.casefold() not in file_names, f"基础包中的文件路径重复：{name}")
         source = contained(path.parent, name)
         require(str(source).casefold() not in source_names, f"基础包中的文件路径重复：{name}")
         file_names.add(name.casefold())
         source_names.add(str(source).casefold())
         files[name] = source
+        if shared:
+            animation_names.add(name)
         return name
 
     add_file(manifest.get("skeleton"))
@@ -137,17 +252,24 @@ def load_template(pack_path, slot=None):
         require(isinstance(entry, dict), "动作槽清单格式不正确。")
         name = entry.get("slot")
         require(name in ACTIVE_SLOTS and name not in configurations, f"未知或重复动作槽：{name}")
-        config_path = add_file(entry.get("config"))
-        config = read_json(files[config_path])
-        require(config.get("format") == "FreeClimbClip" and config.get("version") == 1 and config.get("slot") == name,
-                f"动作配置与槽名不匹配：{name}")
-        add_file(config.get("file"))
+        config_path = relative_file(entry.get("config"))
+        if config_path not in group_documents:
+            add_file(config_path)
+            config = read_json(files[config_path])
+            if config.get("format") == "FreeClimbActionGroup":
+                group_header(config)
+                group_documents[config_path] = config
+        if config_path in group_documents:
+            config = next((clip for clip in group_documents[config_path]["clips"] if clip["slot"] == name), None)
+            require(config is not None, f"动作组中缺少阶段：{name}")
+        clip_header(config, name)
+        add_file(config.get("file"), shared=True)
         configurations[name] = config
         config_paths[name] = config_path
     require(set(configurations) == set(ACTIVE_SLOTS), "基础包缺少必需动作槽。")
     if slot is not None:
         require(slot in configurations, f"不存在的动作槽：{slot}")
-    return TemplatePack(path, manifest, configurations, config_paths, files)
+    return TemplatePack(path, manifest, configurations, config_paths, files, group_documents)
 
 
 @dataclass(frozen=True)
@@ -205,8 +327,9 @@ class EditOptions:
 def configure_clip(template, duration, options, frames=None):
     config = parse_json(options.advanced_json, "高级配置") if options.advanced_json is not None else copy.deepcopy(template)
     require(config.get("slot") == template["slot"] and config.get("file") == template["file"],
-            "高级配置不能更改 slot 或 file；本工具只覆盖所选槽原来的两个文件。")
-    require(config.get("format") == "FreeClimbClip" and config.get("version") == 1, "请保留配置的 format 和 version。")
+            "高级配置不能更改 slot 或 file。")
+    require(config.get("version") == template.get("version"), "请保留配置的 version。")
+    clip_header(config, template["slot"])
     if options.stride is not None:
         config["stride"] = number(options.stride, "stride", 0, 500)
     if options.height is not None:
@@ -277,6 +400,15 @@ class NativeTool:
         require(report.get("loaded") == len(ACTIVE_SLOTS), f"完整基础包未通过全部 {len(ACTIVE_SLOTS)} 槽校验。")
         return report
 
+    def export_group(self, pack, hkx, config, output, work):
+        job = {"pack": str(pack), "input": str(hkx), "config": config, "output": str(output), "work": str(work)}
+        with tempfile.TemporaryDirectory(prefix="group-", dir=work) as temporary:
+            path = Path(temporary) / "job.json"
+            path.write_text(json.dumps(job, ensure_ascii=False, allow_nan=False), encoding="utf-8")
+            report = self.call("export-group", path)
+        require(report.get("loaded") == len(ACTIVE_SLOTS), "完整动作组未通过校验。")
+        return report
+
 
 def inspect_hkx(path, validator=None):
     target = Path(path).resolve()
@@ -297,16 +429,32 @@ def export_override(pack_path, slot, hkx_path, output_path, options=None, valida
     information = inspect_hkx(hkx, native)
     template = pack.configurations[slot]
     config = configure_clip(template, information["duration"], options or EditOptions(), information["frames"])
-    config_bytes = (json.dumps(config, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode("utf-8")
-    require(len(config_bytes) <= 256 * 1024, "生成的动作配置超过 256 KiB。")
     work = Path(work_root).resolve() if work_root is not None else TOOL_DIRECTORY / "work"
     require(not work.is_relative_to(pack.root), "临时工作目录不能位于基础包内。")
     work.mkdir(parents=True, exist_ok=True)
+    if pack.config_paths[slot] in pack.groups:
+        report = native.export_group(pack.path, hkx, config, output, work)
+        return {"output": str(output), "slot": slot, "duration": information["duration"], "files": report["files"], "loaded": report["loaded"]}
+    selected_hkx = relative_file(template["file"])
+    shared = sum(relative_file(value["file"]).casefold() == selected_hkx.casefold()
+                 for value in pack.configurations.values()) > 1
+    if shared or "member" in config:
+        occupied = {name.casefold() for name in pack.files}
+        selected_hkx = f"converted/{slot}.hkx"
+        suffix = 0
+        while selected_hkx.casefold() in occupied:
+            suffix += 1
+            selected_hkx = f"converted/{slot}-{suffix}.hkx"
+        config["file"] = selected_hkx
+    config.pop("member", None)
+    config.pop("frameRange", None)
+    config.pop("rootShift", None)
+    selected_config = pack.config_paths[slot]
+    config_bytes = (json.dumps(config, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode("utf-8")
+    require(len(config_bytes) <= 256 * 1024, "生成的动作配置超过 256 KiB。")
     with tempfile.TemporaryDirectory(prefix="candidate-", dir=work) as temporary:
         stage = Path(temporary)
         total = 0
-        selected_hkx = relative_file(template["file"])
-        selected_config = pack.config_paths[slot]
         for relative, source in pack.files.items():
             if relative == selected_config:
                 data = config_bytes
@@ -317,6 +465,11 @@ def export_override(pack_path, slot, hkx_path, output_path, options=None, valida
             total += len(data)
             require(total <= MAX_PACK_BYTES, "完整候选包超过 256 MiB。")
             target = stage / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        if selected_hkx not in pack.files:
+            data = read_bytes(hkx, min(MAX_HKX_BYTES, MAX_PACK_BYTES - total))
+            target = stage / selected_hkx
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)
         report = native.validate(stage / "pack.json")

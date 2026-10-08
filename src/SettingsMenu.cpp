@@ -1,5 +1,6 @@
 #include "SettingsMenu.h"
-#include "BindingCapture.h"
+#include "SettingsMenuEdits.h"
+#include "SettingsMenuHelp.h"
 #include "TranslationDefaults.h"
 #include "RuntimeLog.h"
 #include <algorithm>
@@ -16,6 +17,8 @@ namespace {
 namespace ui=ImGuiMCP;
 SettingsMenuCallbacks callbacks;
 UserSettings draft;
+SettingsMenuEdits edits;
+SettingsMenuHelp help;
 SettingsPage activePage=SettingsPage::general;
 bool initialized=false,registered=false,dirty=false;
 std::string notice,detail;
@@ -69,12 +72,16 @@ void __stdcall captureEvent(SKSEMenuFramework::Model::EventType event) {
 TranslationCatalog translations{std::span<const TranslationEntry>{translationDefaults}};
 const char* tr(std::string_view key){return translations.text(draft.language,key);}
 std::string label(std::string_view key,const char* id){return std::string(tr(key))+"###"+id;}
-void text(std::string_view key){ui::TextWrapped("%s",tr(key));}
-bool check(std::string_view key,const char* id,bool& value){const bool changed=ui::Checkbox(label(key,id).c_str(),&value);dirty|=changed;return changed;}
-bool slider(std::string_view key,const char* id,float& value,float low,float high,const char* format="%.2f") {
-    const bool changed=ui::SliderFloat(label(key,id).c_str(),&value,low,high,format);dirty|=changed;return changed;
+void itemHelp(std::string_view key,std::string_view description={}) {
+    help.observe(key,description.empty()?settingsHelpFor(key):description,
+        ui::IsItemHovered(ui::ImGuiHoveredFlags_AllowWhenDisabled|ui::ImGuiHoveredFlags_NoNavOverride),ui::IsItemFocused());
 }
-bool button(std::string_view key,const char* id){return ui::Button(label(key,id).c_str());}
+void text(std::string_view key){ui::TextWrapped("%s",tr(key));itemHelp(key);}
+bool check(std::string_view key,const char* id,bool& value){const bool changed=ui::Checkbox(label(key,id).c_str(),&value);itemHelp(key);dirty|=changed;return changed;}
+bool slider(std::string_view key,const char* id,float& value,float low,float high,const char* format="%.2f") {
+    const bool changed=ui::SliderFloat(label(key,id).c_str(),&value,low,high,format);itemHelp(key);dirty|=changed;return changed;
+}
+bool button(std::string_view key,const char* id){const bool clicked=ui::Button(label(key,id).c_str());itemHelp(key);return clicked;}
 void reloadTranslations() {
     try {
         const auto directory=runtimeDataDirectory()/L"Interface"/L"Translations";
@@ -97,15 +104,14 @@ bool acceptBindings() {
         if(!validation.valid){notice="binding-conflict";detail=validation.message;return false;}
     return true;
 }
-void saveSettings() {
-    draft=sanitizeUserSettings(draft);callbacks.requestSave(draft);notice="save-queued";detail.clear();dirty=false;
+void applyEdits(bool force=false) {
+    if(!dirty&&!force)return;
+    if(!acceptBindings())return;
+    const auto result=edits.apply(draft,callbacks.requestSave,force);dirty=false;
+    if(result==SettingsEditResult::queued){notice="settings-queued";detail.clear();}
 }
 void restoreDefaults() {
-    const auto saved=restoreSettingsPage(activePage,callbacks.getSettings());
-    draft=restoreSettingsPage(activePage,draft);
-    callbacks.requestSave(saved);notice="save-queued";detail.clear();
-    dirty=userSettingsIni(draft)!=userSettingsIni(saved)||draft.bindings!=saved.bindings||
-        draft.gamepad.bindings!=saved.gamepad.bindings;
+    draft=restoreSettingsPage(activePage,draft);applyEdits(true);
 }
 void beginCapture(BindingCaptureDevice device,std::size_t index) {
     {
@@ -132,9 +138,8 @@ void finishCapture() {
     if(!finished)return;
     captureUI(false);
     if(result.status==BindingCaptureStatus::captured) {
-        if(result.device==BindingCaptureDevice::keyboard)draft.bindings.*bindingFields[index].member=result.keyboard;
-        else draft.gamepad.bindings.*gamepadBindingFields[index].member=result.gamepad;
-        dirty=true;notice.clear();detail.clear();acceptBindings();
+        if(applyCompletedBinding(draft,result,index,detail)){dirty=true;notice.clear();detail.clear();}
+        else notice="binding-conflict";
     } else notice=unavailable?"$FC_CAPTURE_UNAVAILABLE":
         result.status==BindingCaptureStatus::error?"$FC_CAPTURE_INVALID":"$FC_CAPTURE_TIMEOUT";
 }
@@ -142,7 +147,8 @@ void bindingButton(BindingCaptureDevice device,std::size_t index,const char* key
     const auto value=device==BindingCaptureDevice::keyboard?serializeKeyChord(draft.bindings.*bindingFields[index].member):
         serializeGamepadChord(draft.gamepad.bindings.*gamepadBindingFields[index].member);
     if(ui::Button((value+"###"+id).c_str()))beginCapture(device,index);
-    ui::SameLine();text(key);
+    const auto description=device==BindingCaptureDevice::keyboard?"$FC_BINDING_HELP":"$FC_GAMEPAD_BINDING_HELP";
+    itemHelp(key,description);ui::SameLine();text(key);itemHelp(key,description);
 }
 void capturePrompt() {
     BindingCaptureResult result;bool active=false;
@@ -168,7 +174,7 @@ const char* translatedNotice() {
     if(notice=="binding-invalid")return tr("$FC_NOTICE_BINDING_INVALID");
     if(notice=="gamepad-binding-invalid")return tr("$FC_NOTICE_GAMEPAD_BINDING_INVALID");
     if(notice=="binding-conflict")return tr("$FC_NOTICE_BINDING_CONFLICT");
-    if(notice=="save-queued")return tr("$FC_NOTICE_SAVE_QUEUED");
+    if(notice=="settings-queued")return tr("$FC_NOTICE_SETTINGS_QUEUED");
     if(notice=="reload-queued")return tr("$FC_NOTICE_RELOAD_QUEUED");
     return notice.starts_with("$FC_")?tr(notice):"";
 }
@@ -207,14 +213,12 @@ const char* slotTitle(std::string_view name) {
         {"reach","$FC_SLOT_REACH"},{"hopLeft","$FC_SLOT_HOP_LEFT"},
         {"hopRight","$FC_SLOT_HOP_RIGHT"},{"hopUp","$FC_SLOT_HOP_UP"},
         {"drop","$FC_SLOT_DROP"},
-        {"jumpCatch","$FC_SLOT_JUMP_CATCH"},{"sprintCatch","$FC_SLOT_SPRINT_CATCH"},{"dropBack","$FC_SLOT_DROP_BACK"},
+        {"jumpCatch","$FC_SLOT_JUMP_CATCH"},{"dropBack","$FC_SLOT_DROP_BACK"},
         {"ledgeCatch","$FC_SLOT_LEDGE_CATCH"},{"runUp","$FC_SLOT_RUN_UP"},{"runLeft","$FC_SLOT_RUN_LEFT"},
         {"runRight","$FC_SLOT_RUN_RIGHT"},{"runDiagonalLeft","$FC_SLOT_RUN_DIAGONAL_LEFT"},
         {"runDiagonalRight","$FC_SLOT_RUN_DIAGONAL_RIGHT"},{"runLaunch","$FC_SLOT_RUN_LAUNCH"},
         {"runCatch","$FC_SLOT_RUN_CATCH"},{"kickUp","$FC_SLOT_KICK_UP"},
         {"kickLeft","$FC_SLOT_KICK_LEFT"},{"kickRight","$FC_SLOT_KICK_RIGHT"},
-        {"flipUp","$FC_SLOT_FLIP_UP"},{"flipLeft","$FC_SLOT_FLIP_LEFT"},
-        {"flipRight","$FC_SLOT_FLIP_RIGHT"},
         {"runLaunchLeft","$FC_SLOT_RUN_LAUNCH_LEFT"},{"runLaunchRight","$FC_SLOT_RUN_LAUNCH_RIGHT"},
         {"sideBrace","$FC_SLOT_SIDE_BRACE"},{"backFlipOut","$FC_SLOT_BACK_FLIP_OUT"},
         {"contextHang","$FC_SLOT_CONTEXT_HANG"},{"contextHopLeft","$FC_SLOT_CONTEXT_HOP_LEFT"},
@@ -228,19 +232,19 @@ void basic() {
     check("$FC_NOTIFICATIONS","notifications",draft.notifications);
     check("$FC_LOW_STAMINA_NOTIFICATIONS","lowStamina",draft.lowStaminaNotifications);
     check("$FC_AUTO_MANTLE","autoMantle",draft.autoMantle);
-    text("$FC_ENTRY_HELP");
 }
 void movement() {
     slider("$FC_UP_SPEED","upSpeed",draft.upSpeed,10,140,"%.0f");
     slider("$FC_DOWN_SPEED","downSpeed",draft.downSpeed,10,140,"%.0f");
     slider("$FC_SIDE_SPEED","sideSpeed",draft.sideSpeed,10,120,"%.0f");
+    check("$FC_WALL_RUN_ENABLED","wallRunEnabled",draft.wallRunEnabled);
+    ui::BeginDisabled(!draft.wallRunEnabled);
     slider("$FC_WALL_RUN_SPEED","runSpeed",draft.wallRunSpeed,10,450,"%.1f");
     slider("$FC_DIAGONAL_MULTIPLIER","diagonal",draft.diagonalRunMultiplier,1,1.3f,"%.2fx");
-    text("$FC_MOVEMENT_HELP");
+    ui::EndDisabled();
 }
 void automaticActions() {
     check("$FC_AUTO_SIDE_ACTIONS","autoActions",draft.automaticClimbActions);
-    text("$FC_ATTEMPT_HELP");
     check("$FC_WALL_RUN_OBSTACLES","obstacleJumps",draft.wallRunObstacleJumps);
     check("$FC_CONTEXT_MANTLE","contextMantle",draft.contextualMantleEnabled);
     ui::BeginDisabled(!draft.automaticClimbActions);
@@ -249,32 +253,27 @@ void automaticActions() {
     slider("$FC_ATTEMPT_INTERVAL_MAX","intervalMax",draft.autoActionMaxSeconds,draft.autoActionMinSeconds,30);
     slider("$FC_LEFT_OPPORTUNITY","leftWeight",draft.automaticSideWeights[0],0,1,"%.2f");
     slider("$FC_RIGHT_OPPORTUNITY","rightWeight",draft.automaticSideWeights[1],0,1,"%.2f");
-    text("$FC_OPPORTUNITY_HELP");
     ui::EndDisabled();
 }
 void stamina() {
     check("$FC_STAMINA_ENABLED","staminaEnabled",draft.staminaEnabled);
-    text("$FC_STAMINA_HELP");
     ui::BeginDisabled(!draft.staminaEnabled);
     slider("$FC_CLIMB_STAMINA","movingDrain",draft.movingPerSecond,0,50,"%.1f");
     ui::Text("%s: %.1f",tr("$FC_WALL_RUN_STAMINA"),draft.movingPerSecond*2);
+    itemHelp("$FC_WALL_RUN_STAMINA");
     slider("$FC_REST_STAMINA","hangDrain",draft.hangingPerSecond,0,30,"%.1f");
     slider("$FC_GRAB_STAMINA","grabStamina",draft.requiredToGrab,0,100,"%.0f");
     ui::EndDisabled();
 }
 void audio() {
-    bool changed=check("$FC_AUDIO_ENABLED","audioEnabled",draft.audioEnabled);
-    changed|=slider("$FC_AUDIO_VOLUME","audioVolume",draft.audioVolume,0,1,"%.2f");
-    if(changed&&callbacks.requestAudio)callbacks.requestAudio(draft.audioEnabled,draft.audioVolume);
-    text("$FC_AUDIO_HELP");
+    check("$FC_AUDIO_ENABLED","audioEnabled",draft.audioEnabled);
+    slider("$FC_AUDIO_VOLUME","audioVolume",draft.audioVolume,0,1,"%.2f");
 }
 void bindings() {
     text("$FC_KEYBOARD_SECTION");
     const char* keys[]{"$FC_BIND_FORWARD","$FC_BIND_BACKWARD","$FC_BIND_LEFT","$FC_BIND_RIGHT","$FC_BIND_ENTRY","$FC_BIND_RUN","$FC_BIND_HOP"};
     const char* ids[]{"bindForward","bindBackward","bindLeft","bindRight","bindEntry","bindRun","bindHop"};
     for(std::size_t i=0;i<bindingFields.size();++i)bindingButton(BindingCaptureDevice::keyboard,i,keys[i],ids[i]);
-    text("$FC_BINDING_HELP");
-    text("$FC_BINDING_DERIVED_HELP");
     ui::Separator();
     text("$FC_GAMEPAD_SECTION");
     check("$FC_GAMEPAD_ENABLED","gamepadEnabled",draft.gamepad.enabled);
@@ -284,46 +283,44 @@ void bindings() {
     const char* gamepadIds[]{"gamepadEntry","gamepadRun","gamepadHop","gamepadDrop"};
     recording.triggerThreshold.store(draft.gamepad.triggerThreshold);
     for(std::size_t i=0;i<gamepadBindingFields.size();++i)bindingButton(BindingCaptureDevice::gamepad,i,gamepadKeys[i],gamepadIds[i]);
-    text("$FC_GAMEPAD_BINDING_HELP");
-    text("$FC_GAMEPAD_CONTROL_HELP");
     if(button("$FC_VALIDATE_BINDINGS","validateBindings")) {
         if(acceptBindings()){notice.clear();detail.clear();}
     }
 }
 void diagnostics(const SettingsMenuSnapshot& snapshot) {
     check("$FC_DIAGNOSTICS_ENABLED","diagnostics",draft.diagnostics);
-    text("$FC_DIAGNOSTICS_HELP");
     ui::Text("%s: %s",tr("$FC_RUNTIME"),snapshot.ready?tr("$FC_STATUS_READY"):tr("$FC_STATUS_UNAVAILABLE"));
     ui::Text("%s: %s",tr("$FC_AUDIO_ASSETS"),snapshot.audioReady?tr("$FC_STATUS_READY"):tr("$FC_STATUS_UNAVAILABLE"));
     if(snapshot.movementPending)text("$FC_MOVEMENT_PENDING");
     if(snapshot.reloadPending)text("$FC_RELOAD_PENDING");
-    if(!snapshot.packName.empty())ui::Text("%s: %s",tr("$FC_ANIMATION_PACK"),snapshot.packName.c_str());
+    if(!snapshot.packName.empty()){ui::Text("%s: %s",tr("$FC_ANIMATION_PACK"),snapshot.packName.c_str());itemHelp("$FC_ANIMATION_PACK");}
     ui::Text("%s: %llu / %llu / %llu",tr("$FC_AUTOMATIC_STATS"),
         static_cast<unsigned long long>(snapshot.automaticAttempts),static_cast<unsigned long long>(snapshot.automaticActions),static_cast<unsigned long long>(snapshot.wallRunObstacleJumps));
+    itemHelp("$FC_AUTOMATIC_STATS");
     ui::BeginDisabled(snapshot.reloadPending);
     if(button("$FC_RELOAD_ANIMATIONS","reloadAnimations")&&callbacks.requestReloadAnimations) {
         callbacks.requestReloadAnimations();notice="reload-queued";detail.clear();
     }
     ui::EndDisabled();
-    text("$FC_RELOAD_HELP");
-    text("$FC_SLOT_REPORT_HELP");
-    for(const auto& slot:snapshot.slots) {
+    const bool showSlots=ui::CollapsingHeader(label("$FC_ANIMATION_PACK","animationSlotReports").c_str());itemHelp("$FC_ANIMATION_PACK");
+    if(showSlots)for(const auto& slot:snapshot.slots) {
         const auto title=std::string(slotTitle(slot.name))+" ("+slot.name+")###slot_"+slot.name;
-        if(!ui::CollapsingHeader(title.c_str()))continue;
+        const bool expanded=ui::CollapsingHeader(title.c_str());itemHelp("$FC_ANIMATION_PACK");
+        if(!expanded)continue;
         ui::TextWrapped("%s: %s",tr("$FC_STATUS"),majorReason(slot));
         ui::TextWrapped("%s: %s",tr("$FC_FILE"),slot.file.c_str());
-        if(snapshot.diagnosticsEnabled)
+        if(snapshot.diagnosticsEnabled) {
             ui::Text("%s: %llu   %s: %llu",tr("$FC_SELECTED"),static_cast<unsigned long long>(slot.triggers),tr("$FC_OBSERVED_OUTPUT"),static_cast<unsigned long long>(slot.observed));
-        else {
+            itemHelp("$FC_OBSERVED_OUTPUT");
+        } else {
             ui::Text("%s: %llu   %s: %s",tr("$FC_SELECTED"),static_cast<unsigned long long>(slot.triggers),tr("$FC_OBSERVED_OUTPUT"),tr("$FC_SAMPLING_OFF"));
-            if(slot.observed)ui::Text("%s: %llu",tr("$FC_PREVIOUS_OBSERVED"),static_cast<unsigned long long>(slot.observed));
+            itemHelp("$FC_OBSERVED_OUTPUT");
+            if(slot.observed){ui::Text("%s: %llu",tr("$FC_PREVIOUS_OBSERVED"),static_cast<unsigned long long>(slot.observed));itemHelp("$FC_OBSERVED_OUTPUT");}
         }
         ui::Text("%s: %zu   %s: %.3f",tr("$FC_SAMPLES"),slot.samples,tr("$FC_SECONDS"),slot.seconds);
         if(!slot.reason.empty())ui::TextWrapped("%s: %s",tr("$FC_TECHNICAL_DETAILS"),slot.reason.c_str());
     }
     if(snapshot.slots.empty())text("$FC_NO_ANIMATION_REPORT");
-    text("$FC_STATS_HELP");
-    text("$FC_OBSERVED_HELP");
 }
 void languageControls() {
     std::vector<std::string> languageIds,languageNames;
@@ -342,10 +339,12 @@ void languageControls() {
     if(ui::Combo(label("$FC_LANGUAGE","language").c_str(),&selected,names.data(),static_cast<int>(names.size()))) {
         draft.language=languageIds[static_cast<std::size_t>(selected)];reloadTranslations();dirty=true;
     }
+    itemHelp("$FC_LANGUAGE");
 }
 void __stdcall render() {
+    help.reset();
     recording.rendered=true;recording.observing.store(true);finishCapture();
-    if(!initialized){draft=callbacks.getSettings();reloadTranslations();initialized=true;}
+    if(!initialized){draft=callbacks.getSettings();edits.initialize(draft);reloadTranslations();initialized=true;}
     bool capturing=false;
     {std::scoped_lock lock(recording.mutex);capturing=recording.active;}
     ui::BeginDisabled(capturing);
@@ -362,11 +361,8 @@ void __stdcall render() {
         ui::EndTabBar();
     }
     ui::Separator();
-    if(button("$FC_SAVE_SETTINGS","saveSettings")&&acceptBindings())saveSettings();
-    ui::SameLine();
     if(button("$FC_RESTORE_DEFAULTS","restoreDefaults"))restoreDefaults();
-    ui::EndDisabled();capturePrompt();
-    if(dirty)text("$FC_UNSAVED_CHANGES");
+    ui::EndDisabled();applyEdits();capturePrompt();
     if(!notice.empty())ui::TextWrapped("%s",translatedNotice());
     if(!detail.empty())ui::TextWrapped("%s: %s",tr("$FC_DETAILS"),detail.c_str());
     if(!snapshot.error.empty()) {
@@ -374,6 +370,10 @@ void __stdcall render() {
         ui::TextWrapped("%s",snapshot.error.c_str());
     }
     if(!snapshot.status.empty())ui::TextWrapped("%s: %s",tr("$FC_RUNTIME_STATUS"),runtimeStatus(snapshot.status));
+    if(ui::BeginChild("FreeClimbContextHelp",{0,ui::GetTextLineHeightWithSpacing()*5.5f},0,ui::ImGuiWindowFlags_NoSavedSettings)) {
+        if(!capturing&&!help.helpKey.empty())ui::TextWrapped("%s: %s",tr(help.labelKey),tr(help.helpKey));
+    }
+    ui::EndChild();
 }
 }
 bool registerSettingsMenu(SettingsMenuCallbacks value) {
@@ -385,6 +385,7 @@ bool registerSettingsMenu(SettingsMenuCallbacks value) {
         "igBegin","igEnd","igGetWindowPos","igGetWindowSize","igSetNextWindowPos","igSetNextWindowSize",
         "RegisterEventPriority","igBeginDisabled","igEndDisabled","igCollapsingHeader_TreeNodeFlags",
         "igBeginTabBar","igEndTabBar","igBeginTabItem","igEndTabItem","igSeparator",
+        "igIsItemHovered","igIsItemFocused","igBeginChild_Str","igEndChild","igGetTextLineHeightWithSpacing",
         "IsAnyBlockingWindowOpened"};
     for(const auto name:required)if(!GetProcAddress(module,name))return false;
     callbacks=std::move(value);SKSEMenuFramework::SetSection("FreeClimb");

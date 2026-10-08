@@ -1,4 +1,4 @@
-#include "AnimationOverrides.h"
+#include "AnimationPack.h"
 #include "Pose.h"
 #include <iostream>
 #include <stdexcept>
@@ -187,10 +187,19 @@ static void supportedIdleAfterStop(const Library& lib) {
 int main(int argc,char** argv){try {
     check(argc>=2&&argc<=3,"motion path and optional HKX directory required");Library lib;check(lib.load(argv[1]),"load current runtime motion library");
     if(argc==3) {
-        const auto overrides=fc::loadHkxOverrides(lib,argv[2]);
-        check(overrides.loaded==activeMotionCount&&overrides.rejected==0&&overrides.missing==0,
-            "load every active HKX slot without missing or rejected clips");
-        for(Motion motion:activeMotions)check(lib.hasAnimationOverride(motion),"every active slot installs its HKX override");
+        const auto manifest=std::filesystem::path(argv[2])/"pack.json";
+        if(std::filesystem::exists(manifest)) {
+            const auto pack=fc::loadAnimationPack(lib,manifest);
+            check(pack.committed&&pack.loaded==activeMotionCount&&pack.rejected==0&&pack.missing==0,
+                "load every active HKX slot through the complete animation pack");
+            for(Motion motion:activeMotions)check(lib.clip(motion).frames.size()>=2&&lib.clip(motion).seconds>0,
+                "every active slot loads its complete HKX animation");
+        } else {
+            const auto overrides=fc::loadHkxOverrides(lib,argv[2]);
+            check(overrides.loaded==activeMotionCount&&overrides.rejected==0&&overrides.missing==0,
+                "load every active HKX slot without missing or rejected clips");
+            for(Motion motion:activeMotions)check(lib.hasAnimationOverride(motion),"every active slot installs its HKX override");
+        }
     }
     capturedArmsRemainUnchanged(lib);repairedHingeHasMargin(lib);inversePoleBranch(lib);stoppedClimbing(lib);supportedIdleAfterStop(lib);
     std::cout<<"PASS: source-preserving anatomical arm guards, inverse-pole negative controls, and actual move-to-hang outputs\n";

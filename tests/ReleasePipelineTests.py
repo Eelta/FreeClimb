@@ -109,7 +109,77 @@ class ReleasePipelineTests(unittest.TestCase):
 
     def test_pack_structure(self):
         result = validate.validate_animation_pack(self.root, self.manifest)
-        self.assertEqual((result['clips'], result['bones'], result['pack_files']), (35, 99, 72))
+        self.assertEqual((result['clips'], result['bones'], result['pack_files']), (31, 99, 52))
+
+    def test_directional_files_keep_complete_timelines(self):
+        prefix = 'meshes/actors/character/animations/FreeClimb/'
+        for direction in ('runUp', 'runLeft', 'runRight', 'runDiagonalLeft', 'runDiagonalRight'):
+            self.assertIn(prefix + direction + '.hkx', self.manifest['files'])
+            document = validate.read_json(self.root / prefix / f'configs/{direction}.json')
+            self.assertEqual((document['format'], document['version'], document['group'], document['direction']),
+                             ('FreeClimbActionGroup', 2, 'wallRun', direction))
+            launch = 'runLaunch' if direction == 'runUp' else 'runLaunchLeft' if direction.endswith('Left') else 'runLaunchRight'
+            expected = {launch, direction, 'runCatch'}
+            if direction == 'runLeft':
+                expected.add('sideBrace')
+            self.assertEqual({clip['slot'] for clip in document['clips']}, expected)
+            self.assertEqual(len(document['sequences']), 1)
+            self.assertEqual(document['sequences'][0]['slot'], direction)
+            for clip in document['clips']:
+                member = direction + 'Brace' if clip['slot'] == 'sideBrace' else direction
+                self.assertEqual((clip['file'], clip['member']), (direction + '.hkx', member))
+                if clip['slot'] != 'sideBrace':
+                    self.assertLess(clip['frameRange'][0], clip['frameRange'][1])
+            if direction != 'runUp':
+                brace = document['sequences'][0]['brace']
+                self.assertEqual((brace['slot'], brace['file'], brace['member']),
+                                 ('sideBrace', direction + '.hkx', direction + 'Brace'))
+        self.assertNotIn(prefix + 'sideBrace.hkx', self.manifest['files'])
+        self.assertNotIn(prefix + 'wallRun.hkx', self.manifest['files'])
+        self.assertIn(prefix + 'wallRun.hkx', package.publication()['removed_runtime_files'])
+
+    def test_context_hops_have_independent_files_and_stages(self):
+        prefix = 'meshes/actors/character/animations/FreeClimb/'
+        for direction in ('contextHopLeft', 'contextHopRight'):
+            document = validate.read_json(self.root / prefix / f'configs/{direction}.json')
+            self.assertEqual((document['format'], document['version'], document['group'], document['direction']),
+                             ('FreeClimbActionGroup', 2, 'contextHop', direction))
+            self.assertEqual({clip['slot'] for clip in document['clips']}, {direction, 'contextHang'})
+            sequence = document['sequences'][0]
+            for clip in (*document['clips'], sequence['prepare'], sequence['catch']):
+                self.assertEqual((clip['file'], clip['member']), (direction + '.hkx', direction))
+            main = next(clip for clip in document['clips'] if clip['slot'] == direction)
+            self.assertLessEqual(sequence['prepare']['frameRange'][1], main['frameRange'][0])
+        self.assertNotIn(prefix + 'contextHop.hkx', self.manifest['files'])
+
+    def test_shared_clip_file_reference_is_rejected(self):
+        path = self.root / 'meshes/actors/character/animations/FreeClimb/configs/runRight.json'
+        original = path.read_bytes()
+        try:
+            document = json.loads(original)
+            document['sequences'][0]['brace']['file'] = 'runLeft.hkx'
+            path.write_text(json.dumps(document), encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'private to its direction'):
+                validate.validate_animation_pack(self.root, self.manifest)
+        finally:
+            path.write_bytes(original)
+
+    def test_pack_rejects_wrong_group_member(self):
+        path = self.root / 'meshes/actors/character/animations/FreeClimb/configs/runUp.json'
+        original = path.read_bytes()
+        try:
+            for member in (None, 'runLeft', '../runUp'):
+                document = json.loads(original)
+                config = next(clip for clip in document['clips'] if clip['slot'] == 'runUp')
+                if member is None:
+                    config.pop('member')
+                else:
+                    config['member'] = member
+                path.write_text(json.dumps(document), encoding='utf-8')
+                with self.assertRaisesRegex(ValueError, 'matching animation member'):
+                    validate.validate_animation_pack(self.root, self.manifest)
+        finally:
+            path.write_bytes(original)
 
     def test_independent_installation_keeps_ownership_compatibility(self):
         ini = configparser.ConfigParser()
@@ -150,7 +220,7 @@ class ReleasePipelineTests(unittest.TestCase):
         value['motions'][1]['slot'] = value['motions'][0]['slot']
         path.write_text(json.dumps(value), encoding='utf-8')
         try:
-            with self.assertRaisesRegex(ValueError, '35 active slots exactly once'):
+            with self.assertRaisesRegex(ValueError, '31 active slots exactly once'):
                 validate.validate_animation_pack(self.root, self.manifest)
         finally:
             path.write_bytes(original)
@@ -170,6 +240,26 @@ class ReleasePipelineTests(unittest.TestCase):
         self.assertNotIn("tools/retarget_context_regrab.py", package.SOURCE_FILES)
         self.assertFalse((ROOT / "tools/retarget_context_regrab.py").exists())
 
+    def test_removed_flip_and_sprint_slots_have_exact_cleanup_hashes(self):
+        prefix = "meshes/actors/character/animations/FreeClimb/"
+        expected = {
+            "flipUp.hkx": "28c31fd507f4eaed2a14ba874af1d9a44d70648dd7638f1ff4765f10095159e9",
+            "configs/flipUp.json": "247b8f611e1710b31ec4f3a7c4f0cd5fd0861b8b24812f2e30f0e93e7ebc67ff",
+            "flipLeft.hkx": "4303e349f1a78efbdeb557138a804f2062ce0b0b4d55509741524be8ab7fa951",
+            "configs/flipLeft.json": "a6e2dd815726f646af4d76643bd65ec4b238eb9caf960e45b9eac2358503be21",
+            "flipRight.hkx": "a484b30ec526f90e5c03c0d0a835c69ae8f3944efd4ba57c0f7d66530b4c572f",
+            "configs/flipRight.json": "c6a7162474d65d89c452b4212589565ef4532a9b5056b2ca9441ea960d55325d",
+            "sprintCatch.hkx": "178af0a1e32c5f7fff887bb949959f14f2bc7241f321952bf7508f3891d00f4a",
+            "configs/sprintCatch.json": "00c947655ff3dbb438640566f4018773f0faae4a4a56dc2a3183247b47e2c28c",
+        }
+        removed = package.publication()["removed_runtime_files"]
+        for relative, digest in expected.items():
+            with self.subTest(path=relative):
+                self.assertEqual(removed[prefix + relative], digest)
+                self.assertNotIn(prefix + relative, self.manifest["files"])
+                self.assertFalse((ROOT / "runtime" / prefix / relative).exists())
+        self.assertIn(prefix + "backFlipOut.hkx", self.manifest["files"])
+
     def test_retarget_source_allowlist(self):
         for name in ("tools/retarget_threepeat.py", "tools/MigrateAnimationPack.cpp"):
             self.assertIn(name, package.SOURCE_FILES)
@@ -177,7 +267,7 @@ class ReleasePipelineTests(unittest.TestCase):
 
     def test_runtime_allowlist(self):
         files = package.runtime_files(ROOT / 'runtime', ROOT / 'config/FreeClimb.ini')
-        self.assertEqual(len(files), len(package.runtime_baseline()) + 72 + 2 + len(package.TRANSLATION_FILES))
+        self.assertEqual(len(files), len(package.runtime_baseline()) + 52 + 2 + len(package.TRANSLATION_FILES))
         self.assertFalse(any(name.lower().endswith(('.fbx', '.motion')) for name in files))
         self.assertFalse(any('license' in name.casefold() or 'notice' in name.casefold() for name in files))
         self.assertTrue(all('Interface/Translations/' + name in files for name in package.TRANSLATION_FILES))
@@ -185,6 +275,14 @@ class ReleasePipelineTests(unittest.TestCase):
     def test_default_translations_match_compiled_fallback(self):
         result = validate.validate_translations(ROOT / 'translations', ROOT / 'src/TranslationDefaults.h')
         self.assertEqual(set(result), set(package.TRANSLATION_FILES))
+
+    def test_packaged_wall_run_master_defaults_enabled(self):
+        files = package.runtime_files(ROOT / 'runtime', ROOT / 'build-multiruntime/Release/FreeClimb.dll')
+        path = files['SKSE/Plugins/FreeClimb.ini']
+        self.assertEqual(path, ROOT / 'config/FreeClimb.ini')
+        ini = configparser.ConfigParser()
+        self.assertEqual(ini.read(path, encoding='utf-8-sig'), [str(path)])
+        self.assertTrue(ini.getboolean('Movement', 'WallRunEnabled'))
 
     def test_translation_format_rejects_broken_edits(self):
         path = self.root / 'translation.txt'
@@ -238,13 +336,14 @@ class ReleasePipelineTests(unittest.TestCase):
         self.assertEqual(policy['source_archive'], 'FreeClimb-source.zip')
 
     def test_retired_assets_are_not_required_or_shipped(self):
-        retired = {'mantle', 'step', 'toFree', 'toBraced', 'freeHang', 'runDown', 'dropCatch', 'contextRegrab'}
+        retired = {'mantle', 'step', 'toFree', 'toBraced', 'freeHang', 'runDown', 'dropCatch', 'contextRegrab', 'flipUp', 'flipLeft', 'flipRight', 'sprintCatch'}
         files = package.runtime_files(ROOT / 'runtime', ROOT / 'build-multiruntime/Release/FreeClimb.dll')
         self.assertFalse(any(Path(name).stem in retired for name in files))
         self.assertFalse(any('authoring' in name.lower() for name in files))
         removal = package.publication()['removed_runtime_files']
-        self.assertEqual(len(removal), 16)
-        self.assertEqual({Path(name).stem for name in removal}, retired)
+        self.assertEqual(len(removal), 40)
+        grouped = {'wallRun', 'runLaunch', 'runCatch', 'runLaunchLeft', 'runLaunchRight', 'sideBrace', 'contextHang', 'contextHop'}
+        self.assertEqual({Path(name).stem for name in removal}, retired | grouped)
         self.assertFalse(set(removal) & files.keys())
 
     def test_author_baseline_rejects_changed_notice(self):

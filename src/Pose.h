@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <limits>
+#include <map>
 
 namespace fc {
 inline float smooth(float t) { t=std::clamp(t,0.f,1.f); return t*t*t*(10+t*(-15+6*t)); }
@@ -57,8 +58,9 @@ inline Transform blend(Transform a,Transform b,float t) { return {a.t+(b.t-a.t)*
 inline Vec multiply(Vec a,Vec b) { return {a.x*b.x,a.y*b.y,a.z*b.z}; }
 inline Transform compose(Transform a,Transform b) { return {a.t+a.q.rotate(multiply(a.s,b.t)),(a.q*b.q).unit(),multiply(a.s,b.s)}; }
 using Pose=std::vector<Transform>;
-struct Clip { float seconds{},stride{},height{};Vec travel{}; std::vector<Pose> frames; std::vector<std::array<float,4>> contacts; };
+struct Clip { float seconds{},stride{},height{};Vec travel{}; std::vector<Pose> frames; std::vector<std::array<float,4>> contacts; bool authoredPlayback{};AuthoredTrajectory trajectory; };
 struct RotationOverride { std::vector<std::array<Quat,99>> frames;std::array<bool,99> bones{}; };
+enum class PlaybackReference:std::size_t {launchApproach,kickTakeoff,kickLanding,kickRunLanding,kickRunBrace,count};
 struct Library;
 bool loadAnimationPackFile(Library& library,const std::string& path,std::string& error);
 struct Library {
@@ -70,12 +72,47 @@ struct Library {
     Pose rest;
     PoseRig<Pose> rig;
     std::array<Clip,motionCount> clips;
+    std::array<Clip,5> wallRunLaunches,wallRunCatches;
+    std::array<Clip,5> wallRunBraces;
+    std::array<bool,5> wallRunSequenceValid{};
+    std::array<Clip,2> contextHopPreparations,contextHopRecoveries;
+    std::array<bool,2> contextHopSequenceValid{};
     std::array<RotationOverride,motionCount> rotationOverrides;
+    std::map<std::pair<Motion,PlaybackReference>,Clip> references;
+    bool hasReference(Motion owner,PlaybackReference role) const {
+        const auto found=references.find({owner,role});return found!=references.end()&&found->second.frames.size()>=2;
+    }
+    static Motion referenceFallback(Motion owner,PlaybackReference role) {
+        return role==PlaybackReference::launchApproach||role==PlaybackReference::kickRunLanding?Motion::runUp:
+            role==PlaybackReference::kickRunBrace?Motion::sideBrace:role==PlaybackReference::kickTakeoff?Motion::kickUp:owner==Motion::kickLeft?Motion::hopLeft:
+            owner==Motion::kickRight?Motion::hopRight:Motion::hopUp;
+    }
+    const Clip& reference(Motion owner,PlaybackReference role) const {
+        const auto found=references.find({owner,role});
+        return found!=references.end()&&found->second.frames.size()>=2?found->second:clip(referenceFallback(owner,role));
+    }
+    Pose sampleReference(Motion owner,PlaybackReference role,float phase) const {
+        if(!hasReference(owner,role))return sample(referenceFallback(owner,role),phase);
+        const auto& frames=reference(owner,role).frames;
+        const float at=std::clamp(phase,0.f,1.f)*float(frames.size()-1);
+        const auto first=std::min(std::size_t(at),frames.size()-2);auto result=frames[first];
+        for(std::size_t bone=0;bone<result.size();++bone)result[bone]=blend(result[bone],frames[first+1][bone],at-float(first));
+        rig.adapt(result);return result;
+    }
     bool hasAnimationOverride(Motion motion) const {
         const int index=int(motion)-1;
         return isActiveMotion(motion)&&rotationOverrides[index].frames.size()>=2;
     }
     void clearAnimationOverrides() {for(auto& replacement:rotationOverrides)replacement={};}
+    bool hasWallRunSequence(Motion direction) const {
+        const int index=wallRunDirectionIndex(direction);
+        return index>=0&&wallRunSequenceValid[index]&&wallRunLaunches[index].frames.size()>=2&&wallRunCatches[index].frames.size()>=2;
+    }
+    bool hasContextHopSequence(Motion direction) const {
+        if(!threepeatHop(direction))return false;
+        const auto index=direction==Motion::contextHopLeft?0:1;
+        return contextHopSequenceValid[index]&&contextHopPreparations[index].frames.size()>=2&&contextHopRecoveries[index].frames.size()>=2;
+    }
     std::uint64_t sourceFingerprint{};
     std::size_t sourceBytes{};
     bool sourceValidated{};
@@ -88,6 +125,58 @@ struct Library {
         return true;
     }
     bool configureThreepeat(Settings& cfg) const {
+        cfg.authoredMotions.reset();std::shared_ptr<std::array<AuthoredMotion,42>> authored;
+        for(std::size_t index=0;index<clips.size();++index)if(clips[index].authoredPlayback) {
+            if(!authored)authored=std::make_shared<std::array<AuthoredMotion,42>>();
+            auto& target=(*authored)[index];const auto& source=clips[index];
+            target.enabled=true;target.seconds=source.seconds;target.stride=source.stride;target.trajectory=source.trajectory;
+            for(std::size_t sample=0;sample<65;++sample) {
+                const auto weights=contactWeights(Motion(index+1),float(sample)/64.f);
+                target.contacts[sample]={weights[0],weights[1]};
+            }
+        }
+        cfg.authoredMotions=std::move(authored);
+        cfg.authoredWallRunSequences.reset();std::shared_ptr<AuthoredWallRunSequences> sequences;
+        for(std::size_t index=0;index<wallRunSequenceValid.size();++index) {
+            const auto direction=Motion(int(Motion::runUp)+int(index));
+            if(!hasWallRunSequence(direction))continue;
+            if(!sequences)sequences=std::make_shared<AuthoredWallRunSequences>();
+            sequences->valid[index]=true;
+            for(const auto stage:{Motion::runLaunch,Motion::runCatch,Motion::sideBrace}) {
+                if(stage==Motion::sideBrace&&wallRunBraces[index].frames.size()<2)continue;
+                auto& target=stage==Motion::runCatch?sequences->catches[index]:stage==Motion::sideBrace?sequences->braces[index]:sequences->launches[index];
+                const auto& source=clip(stage,direction);
+                target.enabled=source.authoredPlayback;target.seconds=source.seconds;target.stride=source.stride;target.trajectory=source.trajectory;
+                for(std::size_t sample=0;sample<65;++sample) {
+                    const auto weights=contactWeights(stage,float(sample)/64.f,direction);
+                    target.contacts[sample]={weights[0],weights[1]};
+                }
+            }
+        }
+        cfg.authoredWallRunSequences=std::move(sequences);
+        cfg.contextHopReferences.reset();std::shared_ptr<std::array<ContextHopReference,2>> contextReferences;
+        for(int side=0;side<2;++side) {
+            const auto direction=side?Motion::contextHopRight:Motion::contextHopLeft;
+            if(!hasContextHopSequence(direction))continue;
+            if(!contextReferences)contextReferences=std::make_shared<std::array<ContextHopReference,2>>();
+            auto& reference=(*contextReferences)[side];const auto& source=clip(Motion::contextHang,direction);
+            for(bool recovery:{false,true}) {
+                const auto& part=clip(Motion::contextHang,direction,recovery);
+                auto& target=recovery?reference.recovery:reference.preparation;
+                target.enabled=part.authoredPlayback;target.seconds=part.seconds;target.stride=part.stride;target.trajectory=part.trajectory;
+                for(std::size_t sample=0;sample<65;++sample) {
+                    const auto weights=contactWeights(Motion::contextHang,float(sample)/64.f,direction,recovery);
+                    target.contacts[sample]={weights[0],weights[1]};
+                }
+            }
+            auto local=source.frames.front();rig.adapt(local);const auto pose=world(local);
+            const auto left=palm(pose,0),right=palm(pose,1);
+            reference.height=(left.z+right.z)*.5f;reference.forward=(left.y+right.y)*.5f;
+            reference.halfWidth=std::abs(right.x-left.x)*.5f;reference.toes={pose[50].t,pose[51].t};
+            reference.valid=reference.height>90&&reference.height<175&&reference.halfWidth>8&&reference.halfWidth<40;
+            if(!reference.valid){cfg.threepeatAnimations=false;return false;}
+        }
+        cfg.contextHopReferences=std::move(contextReferences);
         if(!hasThreepeat()){cfg.threepeatAnimations=false;return false;}
         cfg.threepeatProfile=threepeatProfile;
         auto hangPose=clip(Motion::contextHang).frames.front();rig.adapt(hangPose);
@@ -103,6 +192,11 @@ struct Library {
             cfg.threepeatHopSeconds[side]=hop.seconds;
         }
         const auto& mantle=clip(Motion::contextMantle);
+        cfg.authoredMantle=mantle.authoredPlayback;cfg.authoredMantleTrajectory=mantle.trajectory;
+        if(cfg.authoredMantle)for(std::size_t sample=0;sample<65;++sample) {
+            const auto weights=contactWeights(Motion::contextMantle,float(sample)/64.f);
+            cfg.authoredMantleContacts[sample]={weights[0],weights[1]};
+        }
         cfg.threepeatMantleHeight=mantle.height;cfg.threepeatMantleSeconds=mantle.seconds;cfg.threepeatMantleForward=mantle.travel.y;
         auto mantlePose=mantle.frames.front();rig.adapt(mantlePose);
         const auto mantleStart=world(mantlePose);
@@ -225,10 +319,10 @@ struct Library {
         sourceValidated=true;
         return true;
     }
-    Pose sampleBase(Motion motion,float phase) const {
+    Pose sampleBase(Motion motion,float phase,Motion direction=Motion::none,bool recovery=false) const {
         if(!isActiveMotion(motion))return rest;
-        const int index=int(motion)-1;const auto& frames=clips[index].frames;
-        if(frames.empty()) return rest;
+        const int index=int(motion)-1;const auto& frames=clip(motion,direction,recovery).frames;
+        if(frames.empty())return rest;
         float f=std::clamp(phase,0.f,1.f)*float(frames.size()-1);
         auto a=std::min(std::size_t(f),frames.size()-2); Pose out=frames[a];
         for(std::size_t i=0;i<out.size();++i) out[i]=blend(out[i],frames[a+1][i],f-float(a));
@@ -252,9 +346,12 @@ struct Library {
         rig.adapt(out);
         return out;
     }
-    Pose sample(Motion motion,float phase) const {
-        Pose result=sampleBase(motion,phase);
-        if(!hasAnimationOverride(motion)||result.size()!=99)return result;
+    Pose sample(Motion motion,float phase,Motion direction=Motion::none,bool recovery=false) const {
+        Pose result=sampleBase(motion,phase,direction,recovery);
+        if(!hasAnimationOverride(motion)||result.size()!=99||
+            ((wallRunLaunch(motion)||motion==Motion::runCatch||(motion==Motion::sideBrace&&wallRunDirectionIndex(direction)>=0&&
+                wallRunBraces[wallRunDirectionIndex(direction)].frames.size()>=2))&&hasWallRunSequence(direction))||
+            (motion==Motion::contextHang&&hasContextHopSequence(direction)))return result;
         const auto& replacement=rotationOverrides[int(motion)-1];
         const auto& frames=replacement.frames;
         const float frame=std::clamp(phase,0.f,1.f)*float(frames.size()-1);
@@ -263,12 +360,19 @@ struct Library {
             result[bone].q=rig.rotation(bone,blend(frames[first][bone],frames[first+1][bone],frame-float(first)));
         return result;
     }
-    const Clip& clip(Motion motion) const {
+    const Clip& clip(Motion motion,Motion direction=Motion::none,bool recovery=false) const {
         static const Clip unavailable;
+        if(hasWallRunSequence(direction)) {
+            const int index=wallRunDirectionIndex(direction);
+            if(wallRunLaunch(motion))return wallRunLaunches[index];
+            if(motion==Motion::runCatch)return wallRunCatches[index];
+            if(motion==Motion::sideBrace&&wallRunBraces[index].frames.size()>=2)return wallRunBraces[index];
+        }
+        if(motion==Motion::contextHang&&hasContextHopSequence(direction))return (recovery?contextHopRecoveries:contextHopPreparations)[direction==Motion::contextHopLeft?0:1];
         return isActiveMotion(motion)?clips[int(motion)-1]:unavailable;
     }
-    std::array<float,4> contactWeights(Motion motion,float phase) const {
-        const auto& weights=clip(motion).contacts;if(weights.size()<2)return {};
+    std::array<float,4> contactWeights(Motion motion,float phase,Motion direction=Motion::none,bool recovery=false) const {
+        const auto& weights=clip(motion,direction,recovery).contacts;if(weights.size()<2)return {};
         float f=std::clamp(phase,0.f,1.f)*float(weights.size()-1);
         auto a=std::min(std::size_t(f),weights.size()-2);std::array<float,4> result{};
         for(int i=0;i<4;++i)result[i]=weights[a][i]+(weights[a+1][i]-weights[a][i])*(f-float(a));
@@ -333,9 +437,9 @@ struct Library {
         }
     }
 
-    float ik(Pose& p,int a,int b,int c,Vec target,Vec pole) const {
+    float ik(Pose& p,int a,int b,int c,Vec target,Vec pole,bool canonicalGuard=true) const {
         const int hand=a==28&&b==29&&c==38?0:a==31&&b==32&&c==39?1:-1;
-        if(hand>=0)guardArmBend(p,hand);
+        if(hand>=0&&canonicalGuard)guardArmBend(p,hand);
         const auto worldA=worldBone(p,a),worldB=worldBone(p,b),worldC=worldBone(p,c);
         if(!worldA||!worldB||!worldC)return std::numeric_limits<float>::infinity();
         Vec start=worldA->t,mid=worldB->t,end=worldC->t;
@@ -358,7 +462,7 @@ struct Library {
             return true;
         };
         if(!solve(1))return std::numeric_limits<float>::infinity();
-        if(hand>=0&&!armBendValid(p,hand)) {
+        if(hand>=0&&canonicalGuard&&!armBendValid(p,hand)) {
 
             if(!solve(-1))return std::numeric_limits<float>::infinity();
             if(!armBendValid(p,hand))guardArmBend(p,hand);

@@ -9,14 +9,16 @@ bool eaveObstacleAhead(World& w,Input intent) const {
     return false;
 }
 bool tryEaveTransfer(World& originalWorld,Input intent={0,1},bool wallRun=false,float speed=0,float stamina=1000) {
+    const Motion selected=std::abs(intent.x)>.6f&&intent.y<.5f?(intent.x<0?Motion::hopLeft:Motion::hopRight):Motion::hopUp;
+    const bool sourceRoute=authored(selected);
     struct BoundedWorld final:World {
-        World& source;unsigned calls{};bool exhausted{};
-        explicit BoundedWorld(World& world):source(world){}
+        World& source;unsigned calls{},limit{};bool exhausted{};
+        BoundedWorld(World& world,unsigned maximum):source(world),limit(maximum){}
         std::optional<Hit> ray(Vec a,Vec b)override {
-            if(calls>=1800){exhausted=true;return Hit{a,(a-b).unit(),false};}
+            if(calls>=limit){exhausted=true;return Hit{a,(a-b).unit(),false};}
             ++calls;return source.ray(a,b);
         }
-    } bounded(originalWorld);
+    } bounded(originalWorld,sourceRoute?12288:1800);
     World& w=bounded;
     if(!position.finite()||!surfaceNormal.finite()||std::abs(surfaceNormal.z)>=cfg.maxNormalZ||
         intent.y<0||std::hypot(intent.x,intent.y)<.1f||(wallRun&&!cfg.wallRunObstacleJumps))return false;
@@ -66,7 +68,7 @@ bool tryEaveTransfer(World& originalWorld,Input intent={0,1},bool wallRun=false,
             const Vec shift=normal*outward+right*side;
             if(shift.length()>cfg.reach+.01f)continue;
             const Vec outside=position+shift;
-            if(!clearPath(w,position,outside)||!roofPathClear(w,position,outside))continue;
+            if(!sourceRoute&&(!clearPath(w,position,outside)||!roofPathClear(w,position,outside)))continue;
             bool prefixChecked=false,prefixClear=false;
             for(std::size_t ai=0;ai<advances.size();++ai) {
                 const float advance=advances[ai];
@@ -76,7 +78,7 @@ bool tryEaveTransfer(World& originalWorld,Input intent={0,1},bool wallRun=false,
                 for(std::size_t prior=0;prior<ai;++prior)duplicate|=std::abs(advances[prior]-advance)<1;
                 if(duplicate)continue;
                 const Vec over=outside+heading*advance;
-                if(!clearPath(w,outside,over)||!roofPathClear(w,outside,over)) {
+                if(!sourceRoute&&(!clearPath(w,outside,over)||!roofPathClear(w,outside,over))) {
                     if(!prefixChecked) {
                         const Vec prefix=outside+heading*48;
                         prefixClear=clearPath(w,outside,prefix)&&roofPathClear(w,outside,prefix);
@@ -104,19 +106,22 @@ bool tryEaveTransfer(World& originalWorld,Input intent={0,1},bool wallRun=false,
                     const Vec target=anchor->position,delta=target-position;
                     if(delta.dot(heading)<48||delta.dot(heading)>176||delta.z<-.5f||
                         delta.length()>cfg.reach+80||(target-over).length()>cfg.reach||
-                        !clearPath(w,over,target)||!roofPathClear(w,over,target))continue;
+                        (!sourceRoute&&(!clearPath(w,over,target)||!roofPathClear(w,over,target))))continue;
                     const float route=shift.length()+advance+(target-over).length();
                     const float cadence=wallRun?std::clamp(route/(std::max(150.f,speed)*1.35f),.58f,.90f):
                         std::clamp(route/340.f,.72f,1.04f);
                     const float peakDistance=1.5f*std::max({shift.length()*4,advance*2,(target-over).length()*4});
                     const float seconds=std::max(cadence,peakDistance/420.f);
-                    if(stamina<(wallRun?30.f+2*cfg.drain*(seconds+.05f):15.f)||bounded.exhausted)return false;
-                    const Vec startSurface=surfaceNormal;
-                    const Motion motion=sideways?(intent.x<0?Motion::hopLeft:Motion::hopRight):Motion::hopUp;
-                    beginAction(motion,position,target,seconds);
-                    detour=true;detourOut=outside;detourOver=over;roofTransfer=true;
-                    actionStartSurface=startSurface;actionTargetSurface=anchor->hit.normal.unit();
-                    actionLandingNormal=horizontal(actionTargetSurface);
+                    if(stamina<(wallRun?30.f+2*cfg.drain*(motionDuration(selected,seconds)+.05f):15.f)||bounded.exhausted)return false;
+                    if(sourceRoute) {
+                        if(!commitAuthoredRoute(w,selected,target,seconds,horizontal(anchor->hit.normal),true,outside,over,true,anchor->hit.normal.unit(),0,wallRun?speed:0))continue;
+                    } else {
+                        const Vec startSurface=surfaceNormal;
+                        beginAction(selected,position,target,seconds);
+                        detour=true;detourOut=outside;detourOver=over;roofTransfer=true;
+                        actionStartSurface=startSurface;actionTargetSurface=anchor->hit.normal.unit();
+                        actionLandingNormal=horizontal(actionTargetSurface);
+                    }
                     if(wallRun) {
                         actionBeganRunning=true;actionRunSpeed=speed;obstacleJump=true;++obstacleJumps;
                         obstacleProbeCooldown=.5f;runClearanceCooldown=0;

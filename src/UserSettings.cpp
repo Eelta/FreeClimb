@@ -56,7 +56,7 @@ constexpr Flag flags[]{
     {"General","LegacyAutomaticHops",&UserSettings::legacyAutomaticHops},{"General","SurfaceActionVariants",&UserSettings::surfaceActionVariants},
     {"General","WallRunObstacleJumps",&UserSettings::wallRunObstacleJumps},{"General","Diagnostics",&UserSettings::diagnostics},
     {"AutomaticActions","ContextualMantleEnabled",&UserSettings::contextualMantleEnabled},
-    {"Movement","FancyJumps",&UserSettings::fancyJumps},
+    {"Movement","FancyJumps",&UserSettings::fancyJumps},{"Movement","WallRunEnabled",&UserSettings::wallRunEnabled},
     {"Audio","Enabled",&UserSettings::audioEnabled},{"Stamina","Enabled",&UserSettings::staminaEnabled}
 };
 struct IniBindingField {const char* name;KeyChord InputBindings::* member;};
@@ -144,6 +144,7 @@ UserSettings restoreSettingsPage(SettingsPage page,const UserSettings& current) 
         settings.lowStaminaNotifications=defaults.lowStaminaNotifications;settings.autoMantle=defaults.autoMantle;
         break;
     case SettingsPage::movement:
+        settings.wallRunEnabled=defaults.wallRunEnabled;
         settings.upSpeed=defaults.upSpeed;settings.downSpeed=defaults.downSpeed;settings.sideSpeed=defaults.sideSpeed;
         settings.wallRunSpeed=defaults.wallRunSpeed;settings.diagonalRunMultiplier=defaults.diagonalRunMultiplier;
         break;

@@ -79,7 +79,7 @@ Outcome run(EaveWorld& w,int fps,bool sprint=false,bool obstacle=false,bool remo
                 const float angle=angleBetween(previous[i].q,pose[i].q);
                 out.maxAngle=std::max(out.maxAngle,angle);
                 if(recoveryEnabled) {
-                    const bool parkour=runMotion(result.motion)||flipMotion(result.motion)||
+                    const bool parkour=runMotion(result.motion)||
                         (result.motion>=Motion::kickUp&&result.motion<=Motion::kickRight);
                     check(angle<=(parkour?18.849556f:12.566371f)/fps+.015f,
                         "scheduled eave fallback retains the existing per-motion angular bound on every frame");

@@ -17,6 +17,11 @@ SOURCE_FILES = (
     "tools/AuthoringCli.cpp", "tools/authoring/core.py", "tools/authoring/app.py",
     "tools/MigrateAnimationPack.cpp", "tools/retarget_threepeat.py",
     "tools/authoring/Start.cmd", "tools/authoring/README.md", "tools/authoring/README.zh-CN.md", "tools/authoring/bin/FreeClimbAuthoring.exe",
+    "tools/converter/README.md", "tools/converter/README.zh-CN.md",
+    "tools/converter/Converter.manifest",
+    "tools/converter/images/overview.png", "tools/converter/images/overview.zh-CN.png",
+    "tools/converter/images/contacts.png", "tools/converter/images/contacts.zh-CN.png",
+    "tools/converter/bin/FreeClimbHKXConverter.exe", "tools/converter/bin/FreeClimbConverter.exe",
     "tests/ReleasePipelineTests.py",
     "docs/ANIMATION-DIY.md", "docs/ANIMATION-DIY.zh-CN.md",
     "translations/FreeClimb_english.txt", "translations/FreeClimb_chinese.txt",
@@ -30,6 +35,7 @@ SOURCE_TYPES = {
     "tests": {".h", ".hpp", ".cpp", ".c", ".py", ".ps1"},
     "cmake": {".cmake"},
     "config": {".ini"},
+    "tools/converter": {".h", ".cpp"},
 }
 SOURCE_EXCLUDED = {"cmake/LocalTests.cmake"}
 
@@ -95,12 +101,14 @@ def animation_manifest():
     animations = json.loads((ROOT / "tools/animation-runtime.json").read_text(encoding="utf-8"))
     files = animations.get("files", {})
     directory = "meshes/actors/character/animations/FreeClimb/"
-    if animations.get("schema") != 2 or animations.get("motions") != 35 or animations.get("skeletonBones") != 99:
-        raise ValueError("Expected schema 2 animation manifest with 35 clips and 99 bones")
+    if animations.get("schema") != 2 or animations.get("motions") != 31 or animations.get("skeletonBones") != 99:
+        raise ValueError("Expected schema 2 animation manifest with 31 clips and 99 bones")
     if animations.get("version") != version() or animations.get("pack") != directory + "pack.json":
         raise ValueError("Animation release version or pack entry mismatch")
-    if len(files) != 72 or sum(name.endswith('.hkx') for name in files) != 35 or sum(name.startswith(directory + 'configs/') and name.endswith('.json') for name in files) != 35:
-        raise ValueError("Default pack must contain 35 HKX, 35 clip configs, pack.json and skeleton.json")
+    if len(files) != 52 or sum(name.endswith('.hkx') for name in files) != 25 or sum(name.startswith(directory + 'configs/') and name.endswith('.json') for name in files) != 25:
+        raise ValueError("Default pack must contain 25 HKX files, 25 action configs, pack.json and skeleton.json")
+    if any(directory + name not in files for name in tuple(f"{prefix}{name}.{extension}" for name in ("runUp", "runLeft", "runRight", "runDiagonalLeft", "runDiagonalRight", "contextHopLeft", "contextHopRight") for prefix, extension in (("", "hkx"), ("configs/", "json")))):
+        raise ValueError("Missing directional wall-run or contextual-hop animation")
     if directory + "pack.json" not in files or directory + "skeleton.json" not in files:
         raise ValueError("Missing editable pack or skeleton manifest")
     if len({name.casefold() for name in files}) != len(files):
@@ -123,6 +131,11 @@ def source_files():
     validate_author_baseline()
     excluded = set(publication()['excluded_source_files'])
     paths = {ROOT / name for name in SOURCE_FILES}
+    for name, expected in animation_manifest()['files'].items():
+        path = ROOT / 'runtime' / name
+        if not regular_file(path, ROOT / 'runtime') or sha256(path) != expected:
+            raise ValueError(f'Converter base animation differs from the runtime manifest: {name}')
+        paths.add(path)
     for directory, extensions in SOURCE_TYPES.items():
         paths.update(p for p in (ROOT / directory).rglob("*")
                      if p.is_file() and p.suffix.lower() in extensions
@@ -154,8 +167,8 @@ def runtime_files(runtime_assets, dll):
     directory = "meshes/actors/character/animations/FreeClimb/"
     if directory + "pack.json" not in animation_files or directory + "skeleton.json" not in animation_files:
         raise ValueError("Missing editable pack or skeleton manifest")
-    if sum(name.endswith(".hkx") for name in animation_files) != 35:
-        raise ValueError("The default release must contain 35 HKX clips")
+    if sum(name.endswith(".hkx") for name in animation_files) != 25:
+        raise ValueError("The default release must contain 25 HKX files for 31 slots")
     for name, expected_hash in animation_files.items():
         source = runtime_assets / name
         if not name.startswith(directory) or ".." in Path(name).parts or Path(name).suffix not in {".json", ".hkx"}:

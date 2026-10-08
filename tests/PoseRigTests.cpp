@@ -285,7 +285,7 @@ static void actualClipCoverage(const Library& source) {
             for(int step=0;step<=40;++step) {
                 const float phase=step/40.f;const auto authored=source.sample(motion,phase),adapted=lib.sample(motion,phase);
                 finitePose(adapted);unchangedStructure(lib,f,adapted);
-                if(variant==0)check(exact(authored,adapted),"all35 canonical HKX clips preserve every sampled transform bit");
+                if(variant==0)check(exact(authored,adapted),"all active canonical HKX clips preserve every sampled transform bit");
                 else for(int bone:{7,8,29,32,38,39})oldLengthError=std::max(oldLengthError,(authored[bone].t-f.native[bone].t).length());
                 const auto body=lib.world(adapted);
                 Pose scene(99);
@@ -300,7 +300,7 @@ static void actualClipCoverage(const Library& source) {
             check(exact(lib.clip(motion).frames.front(),clip.frames.front())&&exact(lib.clip(motion).frames.back(),clip.frames.back()),"actual HKX source frames remain immutable");
         }
     }
-    check(motions==activeMotionCount*3&&samples==activeMotionCount*3*41,"all35 clips cover canonical and two changed player structures");
+    check(motions==activeMotionCount*3&&samples==activeMotionCount*3*41,"all active clips cover canonical and two changed player structures");
     check(oldLengthError>2,"negative control exposes the old canonical translation override");
     std::cout<<"HKX_RIG motions="<<motions<<" samples="<<samples<<" oldLengthError="<<oldLengthError<<'\n';
 }

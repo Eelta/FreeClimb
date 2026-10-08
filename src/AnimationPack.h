@@ -4,9 +4,11 @@
 namespace fc {
 struct AnimationPackSlotResult {
     Motion motion{};
-    std::string file,reason;
+    std::string file,reason,path;
     OverrideStatus status=OverrideStatus::missing;
     std::size_t samples{};
+    std::size_t bytes{};
+    std::uint64_t contentId{};
     float seconds{};
 };
 struct AnimationPackReport {

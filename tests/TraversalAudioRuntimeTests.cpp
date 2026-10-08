@@ -1,5 +1,6 @@
 #include "Core.h"
 #include "RuntimePolicy.h"
+#include "CornerTestWorld.h"
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
@@ -13,6 +14,8 @@ std::array<float,3> position{};
 bool manager=true,playing=false,assumedShortcut=false;
 std::uint64_t duration=0;
 std::vector<std::string> messages;
+fc::Motion contactDirection=fc::Motion::none;
+bool contactRecovery{};
 }
 namespace SKSE::log {
 template<class...Args>void info(const char* message,Args...){mock::messages.emplace_back(message);}
@@ -84,7 +87,7 @@ template<class Function>struct Relocation {
 };
 }
 namespace fc {
-struct Library {std::array<float,4> contactWeights(Motion,float) const{return {};}};
+struct Library {std::array<float,4> contactWeights(Motion,float,Motion direction,bool recovery) const{mock::contactDirection=direction;mock::contactRecovery=recovery;return {};}};
 }
 #include "TraversalAudioRuntime.h"
 void require(bool okay,const char* message){if(!okay)throw std::runtime_error(message);}
@@ -97,8 +100,34 @@ void step(fc::TraversalAudioRuntime& audio,fc::Vec point={}) {
     audio.update(library,traversal,result,.40f,.1f,true);
 }
 void observeAll(fc::TraversalAudioRuntime& audio) {for(unsigned i=0;i<100;++i)audio.observe(.01f);}
+void directionalContacts() {
+    fc::Library library;fc_test::CornerWorld world;world.boxes={{{-20000,0,-10000},{20000,1000,20000}}};
+    for(int side:{-1,1}) {
+        fc::TraversalAudioRuntime audio;require(audio.install(),"directional audio descriptors rejected");
+        fc::Traversal traversal;traversal.cfg=fc_test::settings();traversal.cfg.approachSeconds=.01f;
+        traversal.cfg.threepeatAnimations=true;traversal.cfg.surfaceActionVariants=true;traversal.cfg.automaticClimbActions=true;
+        traversal.cfg.autoActionMinSeconds=.1f;traversal.cfg.autoActionMaxSeconds=.1f;
+        traversal.cfg.threepeatHangHeight=138.12f;traversal.cfg.threepeatHandHalfWidth=25.14f;traversal.cfg.threepeatHangForward=30;
+        traversal.cfg.threepeatHopDistance={165,170};traversal.cfg.threepeatHopSeconds={1.3f,1.3f};
+        require(traversal.attach(world,{0,-45,300},{0,1,0},1000,60),"directional audio fixture attaches");
+        traversal.update(world,{},.05f,1000);
+        bool preparing=false,acting=false,recovering=false;
+        for(int frame=0;frame<360;++frame) {
+            const auto result=traversal.update(world,acting?fc::Input{}:fc::Input{float(side),0},1.f/60,1000);
+            if(fc::threepeatHop(result.motion))acting=true;
+            if(result.motion!=fc::Motion::contextHang)continue;
+            audio.update(library,traversal,result,.5f,1.f/60,true);
+            const bool recovery=traversal.holdsDestinationEdge(result.motion);
+            require(mock::contactDirection==(side<0?fc::Motion::contextHopLeft:fc::Motion::contextHopRight)&&mock::contactRecovery==recovery,
+                "Audio selects the actual independent direction and preparation/recovery stage");
+            preparing|=!recovery;recovering|=recovery;
+        }
+        require(preparing&&acting&&recovering,"Both real contextual preparation and recovery paths reach audio sampling");
+    }
+}
 int main() {
     try {
+        directionalContacts();
         fc::TraversalAudioRuntime audio;require(audio.install(),"descriptors rejected");
         step(audio);require(audio.statistics()[0].queued==1,"step not queued");
         require(mock::queries==0,"synchronous status request");
