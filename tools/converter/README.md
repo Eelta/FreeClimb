@@ -20,6 +20,10 @@ The tool exports one HKX and one action JSON to install and replace the correspo
 
 The default ZIP name is `SourceName-FreeClimb-TargetAction.zip`. The action selected in the tool determines what is replaced, regardless of the ZIP name.
 
+**Read on if you need more detail. Otherwise, you can stop here.**
+
+------
+
 Each wall-run direction has its own HKX containing the complete start, loop and ending, plus one JSON.
 
 - **Edit a base action:** select its direction and click **Base action**. Preview and adjust the complete action; its existing loop range loads automatically.
@@ -40,10 +44,6 @@ Windows x64 requires the Microsoft Visual C++ v14 x64 runtime. **Python, Blender
 Inspect the bone animation on the left and play or scrub below it. Adjustments on the right are optional; export is at the top right. Hover over a filename to see its full path. Check the in-game result after export.
 
 Imported HKX files preview their own animation and source movement, and complete wall runs play through the whole file. Base actions include their existing game-route adaptation. Real map collision, character skins and clothing physics still require in-game checks.
-
-**Read on if you need more detail. Otherwise, you can stop here.**
-
-------
 
 ## Adapting existing HKX files
 
