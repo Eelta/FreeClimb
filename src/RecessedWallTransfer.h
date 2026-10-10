@@ -48,7 +48,7 @@ bool tryRecessedWallTransfer(World& originalWorld,Input intent,bool wallRun,floa
                     if(motion==Motion::kickUp&&(!wallRun||!kickClearance(w,position)))continue;
                     const float seconds=std::max(wallRun?.58f:.72f,peak/(motion==Motion::kickUp?680.f:420.f));
                     if(stamina<(wallRun?30.f+2*cfg.drain*(motionDuration(motion,seconds)+.05f):15.f))continue;
-                    if(commitAuthoredRoute(w,motion,target,seconds,normal,true,outside,over,true,anchor->hit.normal.unit(),0,wallRun?speed:0)){accepted=true;break;}
+                    if(commitAuthoredRoute(w,motion,target,seconds,horizontal(anchor->hit.normal),true,outside,over,true,anchor->hit.normal.unit(),0,wallRun?speed:0)){accepted=true;break;}
                     if(w.exhausted)return false;
                 }
                 if(!accepted)continue;
@@ -73,10 +73,13 @@ bool tryRecessedWallTransfer(World& originalWorld,Input intent,bool wallRun,floa
             const float peak=1.5f*std::max({(outside-position).length()*4,(over-outside).length()*2,(target-over).length()*4});
             const float seconds=std::max(wallRun?.58f:.72f,peak/(kick?680.f:420.f));
             if(stamina<(wallRun?30.f+2*cfg.drain*(seconds+.05f):15.f))return false;
-            const auto startSurface=surfaceNormal;
-            beginAction(kick?Motion::kickUp:Motion::hopUp,position,target,seconds);
-            detour=true;detourOut=outside;detourOver=over;roofTransfer=true;
-            actionStartSurface=startSurface;actionTargetSurface=anchor->hit.normal.unit();actionLandingNormal=normal;
+            auto planned=*this;
+            planned.beginAction(kick?Motion::kickUp:Motion::hopUp,position,target,seconds);
+            planned.detour=true;planned.detourOut=outside;planned.detourOver=over;planned.roofTransfer=true;
+            planned.actionStartSurface=surfaceNormal;planned.actionTargetSurface=anchor->hit.normal.unit();
+            planned.actionLandingNormal=horizontal(planned.actionTargetSurface);
+            if(!planned.authoredActionClear(w,true)||w.exhausted)continue;
+            *this=std::move(planned);
             if(wallRun) {
                 actionBeganRunning=true;actionRunSpeed=speed;obstacleJump=true;++obstacleJumps;
                 obstacleProbeCooldown=.5f;runClearanceCooldown=0;

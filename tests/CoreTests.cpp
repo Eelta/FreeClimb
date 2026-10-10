@@ -188,7 +188,14 @@ static void supportedTopRecovery() {
         world.boxes={{{-4,0,neighbour?106.f:112.f},{4,100,112},true}};
         Result r;for(int frame=0;frame<120&&t.active();++frame)r=t.update(world,{},1.f/60,100);
         if(neighbour)check(t.active()&&!r.released,"an existing grip retains two real close contacts at a vertical triangle edge");
-        else check(!t.active()&&r.released&&!r.completed,"one isolated collision point cannot indefinitely support a hanging actor");
+        else {
+            const auto held=t.position;
+            for(int frame=0;frame<60;++frame) {
+                r=t.update(world,{0,1},1.f/60,100);
+                check(t.active()&&!r.released&&!r.completed&&(t.position-held).length()<.001f,
+                    "one isolated collision point retains a stationary hold without authorizing movement");
+            }
+        }
     }
     {
         Scene world;world.boxes={{{-500,0,-100},{500,300,1000},true}};Traversal t;
@@ -264,9 +271,20 @@ static void roundedTopCorners() {
         while(reference.progress()<.40f&&reference.active())reference.update(clear,{0,1,false,true},1.f/60,100);
         const float ceiling=reference.position.z+reference.cfg.height+.2f;
         clear.boxes.push_back({{-500,-500,ceiling},{500,500,ceiling+2},false});
+        const auto stoppedAt=reference.position;const float stoppedPhase=reference.progress();
         r=reference.update(clear,{0,1,false,true},1.f/60,100);
-        check(r.released&&!r.completed&&(std::string(r.reason)=="top-out path changed"||std::string(r.reason)=="mantle support changed"),
-            "runtime clearance still prevents a prechecked rounded top from crossing a new solid obstruction");
+        check(!r.released&&!r.completed&&reference.active()&&reference.state==State::mantle&&
+            (reference.position-stoppedAt).length()<.001f&&reference.progress()==stoppedPhase&&
+            (std::string(r.reason)=="top-out path changed"||std::string(r.reason)=="mantle support changed"),
+            "runtime clearance holds a prechecked rounded top before a new solid obstruction");
+        for(int frame=0;frame<60;++frame) {
+            r=reference.update(clear,{0,1,false,true},1.f/60,100);
+            check(!r.released&&!r.completed&&(reference.position-stoppedAt).length()<.001f&&reference.progress()==stoppedPhase,
+                "a persistent mantle obstruction freezes the original route and source phase");
+        }
+        clear.boxes.pop_back();
+        for(int frame=0;frame<240&&reference.active();++frame)r=reference.update(clear,{0,1,false,true},1.f/60,100);
+        check(r.completed&&!reference.active(),"removing the new ceiling resumes and completes the existing mantle");
     }
 }
 static void summitExitAndProbeBudget() {
@@ -314,7 +332,7 @@ static void summitExitAndProbeBudget() {
             peakPlayback=std::max(peakPlayback,world.casts);
         }
         std::cout<<"top probe commit="<<committed<<" peak playback="<<peakPlayback<<'\n';
-        check(r.completed&&peakPlayback<=40,"mantle playback performs current-step clearance without repeating preflight");
+        check(r.completed&&peakPlayback<=48,"mantle playback retains bounded current-step clearance and eight cross-section probes without repeating preflight");
     }
 }
 static void changedFutureTopClearance() {
@@ -336,7 +354,17 @@ static void changedFutureTopClearance() {
             const float z=std::max({obstacle.lo.z-(t.position.z+t.cfg.height-t.cfg.radius),0.f,t.position.z+t.cfg.radius-obstacle.hi.z});
             check(x*x+y*y+z*z>=t.cfg.radius*t.cfg.radius-.02f,"live mantle segments stop before the physical capsule reaches a new future obstruction");
         }
-        check(r.released&&!r.completed&&std::string(r.reason)=="top-out path changed","future obstruction is rejected before completing the mantle");
+        check(!r.released&&!r.completed&&t.active()&&t.state==State::mantle,
+            "future obstruction stops the mantle without releasing control or falsely completing");
+        const auto stoppedAt=t.position;const float stoppedPhase=t.progress();
+        for(int frame=0;frame<fps;++frame) {
+            r=t.update(world,{0,1,false,true},1.f/fps,100);
+            check(!r.released&&!r.completed&&(t.position-stoppedAt).length()<.001f&&t.progress()==stoppedPhase,
+                "waiting at the future obstruction cannot creep into the solid");
+        }
+        world.boxes.pop_back();
+        for(int frame=0;frame<fps*4&&t.active();++frame)r=t.update(world,{0,1,false,true},1.f/fps,100);
+        check(r.completed&&!t.active(),"a future obstruction removed after the hold allows normal mantle completion");
     }
 }
 static void flowingParkourActions() {
@@ -468,13 +496,48 @@ static void reachableSupportContracts() {
             check(t.attach(wall,{0,-30,100},{0,1,0},100),"support range fixture attach");
             const auto start=t.position;
             wall.boxes[0].lo.y=70;
-            Result r;float farthest=0;
+            Result r;float farthest=0,landedHeight=0;bool planned=false,landed=false;
             for(int frame=0;frame<fps*2&&t.active();++frame) {
                 r=t.update(wall,moving?Input{0,1}:Input{},dt,100);
                 farthest=std::max(farthest,(t.position-start).length());
+                if(t.recoveringSupport()&&!planned) {
+                    planned=true;
+                    verify(t.state==State::action&&hopMotion(r.motion)&&
+                        std::string(r.reason)=="checked nearby support recovery"&&(t.position-start).length()<.001f,
+                        "a remote-wall recovery starts a checked leap before committing any position change");
+                    const Vec target=t.actionPathPoint(1);
+                    verify(std::abs(target.y-(70-t.cfg.gap))<.001f,
+                        "recovery selects an actual gap-corrected root at the remote wall");
+                    for(float side:{-10.f,10.f}) {
+                        const Vec hand=target+Vec{side,0,t.cfg.grip};
+                        const auto hit=wall.ray(hand,hand+Vec{0,t.cfg.gap+4,0});
+                        verify(hit&&hit->climbable&&std::abs(hit->point.y-70)<.001f,
+                            "a remote recovery endpoint has real neighbouring hand contacts");
+                    }
+                    for(int sample=0;sample<=64;++sample) {
+                        const Vec point=t.actionPathPoint(sample/64.f);
+                        verify(point.finite()&&point.y+t.cfg.radius<=70.001f&&point.z+6>=-100&&point.z+t.cfg.height<1000,
+                            "the full planned leap remains outside the finite destination wall");
+                    }
+                }
+                verify(!r.released&&t.active()&&t.position.y+t.cfg.radius<=70.001f,
+                    "remote-wall recovery retains ownership and independent live body clearance");
+                verify(farthest<.001f||planned,
+                    "normal climbing cannot renew motion through air without a prechecked recovery action");
+                if(planned&&!t.recoveringSupport()&&t.state==State::wall&&!landed) {
+                    landed=true;landedHeight=t.position.z;
+                }
             }
-            verify(r.released&&!t.active()&&farthest<.001f,
-                "a distant wall cannot renew grip or pull an unsupported body through air");
+            if(moving) {
+                verify(planned&&landed&&!r.released&&t.active()&&t.position.z>landedHeight+.1f,
+                    "intended movement can safely recover to a nearby real wall and continue climbing");
+            } else {
+                verify(!planned&&!r.released&&t.active()&&farthest<.001f,
+                    "an idle player keeps the last anchor without automatically jumping to a remote wall");
+                wall.boxes[0].lo.y=0;
+                for(int frame=0;frame<fps&&(t.position-start).length()<.01f;++frame)r=t.update(wall,{0,1},dt,100);
+                verify(t.active()&&!r.released&&t.position.z>start.z,"a reachable wall returning after a long hold restores checked movement");
+            }
         }
         {
             Scene wall;wall.boxes={{{-500,0,-100},{500,300,1000},true}};
@@ -484,8 +547,11 @@ static void reachableSupportContracts() {
             wall.boxes[0].hi={500,10,32};
             const auto start=t.position;Result r;
             for(int frame=0;frame<fps*2&&t.active();++frame)r=t.update(wall,{},dt,100);
-            verify(r.released&&!t.active()&&(t.position-start).length()<.001f,
-                "a foot-height fragment alone cannot indefinitely renew a hanging hand grip");
+            verify(!r.released&&t.active()&&(t.position-start).length()<.001f,
+                "a foot-height fragment cannot renew a hanging hand grip or move a held actor");
+            wall.boxes[0].hi={500,300,1000};
+            for(int frame=0;frame<fps&&(t.position-start).length()<.01f;++frame)r=t.update(wall,{0,1},dt,100);
+            verify(t.active()&&!r.released&&t.position.z>start.z,"restored hand-height wall support ends the stationary hold");
         }
         {
             Scene wall;wall.boxes={{{-500,0,-100},{500,300,1000},true}};
@@ -510,7 +576,8 @@ static void reachableSupportContracts() {
                 verify(t.active()&&!r.released&&(t.position-start).length()<.001f,
                     "a short missing seam holds the last supported anchor without moving into air");
             }
-            wall.boxes=original;const auto resumed=t.update(wall,{0,1},dt,100);
+            wall.boxes=original;Result resumed;
+            for(int frame=0;frame<fps&&t.position.z<=start.z;++frame)resumed=t.update(wall,{0,1},dt,100);
             verify(t.active()&&!resumed.released&&t.position.z>start.z,
                 "nearby support returning after a short seam resumes movement without detachment");
         }
@@ -572,17 +639,24 @@ int main() {
     check(t.attach(s,{0,-30,0},{0,1,0},100),"low ceiling initial attach");
     t.update(s,{0,0,false,true},.02f,100);
     check(t.state!=State::mantle,"low ceiling prevents mantle");
-    check(t.update(s,{},.02f,0).released,"exhaustion drops");
+    const auto exhaustedAt=t.position;const auto exhausted=t.update(s,{},.02f,0);
+    check(!exhausted.released&&exhausted.staminaCost==0&&t.active()&&(t.position-exhaustedAt).length()==0,"exhaustion holds the last checked wall position");
     t.reset(); check(!t.attach(s,{NAN,0,0},{0,1,0},100),"NaN rejects");
     s.boxes={{{-500,0,-100},{500,300,1000},true}};
     t.reset(); check(t.attach(s,{0,-30,0},{0,1,0},100),"reattach for collision checks");
     auto initial=t.position;
     t.update(s,{1,1},10,100);
     check((t.position-initial).length()<5,"frame hitch cannot teleport through geometry");
-    s.boxes.clear();
+    s.boxes.clear();const auto heldAt=t.position;
     check(!t.update(s,{},.02f,100).released,"one missed surface frame retains the checked anchor");
-    for(int i=0;i<70&&t.active();++i)t.update(s,{},.02f,100);
-    check(!t.active(),"persistently missing support eventually releases");
+    for(int i=0;i<100;++i) {
+        const auto held=t.update(s,{1,1},.02f,100);
+        check(!held.released&&held.staminaCost==0&&t.active()&&(t.position-heldAt).length()<.001f,
+            "persistently missing support remains stationary without moving through air");
+    }
+    Input manual;manual.release=true;t.update(s,manual,.02f,0);
+    for(int i=0;i<60&&t.active();++i)t.update(s,{},.02f,0);
+    check(!t.active(),"manual drop releases a held actor even while support and stamina remain absent");
     s.boxes={{{-500,0,-100},{500,25,120},true}};
     t.reset(); check(t.attach(s,{0,-30,0},{0,1,0},100),"narrow wall attach");
     t.update(s,{0,0,false,true},.02f,100);
@@ -854,9 +928,15 @@ int main() {
         Scene ended;ended.boxes={{{-500,0,-100},{500,25,1000},true}};
         Traversal floating;floating.cfg.approachSeconds=0;
         check(floating.attach(ended,{0,-30,0},{0,1,0},100),"ending wall fixture attach");
-        ended.boxes[0].hi.z=-8;
-        for(int i=0;i<100&&floating.active();++i)floating.update(ended,{},.02f,100);
-        check(!floating.active(),"lower retry contacts cannot renew an unsupported air hang forever");
+        ended.boxes[0].hi.z=-8;const auto heldAt=floating.position;
+        for(int i=0;i<100;++i) {
+            const auto held=floating.update(ended,{0,1},.02f,100);
+            check(!held.released&&floating.active()&&(floating.position-heldAt).length()<.001f,
+                "lower retry contacts cannot turn a stationary unsupported hold into movement");
+        }
+        ended.boxes[0].hi.z=1000;
+        for(int i=0;i<50&&floating.position.z<=heldAt.z;++i)floating.update(ended,{0,1},.02f,100);
+        check(floating.active()&&floating.position.z>heldAt.z,"restored real hand support resumes an ending-wall hold");
     }
     std::cout<<"Traversal tests passed, including ledge-idle upward escape, unsupported-air recovery and narrow supported ridge top-out.\n";
  } catch(const std::exception& e) { std::cerr<<e.what()<<'\n'; return 1; }

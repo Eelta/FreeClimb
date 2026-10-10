@@ -194,7 +194,20 @@ static void liveObstacleToggle() {
         {
             auto blocked=t;auto removed=geometry;removed.boxes[0].high.z=target.z-4;
             const auto before=blocked.position;const auto out=blocked.update(removed,input,dt,1000000);
-            check(out.released&&same(before,blocked.position)&&std::string_view(out.reason)=="wall-run jump support changed","disabled running retains live landing-support checks on an ongoing automatic action");
+            check(!out.released&&blocked.active()&&blocked.state==State::action&&same(before,blocked.position)&&blocked.actionProgress()==phase&&
+                std::string_view(out.reason)=="wall-run jump support changed","disabled running retains a stopped action when its landing support changes");
+            for(int frame=0;frame<fps;++frame) {
+                const auto held=blocked.update(removed,input,dt,1000000);
+                check(!held.released&&held.staminaCost==0&&same(before,blocked.position)&&blocked.actionProgress()==phase,
+                    "live wall-run settings cannot bypass a blocked landing or force a drop");
+            }
+            for(int frame=0;frame<fps*3&&blocked.state==State::action;++frame) {
+                const auto resumed=blocked.update(geometry,input,dt,1000000);
+                check(!resumed.released&&geometry.clearance(blocked.position,blocked.cfg)+.03f>=blocked.cfg.radius,
+                    "restoring landing geometry retains safety after the running option changes");
+            }
+            check(blocked.active()&&blocked.state==State::wall&&!blocked.wallRunning(),
+                "restored ongoing obstacle action lands into the currently selected climb mode");
         }
         for(int frame=0;frame<fps*3&&t.state==State::action;++frame) {
             auto climbing=input;climbing.run=false;

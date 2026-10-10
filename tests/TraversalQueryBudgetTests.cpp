@@ -9,6 +9,7 @@ static void check(bool value,const char* message){++checks;if(!value)throw std::
 namespace fc {
 class TraversalCapture {
 public:
+    using RayCache=Traversal::ProbeRayCache;
     static bool preflight(Traversal& t,World& world,Motion motion,bool roof=false) {
         t.beginAction(motion,t.position,t.position+Vec{0,40,80},.5f);
         t.roofTransfer=roof;
@@ -49,6 +50,45 @@ static void forwarding() {
     check(world.rays==1&&world.bodies==1&&world.paths==1&&world.lastMiddle.z==3,"every forwarded callback retains its actual arguments");
     check(limited.ray({0,0,0},{0,0,1}).has_value()&&limited.exhausted&&world.rays==1,"budget exhaustion is blocking without another engine query");
     check(!limited.actionBodyClear(Motion::backFlipOut,{},{},0,.1f,{0,-1,0})&&world.bodies==1,"exhausted body checks do not escape the budget");
+}
+static void cachedSearchQueries() {
+    CountingWorld world;TraversalCapture::RayCache cache(world);
+    const Vec from{1,2,3},to{4,5,6};
+    check(!cache.ray(from,to)&&!cache.ray(from,to)&&world.rays==1,"identical clear probes use one engine query within the same search");
+    check(!cache.ray(from,{4,5,7})&&!cache.ray(to,from)&&world.rays==3,"different endpoints and reversed rays remain separate queries");
+    world.block=true;TraversalCapture::RayCache nextSearch(world);
+    const auto first=nextSearch.ray(from,to),second=nextSearch.ray(from,to);
+    check(first&&second&&world.rays==4&&(first->point-second->point).length()==0&&
+        (first->normal-second->normal).length()==0&&first->climbable==second->climbable,"a fresh search sees changed geometry and preserves the complete cached hit");
+    world.block=false;TraversalCapture::RayCache clearedSearch(world);
+    check(!clearedSearch.ray(from,to)&&world.rays==5,"a removed obstacle is queried again rather than inheriting an earlier blocked result");
+    TraversalCapture::RayCache collisionMisses(world);
+    for(int pass=0;pass<2;++pass)for(int index=0;index<2048;++index) {
+        const Vec a{float(index),float(index%7),float(index%11)},b=a+Vec{1,2,3};
+        const auto hit=collisionMisses.ray(a,b);
+        check(!hit,"hash collisions and capacity replacement cannot reuse a different query result");
+    }
+    check(world.rays>2048,"bounded cache capacity replaces old entries instead of growing across a long search");
+    world.block=true;TraversalCapture::RayCache collisionHits(world);
+    for(int pass=0;pass<2;++pass)for(int index=0;index<2048;++index) {
+        const Vec a{float(index),float(index%13),float(index%17)},b=a+Vec{3,5,7};
+        const auto hit=collisionHits.ray(a,b);
+        check(hit&&(hit->point-(a+b)*.5f).length()==0&&(hit->normal-(a-b).unit()).length()==0&&!hit->climbable,
+            "hash collisions cannot substitute another endpoint's hit location, normal or collision status");
+    }
+    check(cache.actionBodyClear(Motion::backFlipOut,from,to,0,.2f,{0,-1,0}),"cache forwards body checks");
+    world.bodyAllowed=false;
+    check(!cache.actionBodyClear(Motion::backFlipOut,from,to,0,.2f,{0,-1,0})&&world.bodies==2,"body callbacks are never cached even with identical arguments");
+    check(!cache.actionBodyPathClear(Motion::backFlipOut,from,to,0,.2f,{0,-1,0},{7,8,9})&&
+        !cache.actionBodyPathClear(Motion::backFlipOut,from,to,0,.2f,{0,-1,0},{9,8,7})&&world.paths==2&&world.lastMiddle.x==9,
+        "path body callbacks retain their arguments and are always forwarded");
+    CountingWorld limitedWorld;AuthoredQueryWorld budget(limitedWorld,2);TraversalCapture::RayCache bounded(budget);
+    check(!bounded.ray(from,to)&&!bounded.ray(from,to)&&limitedWorld.rays==1,"cached queries consume only actual engine-query budget");
+    check(!bounded.ray(from,{4,5,7})&&limitedWorld.rays==2,"distinct probes consume the remaining budget");
+    check(bounded.ray(from,{4,5,8}).has_value()&&budget.exhausted&&limitedWorld.rays==2,"cache misses remain blocking when the hard query budget is exhausted");
+    check(bounded.ray(from,{4,5,8}).has_value()&&budget.exhausted&&limitedWorld.rays==2,"a cached exhaustion result remains blocking without clearing exhaustion");
+    check(!bounded.actionBodyClear(Motion::backFlipOut,from,to,0,.2f,{0,-1,0})&&limitedWorld.bodies==0,
+        "cached search cannot bypass the exhausted body-check budget");
 }
 static void completeRoutes() {
     unsigned worst{};
@@ -115,13 +155,13 @@ static void rejectedMantleRetry() {
     }
     std::cout<<"blocked mantle retries="<<retries<<" rays="<<rays<<" peak="<<peak<<'\n';
     check(retries>0&&retries<=80,"unchanged blocked mantle does not repeat its full preflight every frame");
-    check(rays<90000&&peak<1200,"rejected direct and corridor paths keep a bounded retry workload");
+    check(rays<96000&&peak<1200,"rejected direct and corridor paths retain bounded retries including cross-section safety checks");
     check(t.active()&&!completed&&switches==0&&(t.position-start).length()<.001f,"rejected mantle stays attached without repeatedly entering and leaving ledge state");
     world.boxes.pop_back();
     for(int i=0;i<300&&t.active();++i)completed|=t.update(world,{0,0,false,true},1.f/60,100).completed;
     check(completed&&!t.active(),"removing the obstruction allows the same attachment to mantle without a stale failure cache");
 }
 int main()try {
-    forwarding();completeRoutes();boundedFailure();sourceObstacleDeduplication();rejectedMantleRetry();
+    forwarding();cachedSearchQueries();completeRoutes();boundedFailure();sourceObstacleDeduplication();rejectedMantleRetry();
     std::cout<<"Traversal query budget checks="<<checks<<'\n';return 0;
 }catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}

@@ -156,10 +156,14 @@ void manualHopControls() {
         CornerWorld world;world.corner(true);Traversal traversal;traversal.cfg=settings();
         require(traversal.attach(world,{-85,-37,0},{0,1,0},1000),"removed-source corner hop fixture attaches");
         traversal.update(world,{1,0},1.f/60,1000);
-        world.boxes[0].low.z=150;Input jump;jump.hop=true;
+        const auto before=traversal.position;world.boxes[0].low.z=150;Input jump;jump.hop=true;
         const auto result=traversal.update(world,jump,1.f/60,1000);
-        require(result.released&&!traversal.active()&&!hopMotion(result.motion),
-            "a surviving upper landing cannot authorize a hop after the current source grips disappear");++cases;
+        require(!result.released&&traversal.active()&&traversal.geometryHolding()&&!hopMotion(result.motion)&&
+            (traversal.position-before).length()==0,
+            "a surviving upper landing cannot authorize a hop after the current source grips disappear");
+        Input release;release.release=true;auto exit=traversal.update(world,release,1.f/60,1000);
+        for(int frame=0;frame<60&&!exit.released;++frame)exit=traversal.update(world,{},1.f/60,1000);
+        require(exit.released&&!traversal.active(),"unsupported corner source permits a deliberate drop");++cases;
     }
     {
         CornerWorld world;world.corner(true);Traversal traversal;traversal.cfg=settings();
@@ -192,8 +196,23 @@ int main(int argc,char** argv) {
         for(int frame=0;frame<90&&!traversal.turningCorner();++frame)traversal.update(world,{1,0},1.f/60,1000);
         require(traversal.turningCorner(),"dynamic corner fixture begins turn");
         capture(world,traversal,{1,0},1.f/60);
+        const auto boxes=world.boxes;const auto position=traversal.position;const float phase=traversal.progress();
         world.boxes.clear();const auto result=traversal.update(world,{1,0},1.f/60,1000);
-        require(!traversal.turningCorner()&&(!traversal.active()||result.released),"removing all physical support cancels the corner and resumes gravity");
+        require(!traversal.turningCorner()&&traversal.active()&&!result.released&&traversal.geometryHolding(),
+            "removing support cancels the stale corner while preserving attachment");
+        for(int frame=0;frame<60;++frame) {
+            const auto held=traversal.update(world,{1,0},1.f/60,1000);
+            require(!held.released&&(traversal.position-position).length()==0&&traversal.progress()==phase,
+                "missing corner support holds the exact root and phase through retries");
+        }
+        world.boxes=boxes;
+        for(int frame=0;frame<60;++frame) {
+            const auto resumed=traversal.update(world,{0,1},1.f/60,1000);
+            require(!resumed.released&&world.clearance(traversal.position,traversal.cfg)>=traversal.cfg.radius-.03f,
+                "restored corner resumes only inside independently checked body clearance");
+        }
+        require(traversal.active()&&!traversal.geometryHolding()&&traversal.position.z>position.z,
+            "restored corner support resumes checked upward movement");
     }
     std::cout<<"CornerIntegrationTests cases="<<cases<<" snapshots="<<snapshots<<" failures="<<failures<<'\n';
     return failures?1:0;

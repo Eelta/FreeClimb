@@ -74,9 +74,37 @@ static void attachmentAndExhaustion(int fps) {
     check(!denied.attach(geometry,{0,-37,100},{0,1,0},0)&&denied.lastFailure==AttachFailure::stamina,"enabled zero stamina refuses attachment");
     auto free=attach(geometry,settings(false));
     check(free.active(),"disabled zero stamina acquires supported wall");
-    auto charged=attach(geometry,settings());
-    const auto exhausted=charged.update(geometry,{0,1},1.f/fps,0);
-    check(exhausted.released&&!charged.active()&&std::string(exhausted.reason)=="stamina exhausted","enabled exhaustion retains original release");
+    auto charged=attach(geometry,settings());const float dt=1.f/fps;
+    while(charged.state==State::approach)charged.update(geometry,{},dt,1000);
+    const auto restAt=charged.position;const auto restNormal=charged.normal;const auto restPhase=charged.progress();
+    for(int frame=0;frame<fps*2;++frame) {
+        const auto exhausted=charged.update(geometry,{0,1,false,false,true,false,true},dt,0);
+        check(!exhausted.released&&charged.active()&&exhausted.staminaCost==0&&
+            (charged.position-restAt).length()==0&&(charged.normal-restNormal).length()==0&&charged.progress()==restPhase,
+            "enabled exhaustion holds the checked wall pose without movement, running or new hop cost");
+    }
+    const float resumeAt=std::max(1.f,charged.cfg.startStamina);
+    for(int frame=0;frame<fps;++frame) {
+        const auto recovering=charged.update(geometry,{0,1},dt,resumeAt-.01f);
+        check(!recovering.released&&recovering.staminaCost==0&&(charged.position-restAt).length()==0,
+            "partial stamina recovery cannot oscillate between rest and movement below the resume threshold");
+    }
+    for(int frame=0;frame<fps&&charged.position.z<=restAt.z;++frame)charged.update(geometry,{0,1},dt,resumeAt);
+    check(charged.active()&&charged.position.z>restAt.z,"rested climber resumes checked movement at the recovery threshold");
+    for(bool back:{false,true}) {
+        auto manual=attach(geometry,settings());while(manual.state==State::approach)manual.update(geometry,{},dt,1000);
+        manual.update(geometry,{0,1},dt,0);
+        Input release;release.release=true;release.backDrop=back;
+        auto result=manual.update(geometry,release,dt,0);
+        for(int frame=0;frame<fps*3&&manual.active();++frame)result=manual.update(geometry,{},dt,0);
+        check(result.released&&!manual.active()&&result.staminaCost==0,
+            "manual drop and back-push remain available throughout zero-stamina rest");
+    }
+    auto toggled=attach(geometry,settings());while(toggled.state==State::approach)toggled.update(geometry,{},dt,1000);
+    toggled.update(geometry,{0,1},dt,0);const auto toggleAt=toggled.position;toggled.cfg.staminaEnabled=false;
+    const auto unchecked=toggled.update(geometry,{0,1},dt,0);
+    check(!unchecked.released&&unchecked.staminaCost==0&&toggled.position.z>toggleAt.z,
+        "disabling stamina while resting restores ordinary checked movement without requiring regeneration");
     for(bool enabled:{false,true}) {
         Traversal absent;absent.cfg=settings(enabled);CornerWorld empty;
         check(!absent.attach(empty,{0,-37,100},{0,1,0},enabled?1000000.f:0.f)&&absent.lastFailure!=AttachFailure::stamina,"no-stamina mode cannot create a missing wall");
@@ -141,10 +169,47 @@ static void blockedAndLostSupport(int fps) {
             "disabled stamina cannot bypass a real overhead solid");
     }
     check(blocked.free.position.z>start.z&&blocked.free.position.z<400,"movement stops below the overhang without a phantom success");
-    Paired lost(wall());lost.settled(dt);lost.a.boxes.clear();lost.b.boxes.clear();bool released=false;
-    for(int frame=0;frame<fps*2&&!released;++frame)released=lost.tick({0,1},dt).released;
-    check(released&&!lost.free.active(),"disabled stamina still releases after actual support is lost");
+    Paired lost(wall());lost.settled(dt);const auto heldAt=lost.free.position;
+    const auto original=lost.a.boxes;lost.a.boxes.clear();lost.b.boxes.clear();
+    for(int frame=0;frame<fps*2;++frame) {
+        const auto held=lost.tick({0,1},dt);
+        check(!held.released&&lost.free.active()&&(lost.free.position-heldAt).length()==0&&held.staminaCost==0,
+            "both stamina modes hold missing geometry without inventing a movable support");
+    }
+    lost.a.boxes=original;lost.b.boxes=original;
+    for(int frame=0;frame<fps&&lost.free.position.z<=heldAt.z;++frame)lost.tick({0,1},dt);
+    check(lost.free.active()&&lost.free.position.z>heldAt.z,"both stamina modes resume when actual support returns");
     chains+=2;
+}
+static void actionRest(int fps) {
+    const float dt=1.f/fps;
+    for(bool mantle:{false,true}) {
+        auto geometry=wall(mantle?330.f:20000.f);auto t=attach(geometry,settings());
+        while(t.state==State::approach)t.update(geometry,{},dt,1000);
+        if(mantle) {
+            for(int frame=0;frame<fps*6&&t.state!=State::mantle;++frame)t.update(geometry,{0,1,false,true},dt,1000);
+            check(t.state==State::mantle,"rest fixture reaches a checked mantle");
+        } else {
+            const auto started=t.update(geometry,{0,1,false,false,true},dt,1000);
+            check(t.state==State::action&&hopMotion(started.motion),"rest fixture reaches a checked hop");
+            for(int frame=0;frame<3;++frame)t.update(geometry,{},dt,1000);
+        }
+        const auto state=t.state;const auto position=t.position;const float phase=t.progress();
+        for(int frame=0;frame<fps;++frame) {
+            const auto held=t.update(geometry,{0,1,false,true},dt,0);
+            check(!held.released&&!held.completed&&held.staminaCost==0&&t.state==state&&
+                (t.position-position).length()==0&&t.progress()==phase,
+                "exhaustion suspends an ongoing hop or mantle without restarting its source phase");
+        }
+        bool completed=false;
+        for(int frame=0;frame<fps*4&&t.state==state;++frame) {
+            const auto resumed=t.update(geometry,{},dt,std::max(1.f,t.cfg.startStamina));completed|=resumed.completed;
+            check(!resumed.released||resumed.completed,"regeneration resumes the existing action without an unexpected drop");
+        }
+        check(mantle?completed&&!t.active():t.active()&&t.state==State::wall,
+            "a suspended hop lands and a suspended mantle completes after regeneration");
+        ++chains;
+    }
 }
 static float randomValue(std::uint32_t& state) {
     state^=state<<13;state^=state>>17;state^=state<<5;return float(state>>8)*(1.f/16777216.f);
@@ -196,7 +261,7 @@ static void legacyCannotBypassWeight(int fps,int side) {
 }
 int main(){try {
     for(int fps:{30,60,120}) {
-        attachmentAndExhaustion(fps);movementAndManual(fps);obstacleAndTop(fps);blockedAndLostSupport(fps);
+        attachmentAndExhaustion(fps);movementAndManual(fps);obstacleAndTop(fps);blockedAndLostSupport(fps);actionRest(fps);
         automaticSides(fps,-1);automaticSides(fps,1);
         legacyCannotBypassWeight(fps,-1);legacyCannotBypassWeight(fps,1);
     }

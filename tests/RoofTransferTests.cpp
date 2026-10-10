@@ -47,7 +47,7 @@ struct RoofWorld:World {
     }
 };
 static void dimensions(Traversal& t){t.cfg.radius=31;t.cfg.gap=37;t.cfg.height=138;t.cfg.approachSeconds=0;}
-struct Run{bool attached{},transferred{},complete{},released{},safe=true;unsigned actions{};float maxYawStep{},minimumClearance=10000;Vec final{};float finalNormalZ{};State state{};};
+struct Run{bool attached{},transferred{},complete{},released{},safe=true,held{},frozen=true,manualExit{};unsigned actions{};float maxYawStep{},minimumClearance=10000;Vec final{};float finalNormalZ{};State state{};};
 Run run(RoofWorld& w,int fps,bool sprint=false,bool changePath=false,bool finalSideways=false) {
     Traversal t;dimensions(t);Run r;r.attached=t.attach(w,w.global({0,-37,-120}),w.rotate({0,1,0},w.yaw),100);
     Vec priorNormal=t.normal;bool inserted=false;Result result;
@@ -55,7 +55,11 @@ Run run(RoofWorld& w,int fps,bool sprint=false,bool changePath=false,bool finalS
         if(changePath&&r.transferred&&!inserted){w.solids.push_back(box({-150,-100,180},{150,100,184}));inserted=true;}
         const bool sideways=finalSideways&&frame>=fps*3;
 
+        const auto before=t.position;const float phase=t.progress();
         result=t.update(w,{sideways?1.f:0.f,sideways?0.f:1.f,false,!finalSideways,false,false,sprint},1.f/fps,100);
+        if(t.geometryHolding()) {
+            r.held=true;r.frozen&=(t.position-before).length()==0&&t.progress()==phase&&result.staminaCost==0;
+        }
         if(std::string(t.blockedReason)=="checked steep roof transfer")r.transferred=true;
         if(t.state==State::action)++r.actions;
         r.minimumClearance=std::min(r.minimumClearance,w.cylinderDistance(t.position));
@@ -63,7 +67,13 @@ Run run(RoofWorld& w,int fps,bool sprint=false,bool changePath=false,bool finalS
         r.maxYawStep=std::max(r.maxYawStep,std::acos(std::clamp(priorNormal.dot(t.normal),-1.f,1.f)));
         priorNormal=t.normal;r.complete|=result.completed;r.released|=result.released;
     }
-    r.final=w.local(t.position);r.finalNormalZ=t.surfaceNormal.z;r.state=t.state;return r;
+    r.final=w.local(t.position);r.finalNormalZ=t.surfaceNormal.z;r.state=t.state;
+    if(changePath&&r.held) {
+        Input release;release.release=true;result=t.update(w,release,1.f/fps,100);
+        for(int frame=0;frame<fps&&!result.released;++frame)result=t.update(w,{},1.f/fps,100);
+        r.manualExit=result.released&&!t.active();
+    }
+    return r;
 }
 }
 int main(int argc,char**argv){
@@ -103,7 +113,9 @@ int main(int argc,char**argv){
         RoofWorld running;running.yaw=.73f;if(far)running.origin=small.origin;
         const auto sprint=run(running,fps,true);require(!sprint.transferred&&sprint.actions==0,"holding Shift must never start a roof-transfer jump");++negatives;
         RoofWorld dynamic;dynamic.yaw=.73f;if(far)dynamic.origin=small.origin;
-        const auto changed=run(dynamic,fps,false,true);require(changed.transferred&&changed.released&&!changed.complete,"an obstruction entering the accepted arc aborts on runtime revalidation");++negatives;
+        const auto changed=run(dynamic,fps,false,true);require(changed.transferred&&!changed.released&&!changed.complete&&
+            changed.held&&changed.frozen&&changed.safe&&changed.manualExit,
+            "an obstruction freezes the checked roof arc without blocking deliberate release");++negatives;
         RoofWorld gable;const Vec otherNormal{-std::sqrt(1-.512723f*.512723f),0,.512723f};
         const Vec ridge{-2.17f,0,73.6332f};gable.solids[0].push_back({otherNormal,otherNormal.dot(ridge)});
         gable.yaw=.73f;if(far)gable.origin=small.origin;

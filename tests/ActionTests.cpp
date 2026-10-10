@@ -131,10 +131,26 @@ static void intermediateHopObstacle() {
         check(before.y-depth>*changed.rear&&atEnd.position.y-depth>*changed.rear,
             "negative control: checking only the endpoint capsules would approve the obstructed curve");
         const auto blocked=t.update(changed,moving,dt,100);
-        check(blocked.released&&!t.active()&&std::string(blocked.reason)=="jump path changed"&&blocked.staminaCost==0,
-            "ordinary hop still catches a new obstruction at an intermediate arc knot");
+        check(!blocked.released&&t.active()&&t.state==State::action&&std::string(blocked.reason)=="jump path changed"&&blocked.staminaCost==0,
+            "ordinary hop holds before a new obstruction at an intermediate arc knot");
         check((t.position-before).length()<.0001f&&t.actionProgress()==phase,
             "neither movement nor source progress commits before the entire hop step is clear");
+        for(int frame=0;frame<fps;++frame) {
+            const auto held=t.update(changed,moving,dt,100);
+            check(!held.released&&held.staminaCost==0&&t.active()&&t.state==State::action&&
+                (t.position-before).length()<.0001f&&t.actionProgress()==phase,
+                "a persistent hop obstruction preserves the exact last checked source pose and position");
+        }
+        auto dropped=t;Input release;release.release=true;
+        auto exited=dropped.update(changed,release,dt,0);
+        for(int frame=0;frame<fps&&dropped.active();++frame)exited=dropped.update(changed,{},dt,0);
+        check(exited.released&&!dropped.active(),"manual drop remains available from a blocked hop even with zero stamina");
+        for(int frame=0;frame<fps*3&&t.state==State::action;++frame) {
+            const auto resumed=t.update(open,moving,dt,100);
+            check(!resumed.released,"restoring a hop path resumes without losing attachment");
+        }
+        check(t.active()&&t.state==State::wall&&t.actionProgress()>=1,
+            "a restored hop completes its existing route instead of remaining in a stale hold");
         std::cout<<"intermediate rear obstacle fps="<<fps<<" phase="<<phase<<"->"<<atEnd.actionProgress()<<" clearanceGap="<<endpointBack-peakBack<<'\n';
     }
 }

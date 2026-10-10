@@ -116,11 +116,13 @@ bool tryEaveTransfer(World& originalWorld,Input intent={0,1},bool wallRun=false,
                     if(sourceRoute) {
                         if(!commitAuthoredRoute(w,selected,target,seconds,horizontal(anchor->hit.normal),true,outside,over,true,anchor->hit.normal.unit(),0,wallRun?speed:0))continue;
                     } else {
-                        const Vec startSurface=surfaceNormal;
-                        beginAction(selected,position,target,seconds);
-                        detour=true;detourOut=outside;detourOver=over;roofTransfer=true;
-                        actionStartSurface=startSurface;actionTargetSurface=anchor->hit.normal.unit();
-                        actionLandingNormal=horizontal(actionTargetSurface);
+                        auto planned=*this;
+                        planned.beginAction(selected,position,target,seconds);
+                        planned.detour=true;planned.detourOut=outside;planned.detourOver=over;planned.roofTransfer=true;
+                        planned.actionStartSurface=surfaceNormal;planned.actionTargetSurface=anchor->hit.normal.unit();
+                        planned.actionLandingNormal=horizontal(planned.actionTargetSurface);
+                        if(!planned.authoredActionClear(w,true)||bounded.exhausted)continue;
+                        *this=std::move(planned);
                     }
                     if(wallRun) {
                         actionBeganRunning=true;actionRunSpeed=speed;obstacleJump=true;++obstacleJumps;

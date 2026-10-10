@@ -1233,8 +1233,10 @@ void update(RE::PlayerCharacter* p,float dt) {
     if(input.release&&!animationReady&&attachedTime>.12f) {release(p,"manual drop while animation output unavailable",false,true);return;}
     const auto stateBefore=traversal.state;
     const bool runningBefore=traversal.wallRunning();
+    const bool heldBefore=traversal.geometryHolding(),restingBefore=traversal.resting();
     const float effectiveDt=animationReady?dt:0.f;
-    const bool captureFrame=diagnostics&&animationReady&&geometryCaptureGate.arm(traversal,input,attachedTime);
+    const bool captureFrame=diagnostics&&animationReady&&geometryCaptureGate.arm(traversal,input,attachedTime,effectiveDt);
+    bool captureCommitted=false;
     const auto traversalStarted=std::chrono::steady_clock::now();
     fc::Result result;
     if(captureFrame) {
@@ -1242,6 +1244,7 @@ void update(RE::PlayerCharacter* p,float dt) {
         fc::TraversalCapture::RecordingWorld recorded(world,geometryCapture);
         result=traversal.update(recorded,input,effectiveDt,stamina);
         geometryCapture.finish(traversal,result);
+        captureCommitted=geometryCaptureGate.commit(geometryCapture.observed()>0);
     } else result=traversal.update(world,input,effectiveDt,stamina);
     const float traversalMs=std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-traversalStarted).count();
     if(diagnostics) {
@@ -1254,7 +1257,12 @@ void update(RE::PlayerCharacter* p,float dt) {
             inputSeconds[mode]+=seconds;
         }
     }
-    if(captureFrame) {
+    if(diagnostics&&(heldBefore!=traversal.geometryHolding()||restingBefore!=traversal.resting()))
+        SKSE::log::info("Traversal hold: geometry={} resting={} stamina={:.2f} state={} motion={} pos=({:.2f},{:.2f},{:.2f}) input=({:.1f},{:.1f}) normal=({:.3f},{:.3f},{:.3f}) phase={:.3f} reason={}",
+            traversal.geometryHolding(),traversal.resting(),stamina,int(traversal.state),int(result.motion),
+            traversal.position.x,traversal.position.y,traversal.position.z,input.x,input.y,
+            traversal.normal.x,traversal.normal.y,traversal.normal.z,traversal.progress(),result.reason);
+    if(captureCommitted) {
 
         try {SKSE::log::info("{}",geometryCapture.serialize());}
         catch(const std::exception& e){SKSE::log::warn("Geometry capture unavailable: {}",e.what());}
@@ -1311,11 +1319,14 @@ void update(RE::PlayerCharacter* p,float dt) {
             contextReportTime=attachedTime+.5f;
         }
     }
-    if(diagnostics&&traversal.stalledSeconds()>.35f&&attachedTime>=stallReportTime) {
+    if(diagnostics&&(traversal.stalledSeconds()>.35f||traversal.geometryHolding())&&
+        (!traversal.geometryHolding()||world.casts>0)&&attachedTime>=stallReportTime) {
         stallReportTime=attachedTime+1;
-        SKSE::log::info("Blocked movement: time={:.2f} dt={:.5f} input=({:.1f},{:.1f}) pos=({:.2f},{:.2f},{:.2f}) surface=({:.3f},{:.3f},{:.3f}) state={} casts={} hits={} rayCandidates={} rayClassifications={} reason={} top={}",
+        const auto target=traversal.state==fc::State::action?traversal.edgeTarget():traversal.position;
+        SKSE::log::info("Blocked movement: time={:.2f} dt={:.5f} input=({:.1f},{:.1f}) pos=({:.2f},{:.2f},{:.2f}) surface=({:.3f},{:.3f},{:.3f}) state={} motion={} phase={:.3f} recovery={} target=({:.2f},{:.2f},{:.2f}) casts={} hits={} rayCandidates={} rayClassifications={} reason={} top={}",
             traversal.stalledSeconds(),dt,input.x,input.y,traversal.position.x,traversal.position.y,traversal.position.z,
-            traversal.surfaceNormal.x,traversal.surfaceNormal.y,traversal.surfaceNormal.z,int(traversal.state),world.casts,world.hits,world.rayCandidates,world.rayClassifications,traversal.blockedReason,traversal.ledgeReason);
+            traversal.surfaceNormal.x,traversal.surfaceNormal.y,traversal.surfaceNormal.z,int(traversal.state),int(result.motion),traversal.progress(),traversal.recoveringSupport(),
+            target.x,target.y,target.z,world.casts,world.hits,world.rayCandidates,world.rayClassifications,traversal.blockedReason,traversal.ledgeReason);
         if(traversal.blockedHit) {
             const auto& hit=*traversal.blockedHit;const auto a=traversal.blockedFrom,b=traversal.blockedTo;
             SKSE::log::info("Clearance obstruction: from=({:.2f},{:.2f},{:.2f}) to=({:.2f},{:.2f},{:.2f}) hit=({:.2f},{:.2f},{:.2f}) normal=({:.3f},{:.3f},{:.3f}) climbable={}",
@@ -1334,12 +1345,13 @@ void update(RE::PlayerCharacter* p,float dt) {
         if(!faceWall(p,dt)) {release(p,"wall-facing ownership or normal invalid",true);return;}
     }
     if(result.staminaCost>0) p->AsActorValueOwner()->ModActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage,RE::ActorValue::kStamina,-result.staminaCost);
-    if(traversal.cfg.staminaEnabled&&lowStaminaNotifications&&stamina<=20&&!lowStaminaNoted){note("FreeClimb: low stamina - stop to rest or climb down");lowStaminaNoted=true;}
+    if(traversal.cfg.staminaEnabled&&lowStaminaNotifications&&stamina<=20&&!lowStaminaNoted){note("FreeClimb: low stamina - rest on the wall to recover");lowStaminaNoted=true;}
     if(stamina>30)lowStaminaNoted=false;
     if(!result.released&&!traversalStealth.update(p,traversal.wallRunning(),activeSettings.climbSneakEnabled)) {release(p,"traversal state invalid");return;}
     const auto publishStarted=std::chrono::steady_clock::now();
-    poses.update(world,traversal,result.motion,dt,p->GetScale());
-    traversalAudio.update(poses.library,traversal,result,poses.surface.sampledPhase(),effectiveDt,animationReady);
+    const bool heldPose=traversal.geometryHolding()||(traversal.resting()&&traversal.state!=fc::State::wall&&traversal.state!=fc::State::ledge);
+    poses.update(world,traversal,result.motion,heldPose?0.f:dt,p->GetScale());
+    traversalAudio.update(poses.library,traversal,result,poses.surface.sampledPhase(),heldPose?0.f:effectiveDt,animationReady);
     const float publishMs=std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-publishStarted).count();
     reportOutput(p,result.motion,traversalMs,publishMs,world.casts,world.rayCandidates,world.rayClassifications,result.released);
     if(poseHealth.stale()>.25f&&attachedTime>=poseRefreshTime) {

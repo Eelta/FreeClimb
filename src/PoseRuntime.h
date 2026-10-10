@@ -110,7 +110,7 @@ private:
     std::uintptr_t lookupDiagnosticRoot{},lookupDiagnosticData{};
     std::size_t lookupDiagnosticCount{};
     int lookupDiagnosticBone=-1;
-    std::uint64_t lookupDiagnosticTime{};
+    std::uint64_t lookupDiagnosticTime{},rootLookupDiagnosticTime{};
     Pose published;
     PoseHandoff handoff;
     NativePoseHistory nativeHistory;
@@ -853,8 +853,9 @@ private:
                     bindingFailure,g->projectName.c_str(),count,layout.parentCount,layout.referenceCount,
                     bool(bones),bool(parents),bool(layout.references));continue;
             }
+            const auto rootLookup=lookupSkeletonRoot(actorRoot,library.names[0]);
             if(!bindings.empty()&&bindings[0].graph==g&&bindings[0].actorRoot.get()==actorRoot&&
-                bindings[0].root.get()==existingNode(actorRoot,library.names[0])&&currentRig(bindings[0],true)) {
+                bindings[0].root.get()==rootLookup.selected()&&currentRig(bindings[0],true)) {
                 ++reusedBindings;bindingFailure="none";return true;
             }
             if(ownsPose||fading){invalidateRig();bindingFailure="character rig changed during traversal";return false;}
@@ -871,8 +872,17 @@ private:
                     index>=0?animationBones[index].name:std::string_view("<none>"),index>=0?animationBones[index].parent:-1);
                 continue;
             }
-            next.root=RE::NiPointer<RE::NiAVObject>(existingNode(actorRoot,library.names[0]));
-            if(!next.root){bindingFailure="existing NPC Root unavailable";continue;}
+            next.root=RE::NiPointer<RE::NiAVObject>(rootLookup.selected());
+            if(!next.root) {
+                bindingFailure="existing NPC Root unavailable";
+                const auto now=GetTickCount64();
+                if(!rootLookupDiagnosticTime||now-rootLookupDiagnosticTime>=2000) {
+                    rootLookupDiagnosticTime=now;
+                    SKSE::log::warn("Pose root lookup diagnostic: scope=outermost-root project='{}' requested='{}' animationBones={}; {}",
+                        sceneDiagnosticText(g->projectName.c_str()),library.names[0],count,describeExistingSceneLookup(actorRoot,rootLookup));
+                }
+                continue;
+            }
             next.flatNames=std::make_shared<FlatNameSnapshot>();
             next.scene=bindRuntimeScene(next.root.get(),library.names,library.parents,next.flatNames.get());
             if(!next.scene) {
@@ -911,7 +921,7 @@ private:
             next.footIK=g->doFootIK;
             bindingFailure="none";
             if(!captureRig(next))continue;
-            lookupDiagnosticTime=0;
+            lookupDiagnosticTime=rootLookupDiagnosticTime=0;
             next.outputRig=makeOutputRig(next);
             for(auto& old:bindings) {
                 if(old.graph==g&&old.footOwned)next.footIK=old.footIK;

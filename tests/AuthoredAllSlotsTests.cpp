@@ -107,11 +107,15 @@ static void originalInputAndBlocks(const Library& base,const Library& library) {
     SourceWall world;auto t=wall(world,library);t.cfg.fancyJumps=false;
     const auto before=t.position;world.barrier=before.y-60;
     const auto failed=t.update(world,{0,0,true,false,false,true},1.f/60,1000);
-    require(t.active()&&t.state==State::wall&&(t.position-before).length()<.001f&&!failed.released&&failed.staminaCost==0,
-        "blocked authored release is rejected before any movement or stamina charge");
+    require(!t.active()&&(t.position-before).length()<.001f&&failed.released&&!failed.completed&&failed.staminaCost==0,
+        "blocked authored manual exit safely releases in place without movement or stamina charge");
     world.barrier=1e9f;t.cfg.automaticClimbActions=false;
+    require(!t.attach(world,before,t.normal*-1,1000)&&t.lastFailure==AttachFailure::unavailable,
+        "manual exit preserves the existing reattachment cooldown");
+    for(int frame=0;frame<40;++frame)t.tickCooldown(.025f);
+    require(t.attach(world,before,t.normal*-1,1000),"manual exit permits a later explicit checked attachment after its cooldown");
     const auto hop=t.update(world,{1,0,false,false,true},1.f/60,1000);
-    require(!hop.released,"failed custom exit retains normal attached control");
+    require(!hop.released,"a new checked attachment retains normal control after the rejected authored exit route");
 }
 static void bridgeClocks(const Library& library) {
     for(const auto row:{std::pair{Motion::runLaunch,Input{0,1,false,false,false,false,true}},

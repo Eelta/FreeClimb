@@ -88,7 +88,19 @@ static void dynamicCases() {
         {
             auto t=started;auto removed=world;removed.boxes[0].high.z=t.edgeTarget().z-4;
             const auto p=t.position;const auto out=t.update(removed,input,dt,1000);
-            check(out.released&&std::string(out.reason)=="wall-run jump support changed"&&(t.position-p).length()==0,"removed target drops safely before stale movement is committed");
+            check(!out.released&&t.active()&&t.state==State::action&&std::string(out.reason)=="wall-run jump support changed"&&
+                (t.position-p).length()==0&&t.actionProgress()==started.actionProgress(),"removed target holds safely before stale movement is committed");
+            for(int frame=0;frame<fps;++frame) {
+                const auto held=t.update(removed,input,dt,1000);
+                check(!held.released&&held.staminaCost==0&&(t.position-p).length()==0&&t.actionProgress()==started.actionProgress(),
+                    "missing running-jump destination cannot advance or charge a frozen action");
+            }
+            for(int frame=0;frame<fps*3&&t.state==State::action;++frame) {
+                const auto resumed=t.update(world,input,dt,1000);
+                check(!resumed.released&&world.clearance(t.position,t.cfg)+.03f>=t.cfg.radius,
+                    "restored running-jump destination resumes through actual collision checks");
+            }
+            check(t.active()&&t.state==State::wall,"running jump finishes after its real destination returns");
         }
         {
             auto t=started;Input climb=input;climb.run=false;
@@ -112,7 +124,19 @@ static void dynamicCases() {
             auto changed=world;const float rear=(endBack+peakBack)*.5f;
             changed.boxes.push_back({{-10000,rear-1,-10000},{10000,rear,10000},false});
             const auto out=t.update(changed,input,dt,1000);
-            check(out.released&&(t.position-p).length()<.0001f&&t.actionProgress()==phase,"crossed intermediate action knots block a new obstacle without phase or position commit");
+            check(!out.released&&t.active()&&t.state==State::action&&(t.position-p).length()<.0001f&&t.actionProgress()==phase,
+                "crossed intermediate action knots hold before a new obstacle without phase or position commit");
+            for(int frame=0;frame<fps;++frame) {
+                const auto held=t.update(changed,input,dt,1000);
+                check(!held.released&&(t.position-p).length()<.0001f&&t.actionProgress()==phase,
+                    "a thin intermediate blocker cannot be bypassed by waiting or repeated input");
+            }
+            for(int frame=0;frame<fps*3&&t.state==State::action;++frame) {
+                const auto resumed=t.update(world,input,dt,1000);
+                check(!resumed.released&&world.clearance(t.position,t.cfg)+.03f>=t.cfg.radius,
+                    "removing an intermediate blocker resumes the checked running-jump curve");
+            }
+            check(t.active()&&t.state==State::wall,"interrupted running-jump curve still completes after collision recovery");
         }
     }
 }

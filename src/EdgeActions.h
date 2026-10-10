@@ -59,7 +59,7 @@
         edgePreparation.status=5;
         if(!edgeFeetSupported(w,position,normal)||!edgeFeetSupported(w,destination,normal))return false;
         edgePreparation.status=6;
-        if(!edgeRouteClear(w,motion,position,destination)||w.exhausted)return false;
+        if(!edgeRouteClear(w,motion,position,destination,horizontal(destinationSupport->normal))||w.exhausted)return false;
         EdgePreparation plan;plan.active=true;plan.motion=motion;plan.from=plan.to=position;
         plan.destination=destination;plan.direction=direction;plan.source=*source;plan.target=*target;plan.status=7;
         edgePreparation=plan;edgeAction=edgeSettled=false;
@@ -164,18 +164,19 @@
         const auto foot=w.ray(start,start-facing*(cfg.gap+12));
         return foot&&foot->climbable&&foot->normal.unit().dot(facing)>.95f;
     }
-    bool edgeRouteClear(World& w,Motion motion,Vec from,Vec to) {
-        if(authoredPath(motion))return checkedHop(w,from,to,cfg.hopOut,motion);
+    bool edgeRouteClear(World& w,Motion motion,Vec from,Vec to,Vec landing={}) {
+        if(landing.length()<.5f)landing=normal;
+        if(authoredPath(motion))return checkedHop(w,from,to,cfg.hopOut,motion,landing);
         if(threepeatHop(motion)) {
             Vec previous=from;
             for(int sample=1;sample<=32;++sample) {
                 const Vec next=threepeatHopPoint(motion,from,to,sample/32.f);
-                if(!clearPath(w,previous,next))return false;
+                if(!clearPath(w,previous,next,false,sample==32?landing:normal))return false;
                 previous=next;
             }
             return true;
         }
-        return checkedHop(w,from,to,cfg.hopOut,motion);
+        return checkedHop(w,from,to,cfg.hopOut,motion,landing);
     }
     void commitEdgeAction(const EdgePreparation& plan) {
 
@@ -253,7 +254,7 @@
             edgePreparation.status=6;
 
             if(routeChecks++>=2)return false;
-            if(!edgeRouteClear(w,motion,aligned,anchor->position))continue;
+            if(!edgeRouteClear(w,motion,aligned,anchor->position,horizontal(anchor->hit.normal)))continue;
             EdgePreparation plan;
             plan.active=true;plan.motion=motion;plan.from=position;plan.to=aligned;plan.destination=anchor->position;
             plan.direction=direction;plan.source=*upper;plan.target=*target;plan.status=7;
@@ -308,9 +309,10 @@
             Result result;result.motion=stableMotion;return result;
         }
 
-        if(!support(w,edgePreparation.destination,normal*-1)||
+        const auto destination=support(w,edgePreparation.destination,normal*-1);
+        if(!destination||
             !edgeFeetSupported(w,edgePreparation.destination,edgePreparation.target.normal)||
-            !edgeRouteClear(w,edgePreparation.motion,position,edgePreparation.destination)) {
+            !edgeRouteClear(w,edgePreparation.motion,position,edgePreparation.destination,horizontal(destination->normal))) {
             cancel(6);return {};
         }
         commitEdgeAction(edgePreparation);

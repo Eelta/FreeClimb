@@ -17,7 +17,7 @@ class TraversalCapture {
 public:
     static constexpr std::size_t capacity=8192;
     static constexpr std::size_t maxTextBytes=4*1024*1024;
-    static constexpr std::string_view coreVersion="active31-4";
+    static constexpr std::string_view coreVersion="active31-6";
     enum class Kind {ray,body,bodyPath};
     struct Call {
         Kind kind=Kind::ray;
@@ -35,17 +35,38 @@ public:
 
     class SessionGate {
         unsigned captures{};
-        float previousTime{};
-        Vec previousPosition{};
+        float previousTime{},heldSeconds{},pendingTime{};
+        std::array<Vec,4> positions{},directions{};
+        Vec pendingPosition{},pendingDirection{};
+        bool pending{};
     public:
-        void reset(){captures=0;previousTime=0;previousPosition={};}
+        void reset(){captures=0;previousTime=heldSeconds=pendingTime=0;positions={};directions={};pendingPosition=pendingDirection={};pending=false;}
         unsigned used()const{return captures;}
-        bool arm(const Traversal& before,Input input,float elapsed) {
-            if(captures>=2||!before.active()||before.stalledSeconds()<=.35f||
-                !std::isfinite(elapsed)||!before.position.finite()||
-                !std::isfinite(input.x)||!std::isfinite(input.y)||std::abs(input.x)+std::abs(input.y)<=.1f)return false;
-            if(captures&&(elapsed-previousTime<5.f||(before.position-previousPosition).length()<=96.f))return false;
-            ++captures;previousTime=elapsed;previousPosition=before.position;return true;
+        bool arm(const Traversal& before,Input input,float elapsed,float dt) {
+            pending=false;
+            if(!std::isfinite(dt)||dt<=1e-6f)return false;
+            dt=std::min(dt,.05f);
+            const bool held=before.geometryHolding();
+            heldSeconds=held&&!before.resting()?std::min(1.5f,heldSeconds+dt):0;
+            if(captures>=positions.size()||!before.active()||input.release||input.backDrop||
+                before.resting()||!std::isfinite(before.stalledSeconds())||
+                (held?!before.geometryRetryDue(dt):before.stalledSeconds()<=.35f)||
+                !std::isfinite(elapsed)||elapsed<0||!before.position.finite()||
+                !std::isfinite(input.x)||!std::isfinite(input.y)||(!held&&std::abs(input.x)+std::abs(input.y)<=.1f))return false;
+            if(captures&&elapsed-previousTime<1.f)return false;
+            if(captures==positions.size()-1&&(held?heldSeconds:before.stalledSeconds())<1.5f)return false;
+            const Vec direction=std::abs(input.x)+std::abs(input.y)<=.1f?Vec{}:
+                Vec{std::clamp(input.x,-1.f,1.f),std::clamp(input.y,-1.f,1.f),0}.unit();
+            for(unsigned index=0;index<captures;++index)
+                if((before.position-positions[index]).length()<=24.f&&
+                    (direction.dot(directions[index])>=.95f||(direction.length()==0&&directions[index].length()==0)))return false;
+            pendingPosition=before.position;pendingDirection=direction;pendingTime=elapsed;pending=true;return true;
+        }
+        bool commit(bool queried) {
+            const bool accepted=pending&&queried;pending=false;
+            if(!accepted)return false;
+            positions[captures]=pendingPosition;directions[captures]=pendingDirection;
+            ++captures;previousTime=pendingTime;return true;
         }
     };
 private:
@@ -110,7 +131,7 @@ private:
         for(auto& knot:motion.trajectory.knots){v(knot.phase);v(knot.displacement);}
         for(auto& sample:motion.contacts)for(auto& value:sample)v(value);
     }
-    template<class Visitor> static void fields(Visitor& v,Traversal& t,bool wallRunSetting=true,bool legacyArc=false,bool wallRunSequences=true,bool mantleRoutes=true,bool contextSequences=true) {
+    template<class Visitor> static void fields(Visitor& v,Traversal& t,bool wallRunSetting=true,bool legacyArc=false,bool wallRunSequences=true,bool mantleRoutes=true,bool contextSequences=true,bool holds=true,bool recovery=true) {
         auto& s=t.cfg;
         v(s.reach);v(s.gap);v(s.radius);v(s.height);v(s.chest);v(s.grip);
         v(s.climbSpeed);v(s.sideSpeed);v(s.downSpeed);v(s.maxNormalZ);
@@ -217,10 +238,19 @@ private:
                 if constexpr(std::is_same_v<Visitor,Reader>)s.contextHopReferences=std::move(data);
             } else if constexpr(std::is_same_v<Visitor,Reader>)s.contextHopReferences.reset();
         } else if constexpr(std::is_same_v<Visitor,Reader>)s.contextHopReferences.reset();
+        if(holds) {v(t.geometryHeld);v(t.geometryRetry);v(t.staminaResting);}
+        else if constexpr(std::is_same_v<Visitor,Reader>) {t.geometryHeld=t.staminaResting=false;t.geometryRetry=0;}
         if(contextSequences&&s.authoredWallRunSequences) {
             auto data=std::make_shared<AuthoredWallRunSequences>(*s.authoredWallRunSequences);
             for(auto& motion:data->braces)authoredFields(v,motion);
             if constexpr(std::is_same_v<Visitor,Reader>)s.authoredWallRunSequences=std::move(data);
+        }
+        if(recovery) {
+            v(t.supportRecoveryRetry);v(t.supportRecoveryOrigin);v(t.supportRecoveryInput);
+            v(t.supportRecoveryCursor);v(t.supportRecoveryAction);
+        } else if constexpr(std::is_same_v<Visitor,Reader>) {
+            t.supportRecoveryRetry=0;t.supportRecoveryOrigin=t.supportRecoveryInput={};
+            t.supportRecoveryCursor=0;t.supportRecoveryAction=false;
         }
     }
     template<class Visitor> static void inputFields(Visitor& v,Input& input) {
@@ -242,8 +272,11 @@ private:
         out<<label;auto value=snapshot.value;Writer writer{out};fields(writer,value);
         out<<' '<<std::quoted(snapshot.blocked.data())<<' '<<std::quoted(snapshot.ledge.data())<<'\n';
     }
-    static void readSnapshot(std::istream& in,std::string_view label,Snapshot& snapshot,bool wallRunSetting,bool legacyArc,bool wallRunSequences,bool mantleRoutes,bool contextSequences) {
-        token(in,label);Reader reader{in};fields(reader,snapshot.value,wallRunSetting,legacyArc,wallRunSequences,mantleRoutes,contextSequences);
+    static void readSnapshot(std::istream& in,std::string_view label,Snapshot& snapshot,bool wallRunSetting,bool legacyArc,bool wallRunSequences,bool mantleRoutes,bool contextSequences,bool holds,bool recovery) {
+        token(in,label);Reader reader{in};fields(reader,snapshot.value,wallRunSetting,legacyArc,wallRunSequences,mantleRoutes,contextSequences,holds,recovery);
+        if(snapshot.value.supportRecoveryRetry<0||snapshot.value.supportRecoveryRetry>.401f||snapshot.value.supportRecoveryCursor>11||
+            snapshot.value.supportRecoveryInput.z!=0||snapshot.value.supportRecoveryInput.length()>1.001f)
+            throw std::runtime_error("invalid support recovery state");
         if(!validThreepeatProfile(snapshot.value.cfg.threepeatProfile))throw std::runtime_error("invalid animation profile");
         const auto& settings=snapshot.value.cfg;
         if(!settings.authoredMantleTrajectory.valid()||!snapshot.value.mantleRoute.valid())
@@ -343,15 +376,16 @@ public:
             if(end+9<data.size()&&data[end+9]!='\r'&&data[end+9]!='\n')throw std::runtime_error("invalid capture end marker");
             std::istringstream in(std::string(data.substr(begin,end-begin+9)));in.imbue(std::locale::classic());
             token(in,"FCGEO_BEGIN");int schema{};std::string version;
-            if(!(in>>schema>>version)||schema!=1||(version!=coreVersion&&version!="active31-3"&&version!="active31-2"&&version!="active31-1"&&version!="active35-9"&&version!="active35-10"))throw std::runtime_error("unsupported capture/Core version");
+            if(!(in>>schema>>version)||schema!=1||(version!=coreVersion&&version!="active31-5"&&version!="active31-4"&&version!="active31-3"&&version!="active31-2"&&version!="active31-1"&&version!="active35-9"&&version!="active35-10"))throw std::runtime_error("unsupported capture/Core version");
             token(in,"META");bool markedComplete{};Reader reader{in};reader(count_);reader(observed_);reader(markedComplete);
             if(count_>capacity||observed_<count_||markedComplete!=(count_==observed_))throw std::runtime_error("invalid call count");
             token(in,"INPUT");inputFields(reader,input_);reader(dt_);reader(stamina_);
             const bool legacyArc=version=="active35-9"||version=="active35-10";
-            const bool sequences=version==coreVersion||version=="active31-3"||version=="active31-2";
-            const bool routes=version==coreVersion||version=="active31-3";
-            readSnapshot(in,"BEFORE",before_,version!="active35-9",legacyArc,sequences,routes,version==coreVersion);
-            readSnapshot(in,"AFTER",after_,version!="active35-9",legacyArc,sequences,routes,version==coreVersion);
+            const bool recovery=version==coreVersion,holds=recovery||version=="active31-5";
+            const bool context=holds||version=="active31-4",routes=context||version=="active31-3";
+            const bool sequences=routes||version=="active31-2";
+            readSnapshot(in,"BEFORE",before_,version!="active35-9",legacyArc,sequences,routes,context,holds,recovery);
+            readSnapshot(in,"AFTER",after_,version!="active35-9",legacyArc,sequences,routes,context,holds,recovery);
             token(in,"RESULT");resultFields(reader,result_);text(in,resultReason_);result_.reason=resultReason_.data();
             for(std::size_t i=0;i<count_;++i) {
                 auto& call=calls_[i];call=Call{};std::string type;if(!(in>>type)||(type!="R"&&type!="B"&&type!="P"))throw std::runtime_error("unknown World call");

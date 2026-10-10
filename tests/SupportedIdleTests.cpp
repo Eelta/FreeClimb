@@ -67,8 +67,8 @@ static void supportedRest(const Library& lib,int fps,float scale,int kind) {
                 const float wristBend=std::acos(std::clamp((body[wrist].t-body[elbow].t).unit().dot((body[middle].t-body[wrist].t).unit()),-1.f,1.f));
                 wristAngle=std::max(wristAngle,wristBend);
                 check(wristBend<1.658064f+.001f,"resting output preserves the original wrist-flexion bound");
-                for(int bone=(hand?82:67);bone<(hand?97:82);++bone)
-                    check(angleBetween(pose[bone].q,authored[bone].q)<.000001f,"supported idle retains authored finger articulation");
+                if(kind!=0)for(int bone=(hand?82:67);bone<(hand?97:82);++bone)
+                    check(angleBetween(pose[bone].q,authored[bone].q)<.000001f,"edge preparation retains authored finger articulation");
             }
         }
         previous=pose;

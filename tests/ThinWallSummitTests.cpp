@@ -63,9 +63,22 @@ static void changingPath() {
     ThinWorld w;w.scene();auto t=initial(w);auto r=t.update(w,{0,1,false,true},1.f/60,1000);
     check(t.state==State::mantle,"dynamic obstacle fixture starts a valid top-out");
     w.quad({-300,-100,150},{-300,150,150},{300,150,150},{300,-100,150});
-    bool released=false,completed=false;
-    for(int frame=0;frame<90&&t.active();++frame){r=t.update(w,{0,1,false,true},1.f/60,1000);released|=r.released;completed|=r.completed;}
-    check(released&&!completed,"new ceiling aborts the top-out instead of crossing collision");
+    bool released=false,completed=false,held=false;
+    for(int frame=0;frame<90&&t.active();++frame) {
+        const auto before=t.position;const auto phase=t.progress();
+        r=t.update(w,{0,1,false,true},1.f/60,1000);released|=r.released;completed|=r.completed;
+        if(t.geometryHolding()) {
+            held=true;check(t.state==State::mantle&&(t.position-before).length()<.001f&&t.progress()==phase,
+                "new ceiling holds the mantle before committing position or phase");
+        }
+    }
+    check(held&&t.active()&&!released&&!completed,"new ceiling retains the checked top-out without crossing collision or releasing");
+    w.scene();
+    for(int frame=0;frame<180&&t.active();++frame) {
+        r=t.update(w,{0,1,false,true},1.f/60,1000);completed|=r.completed;
+        check(!r.released||r.completed,"restored thin-wall route never forces an incomplete release");
+    }
+    check(completed&&!t.active(),"removing the ceiling resumes and completes the retained thin-wall top-out");
 }
 int main() {
     for(bool far:{false,true})for(float yaw:{0.f,.633f})for(int fps:{30,60,120})positive(far,yaw,fps);

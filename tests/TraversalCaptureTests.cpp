@@ -1,14 +1,30 @@
 #include "TraversalCapture.h"
+#include "CornerTestWorld.h"
 #include <iostream>
 #include <fstream>
 #include <memory>
 #include <stdexcept>
 using namespace fc;
 static void check(bool value,const char* message){if(!value)throw std::runtime_error(message);}
+static std::string withoutRecovery(std::string text,bool omit=false) {
+    for(const auto label:{"BEFORE ","AFTER "}) {
+        const auto start=text.find(label),reasons=text.find(" \"",start);auto recovery=reasons;
+        for(unsigned i=0;i<9;++i)recovery=text.rfind(' ',recovery-1);
+        text.replace(recovery,reasons-recovery,omit?"":" 0 0 0 0 0 0 0 0 0");
+    }
+    return text;
+}
 static std::string priorCapture(std::string text,std::string_view version,bool retiredArc=false) {
+    text=withoutRecovery(std::move(text),true);
     text.replace(text.find(TraversalCapture::coreVersion),TraversalCapture::coreVersion.size(),version);
+    if(version=="active31-5")return text;
     for(const auto label:{"BEFORE ","AFTER "}) {
         const auto start=text.find(label);auto reasons=text.find(" \"",start);
+        auto holds=reasons;
+        for(unsigned i=0;i<3;++i)holds=text.rfind(' ',holds-1);
+        check(text.substr(holds,reasons-holds)==" 0 0 0","prior snapshot fixture has no traversal hold");
+        text.erase(holds,reasons-holds);reasons=holds;
+        if(version=="active31-4")continue;
         const auto context=text.rfind(' ',reasons-1);
         check(text.substr(context,reasons-context)==" 0","prior snapshot fixture has no directional side-hop references");
         text.erase(context,reasons-context);reasons=context;
@@ -76,11 +92,19 @@ static void snapshotRoundTrip() {
     const auto replay=decoded->replay();if(!replay.matched)std::cerr<<replay.error<<'\n';
     check(replay.matched&&replay.callsConsumed==capture->count(),"serialized failure reproduces every query and final private state");
     std::cout<<"blocked tape: rays="<<capture->count()<<" bytes="<<encoded.size()<<" reason="<<t.blockedReason<<'\n';
-    for(const auto version:{"active35-9","active35-10","active31-1","active31-2","active31-3"}) {
-        const auto prior=priorCapture(encoded,version);
+    EdgeWall priorWorld;Traversal priorTraversal;priorTraversal.cfg.approachSeconds=0;
+    check(priorTraversal.attach(priorWorld,priorWorld.origin+Vec{-1000,-37,200},{0,1,0},1000),"prior-format fixture attaches to a supported finite wall");
+    auto priorFrame=std::make_unique<TraversalCapture>();TraversalCapture::RecordingWorld priorRecorder(priorWorld,*priorFrame);
+    priorFrame->begin(priorTraversal,{-1,0},1.f/48,1000);
+    const auto priorResult=priorTraversal.update(priorRecorder,{-1,0},1.f/48,1000);priorFrame->finish(priorTraversal,priorResult);
+    const auto priorEncoded=priorFrame->serialize();
+    for(const auto version:{"active35-9","active35-10","active31-1","active31-2","active31-3","active31-4","active31-5"}) {
+        const auto prior=priorCapture(priorEncoded,version);
         check(decoded->deserialize(prior,error)&&decoded->before().cfg.wallRunEnabled&&decoded->after().cfg.wallRunEnabled,"prior version ordinary snapshots retain enabled wall running");
-        check(decoded->replay().matched&&decoded->serialize()==encoded,"prior ordinary snapshot upgrades without changing any queries or traversal state");
-        if(std::string_view(version).starts_with("active35"))check(!decoded->deserialize(priorCapture(encoded,version,true),error)&&error.find("retired")!=std::string::npos,"prior snapshot with an active removed arc is rejected without changing its meaning");
+        const auto report=decoded->replay();
+        if(!report.matched)std::cerr<<version<<": "<<report.error<<'\n';
+        check(report.matched&&decoded->serialize()==withoutRecovery(priorEncoded),"prior supported movement retains queries and state while defaulting absent recovery fields");
+        if(std::string_view(version).starts_with("active35"))check(!decoded->deserialize(priorCapture(priorEncoded,version,true),error)&&error.find("retired")!=std::string::npos,"prior snapshot with an active removed arc is rejected without changing its meaning");
         for(int id:{17,30,31,32}) {
             auto removed=prior;const auto resultStart=removed.find("RESULT ")+7;
             const auto motion=removed.find(' ',resultStart)+1,end=removed.find(' ',motion);
@@ -147,16 +171,150 @@ static void limitsAndWorldCompleteness() {
 }
 static void sessionBudget() {
     EdgeWall world;auto t=stalledTraversal(world);TraversalCapture::SessionGate gate;
-    check(!gate.arm(t,{},1),"idle hanging never arms capture");
-    check(gate.arm(t,{1,0},1)&&gate.used()==1,"existing deliberate .35s stall arms first frame");
-    check(!gate.arm(t,{1,0},7),"same stuck position cannot spam a second capture");
+    auto arm=[&](const Traversal& state,Input input,float elapsed) {
+        return gate.arm(state,input,elapsed,.025f)&&gate.commit(true);
+    };
+    const Vec upwardStop{-692.019043f,191.0042267f,799.2728271f},laterStop{-713.58f,162.73f,799.27f};
+    t.position=upwardStop;
+    check(!arm(t,{},1)&&!arm(t,{.05f,.05f},1),"idle hanging and deadzone input never arm capture");
+    check(!arm(t,{0,1,true},1)&&!arm(t,{0,-1,false,false,false,true},1),"release and backward drop do not spend capture budget");
+    Traversal unstalled;unstalled.state=State::wall;unstalled.position=upwardStop;
+    check(!arm(unstalled,{0,1},1),"active traversal without a sustained stall does not arm capture");
+    const float nan=std::numeric_limits<float>::quiet_NaN(),infinity=std::numeric_limits<float>::infinity();
+    for(const float elapsed:{nan,infinity,-infinity,-1.f})check(!arm(t,{0,1},elapsed),"nonfinite or negative attachment time does not arm capture");
+    for(const Input input:{Input{nan,1},Input{1,nan},Input{infinity,1},Input{1,-infinity}})
+        check(!arm(t,input,1),"nonfinite input does not arm capture");
+    for(const Vec position:{Vec{nan,0,0},Vec{0,infinity,0},Vec{0,0,-infinity}}) {
+        t.position=position;check(!arm(t,{0,1},1),"nonfinite player position does not arm capture");
+    }
+    check(gate.used()==0,"invalid and idle requests preserve the full budget");
+    t.position=upwardStop;
+    check(arm(t,{0,1},4.106f)&&gate.used()==1,"15:44:04.868 upward stall arms after the 15:44:00.762 attachment");
+    t.position=laterStop;
+    check((laterStop-upwardStop).length()>35&&(laterStop-upwardStop).length()<36,"logged second stop moved only about 36 units");
+    check(!arm(t,{-1,0},5.100f),"15:44:05.862 later left stall remains below the one-second interval");
+    check(arm(t,{-1,0},5.125f)&&gate.used()==2,"next 25ms frame can capture the nearby second stop");
+    check(!arm(t,{-1,-1},6.123f),"15:44:06.885 down-left change also respects the interval");
+    check(arm(t,{-1,-1},6.148f)&&gate.used()==3,"next frame captures down-left at the same stop");
     t.position.x+=120;
-    check(!gate.arm(t,{1,0},5.9f),"different position still respects five-second interval");
-    check(gate.arm(t,{0,1},6)&&gate.used()==2,"different later stall arms second frame");
-    t.position.x+=120;
-    check(!gate.arm(t,{1,0},20),"strict two-block per attachment budget");
-    gate.reset();check(gate.arm(t,{1,0},.5f),"new attachment explicitly resets capture budget");
-    gate.reset();t.stop();check(!gate.arm(t,{1,0},10),"released traversal cannot arm");
+    check(!arm(t,{1,0},20)&&gate.used()==3,"three short stalls preserve the final diagnostic slot for a sustained obstruction");
+    auto persistent=stalledTraversal(world);
+    for(unsigned frame=0;frame<100&&persistent.stalledSeconds()<1.5f;++frame)persistent.update(world,{1,0},1.f/48,1000);
+    check(persistent.active()&&persistent.stalledSeconds()>=1.5f,"the final capture uses a real sustained movement obstruction");
+    persistent.position=t.position;
+    check(arm(persistent,{1,0},21)&&gate.used()==4,"a later persistent stop is captured after the three earlier brief obstructions");
+    persistent.position.x+=120;
+    check(!arm(persistent,{-1,0},25)&&gate.used()==4,"the reserved capture keeps a strict four-block per attachment limit");
+
+    gate.reset();t.position=upwardStop;
+    check(arm(t,{0,1},4.106f),"reset starts an independent attachment budget");
+    t.position=laterStop;
+    check(arm(t,{0,1},5.106f),"36-unit displacement alone can capture after exactly one second");
+    check(!arm(t,{0,.3f},8),"same direction at a different analog magnitude cannot repeat a capture");
+    check(!arm(t,{.05f,1},9),"small analog direction jitter cannot repeat a capture");
+    t.position=upwardStop;
+    check(!arm(t,{0,1},10),"return to an earlier captured position and direction cannot repeat it");
+    check(arm(t,{-1,0},11)&&gate.used()==3,"a significant direction change at an earlier position remains eligible");
+
+    gate.reset();t.position=laterStop;
+    check(arm(t,{-1,0},1)&&arm(t,{-1,-1},2),"one position permits a distinct diagonal query after exactly one second");
+    check(!arm(t,{-1,0},3)&&!arm(t,{-1,-1},4)&&gate.used()==2,"alternating previously captured directions cannot spam the same position");
+    check(!arm(t,{1,0},1.5f),"a rewound attachment clock cannot bypass the interval");
+    check(arm(t,{std::numeric_limits<float>::max(),0},5)&&gate.used()==3,"large finite input uses the runtime-clamped direction without overflow");
+    gate.reset();check(arm(t,{1,0},.5f)&&gate.used()==1,"new attachment explicitly resets capture budget and time");
+    gate.reset();t.stop();check(!arm(t,{1,0},10)&&gate.used()==0,"released traversal cannot arm");
+}
+static void captureCommitBudget() {
+    EdgeWall world;auto t=stalledTraversal(world);TraversalCapture::SessionGate gate;
+    const float nan=std::numeric_limits<float>::quiet_NaN(),infinity=std::numeric_limits<float>::infinity();
+    for(const float dt:{nan,infinity,-infinity,-1.f,0.f,1e-7f})
+        check(!gate.arm(t,{0,1},2,dt)&&gate.used()==0,"invalid or paused frame time cannot reserve a capture");
+    check(!gate.commit(true),"commit without an armed frame cannot spend a slot");
+    check(gate.arm(t,{0,1},2,.025f)&&gate.used()==0,"arming does not consume or deduplicate a provisional capture");
+    check(!gate.commit(false)&&gate.used()==0,"a frame without actual World queries does not consume the budget");
+    check(gate.arm(t,{0,1},2,.025f)&&gate.commit(true)&&gate.used()==1,"the same immediate candidate remains available after an empty frame");
+    check(!gate.commit(true)&&gate.used()==1,"a committed capture cannot be committed twice");
+    check(!gate.arm(t,{1,0},2.9f,.025f),"only an observed frame advances the one-second interval");
+    check(gate.arm(t,{1,0},3,.025f),"a changed direction can arm after the observed frame interval");
+    check(!gate.arm(t,{1,0},3,0)&&!gate.commit(true)&&gate.used()==1,"a paused frame invalidates a pending unrecorded candidate");
+    gate.reset();check(!gate.commit(true)&&gate.used()==0,"reset clears pending state and all committed quotas");
+}
+struct CaptureHoldWall:EdgeWall {
+    bool visible=true;
+    std::optional<Hit> ray(Vec a,Vec b)override {
+        if(visible)return EdgeWall::ray(a,b);
+        ++calls;return {};
+    }
+};
+static Traversal capturedHold(CaptureHoldWall& world) {
+    Traversal t;t.cfg.approachSeconds=0;
+    check(t.attach(world,world.origin+Vec{-1000,-37,200},{0,1,0},1000),"geometry capture fixture starts on a valid wall");
+    world.visible=false;t.update(world,{0,1},.025f,1000);
+    check(t.geometryHolding()&&t.stalledSeconds()<.35f,"lost source support holds before the ordinary stall counter reaches its gate");
+    return t;
+}
+static void heldCaptureBudget() {
+    CaptureHoldWall world;auto t=capturedHold(world);TraversalCapture::SessionGate gate;
+    auto capture=std::make_unique<TraversalCapture>();auto decoded=std::make_unique<TraversalCapture>();
+    TraversalCapture::RecordingWorld recorded(world,*capture);
+    float elapsed=10;
+    for(const float dt:{0.f,-1.f,std::numeric_limits<float>::quiet_NaN(),std::numeric_limits<float>::infinity(),1e-7f})
+        check(!gate.arm(t,{0,1},elapsed,dt)&&gate.used()==0,"paused and invalid hold updates do not consume capture quota");
+    check(!gate.arm(t,{0,1},elapsed,1.f),"long frame time obeys Core's 50ms clamp instead of prematurely draining a 150ms retry");
+    unsigned captured=0,cooldown=0;
+    for(unsigned frame=0;frame<80;++frame) {
+        elapsed+=.025f;const bool armed=gate.arm(t,{0,1},elapsed,.025f);const auto calls=world.calls;
+        if(armed)capture->begin(t,{0,1},.025f,1000);
+        const auto result=t.update(armed?static_cast<World&>(recorded):static_cast<World&>(world),{0,1},.025f,1000);
+        if(armed) {
+            capture->finish(t,result);
+            check(world.calls>calls&&capture->observed()>0,"held frame is captured only on a real geometry retry");
+            check(gate.commit(capture->observed()>0),"queried held frame commits its reserved slot");
+            const auto replay=capture->replay();check(replay.matched,"held retry records an exact Core replay without additional queries");
+            const auto encoded=capture->serialize();std::string error;
+            check(decoded->deserialize(encoded,error)&&decoded->serialize()==encoded&&decoded->replay().matched,
+                "held retry preserves recovery cooldown, origin, direction and search cursor through disk serialization");
+            check(decoded->deserialize(priorCapture(encoded,"active31-5"),error)&&decoded->before().geometryHolding()&&
+                decoded->serialize()==withoutRecovery(encoded),"active31-5 preserves hold state while safely defaulting absent recovery state");
+            ++captured;
+        } else if(world.calls==calls) {
+            ++cooldown;check(!gate.commit(false),"zero-query cooldown cannot commit a new capture");
+        }
+    }
+    check(captured==1&&gate.used()==1&&cooldown>20,"same held position and direction is captured once while cooldown frames preserve the budget");
+    t.update(world,{0,1},.025f,0);
+    check(t.resting(),"geometry hold can coexist with exhausted stamina");
+    for(unsigned frame=0;frame<100;++frame)
+        check(!gate.arm(t,{1,0},elapsed+2+frame*.025f,.025f)&&gate.used()==1,"resting does not capture repeated zero-query frames");
+    CaptureHoldWall reserveWorld;auto reserved=capturedHold(reserveWorld);gate.reset();
+    EdgeWall ordinaryWorld;auto ordinary=stalledTraversal(ordinaryWorld);
+    for(unsigned i=0;i<3;++i) {
+        ordinary.position.x+=40;
+        check(gate.arm(ordinary,{1,0},float(i+1),.025f)&&gate.commit(true),"three ordinary stalls leave one diagnostic slot reserved");
+    }
+    elapsed=10;float committedAt=0;
+    for(unsigned frame=0;frame<90;++frame) {
+        elapsed+=.025f;const bool armed=gate.arm(reserved,{0,1},elapsed,.025f);const auto calls=reserveWorld.calls;
+        reserved.update(reserveWorld,{0,1},.025f,1000);
+        if(armed) {
+            check(reserveWorld.calls>calls&&gate.commit(true),"reserved slot captures a real persistent hold retry");
+            committedAt=elapsed-10;break;
+        }
+    }
+    check(committedAt>=1.49f&&committedAt<2&&gate.used()==4,"persistent source loss reaches the fourth slot even when ordinary stalled time stays zero");
+    check(!gate.arm(reserved,{-1,0},20,.025f),"held retries retain the strict four-capture session limit");
+    CaptureHoldWall idleWorld;auto idle=capturedHold(idleWorld);gate.reset();unsigned idleCaptured=0;
+    elapsed=0;
+    for(unsigned frame=0;frame<120;++frame) {
+        elapsed+=.025f;const Input input=frame%2?Input{}:Input{.03f,-.03f};
+        const bool armed=gate.arm(idle,input,elapsed,.025f);const auto calls=idleWorld.calls;
+        idle.update(idleWorld,input,.025f,1000);
+        if(armed) {
+            check(idleWorld.calls>calls&&gate.commit(true),"neutral held retry captures actual geometry queries");
+            ++idleCaptured;
+        }
+    }
+    check(idleCaptured==1&&gate.used()==1,"neutral and deadzone holding share one independently deduplicated direction");
 }
 struct TopWall:World {
     std::optional<Hit> ray(Vec a,Vec b)override {
@@ -166,6 +324,44 @@ struct TopWall:World {
         return result;
     }
 };
+struct CaptureRecoveryWorld:World {
+    fc_test::CornerWorld source,target;
+    bool sourceVisible=true;
+    unsigned calls{};
+    CaptureRecoveryWorld(){source.boxes={{{-10000,0,-10000},{10000,10000,10000}}};}
+    std::optional<Hit> ray(Vec a,Vec b)override {
+        ++calls;auto hit=sourceVisible?source.ray(a,b):std::optional<Hit>{};
+        if(auto next=target.ray(a,b))if(!hit||(next->point-a).length()<(hit->point-a).length())hit=next;
+        return hit;
+    }
+};
+static void supportRecoveryReplay() {
+    unsigned frames=0;
+    for(int direction=0;direction<4;++direction) {
+        CaptureRecoveryWorld world;Traversal t;t.cfg=fc_test::settings();t.cfg.contextActions=false;
+        t.cfg.automaticClimbActions=false;t.cfg.wallRunObstacleJumps=false;t.cfg.fancyJumps=false;
+        check(t.attach(world,{0,-42,200},{0,1,0},1000),"recovery capture starts from a real supported attachment");
+        world.sourceVisible=false;Input input{};
+        if(direction==0){input.y=1;world.target.boxes={{{-10000,0,350},{10000,10000,10000}}};}
+        else if(direction==1){input.x=1;world.target.boxes={{{100,0,-10000},{10000,10000,10000}}};}
+        else if(direction==2){input.x=-1;world.target.boxes={{{-10000,0,-10000},{-100,10000,10000}}};}
+        else {input.y=-1;world.target.boxes={{{-10000,0,-10000},{10000,10000,224}}};}
+        auto capture=std::make_unique<TraversalCapture>(),decoded=std::make_unique<TraversalCapture>();
+        TraversalCapture::RecordingWorld recorder(world,*capture);bool began=false,ended=false;
+        for(unsigned frame=0;frame<360&&!ended;++frame) {
+            const Input current=began?Input{}:input;const auto calls=world.calls;
+            capture->begin(t,current,.025f,1000);const auto result=t.update(recorder,current,.025f,1000);capture->finish(t,result);
+            check(capture->count()==world.calls-calls&&capture->complete(),"recovery capture preserves the exact bounded source query count");
+            std::string error;const auto encoded=capture->serialize();
+            check(decoded->deserialize(encoded,error)&&decoded->serialize()==encoded,"recovery planning and movement snapshots retain every recovery field");
+            const auto replay=decoded->replay();if(!replay.matched)std::cerr<<replay.error<<'\n';
+            check(replay.matched,"recovery search, orientation, live checks and landing replay exactly");
+            ++frames;began|=t.recoveringSupport();ended=began&&!t.recoveringSupport()&&t.state==State::wall;
+        }
+        check(began&&ended,"each direction captures a complete collision-checked support recovery");
+    }
+    std::cout<<"support recovery snapshots replayed="<<frames<<'\n';
+}
 static void privateTransitionState() {
     auto capture=std::make_unique<TraversalCapture>();auto decoded=std::make_unique<TraversalCapture>();
     TopWall world;Traversal t;t.cfg.radius=31;t.cfg.gap=37;t.cfg.height=138;
@@ -334,7 +530,7 @@ static void sharedWallRunSourceReplay() {
         capture->begin(t,input,1.f/60,1000);const auto result=t.update(recorder,input,1.f/60,1000);capture->finish(t,result);std::string error;
         check(decoded->deserialize(priorCapture(capture->serialize(),"active31-1"),error),"prior shared authored transitions deserialize without direction variants");
         const auto report=decoded->replay();if(!report.matched)throw std::runtime_error(report.error);
-        check(decoded->serialize()==capture->serialize(),"old shared launch and catch snapshots replay without inventing a new direction field");
+        check(decoded->serialize()==withoutRecovery(capture->serialize()),"old shared launch and catch snapshots replay while defaulting absent recovery fields");
         return result;
     };
     check(record(running).motion==Motion::runLaunchLeft&&t.state==State::action,"shared source launch starts through Core");
@@ -365,7 +561,7 @@ static int replayLog(const char* path) {
 }
 int main(int argc,char** argv){try {
     if(argc==2)return replayLog(argv[1]);
-    snapshotRoundTrip();limitsAndWorldCompleteness();sessionBudget();privateTransitionState();failedSearchCooldownState();animationProfileValidation();wallRunSettingReplay();wallRunDirectionReplay();sharedWallRunSourceReplay();
+    snapshotRoundTrip();limitsAndWorldCompleteness();sessionBudget();captureCommitBudget();heldCaptureBudget();supportRecoveryReplay();privateTransitionState();failedSearchCooldownState();animationProfileValidation();wallRunSettingReplay();wallRunDirectionReplay();sharedWallRunSourceReplay();
     std::cout<<"PASS TraversalCapture exact versioned replay, no extra queries, truncation and session budgets\n";
     return 0;
 }catch(const std::exception& e){std::cerr<<"FAIL "<<e.what()<<'\n';return 1;}}

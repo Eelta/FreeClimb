@@ -455,10 +455,22 @@ struct Library {
         auto solve=[&](float side) {
             p[a].q=originalA;p[b].q=originalB;
             const Vec joint=start+axis*along+plane.unit()*(radial*side);
-            rotateWorld(p,a,Quat::between(mid-start,joint-start)*upperWorld);
+            const auto aimedUpper=Quat::between(mid-start,joint-start)*upperWorld;
+            rotateWorld(p,a,aimedUpper);
             const auto aimedB=worldBone(p,b),aimedC=worldBone(p,c);
             if(!aimedB||!aimedC)return false;
-            rotateWorld(p,b,Quat::between(aimedC->t-aimedB->t,start+axis*distance-aimedB->t)*aimedB->q);
+            const Vec before=aimedC->t-aimedB->t,desired=start+axis*distance-aimedB->t;
+            if(hand>=0&&canonicalGuard) {
+                Quat roll{};
+                const Vec humerus=(aimedB->t-start).unit();
+                const Vec from=before-humerus*before.dot(humerus),to=desired-humerus*desired.dot(humerus);
+                if(from.length()>.0001f&&to.length()>.0001f) {
+                    const auto source=from.unit(),destination=to.unit();
+                    roll=Quat::axis(humerus,std::atan2(humerus.dot(source.cross(destination)),source.dot(destination)));
+                    rotateWorld(p,a,roll*aimedUpper);
+                }
+                rotateWorld(p,b,Quat::between(roll.rotate(before),desired)*roll*aimedB->q);
+            } else rotateWorld(p,b,Quat::between(before,desired)*aimedB->q);
             return true;
         };
         if(!solve(1))return std::numeric_limits<float>::infinity();
@@ -475,5 +487,6 @@ struct Library {
 #include "SideRunPose.h"
 #include "PoseContinuation.h"
 #include "BackFlipPose.h"
+#include "GripHandPose.h"
 #include "SurfacePose.h"
 }

@@ -63,17 +63,30 @@ static void blocked(const Library& library,int kind) {
     auto t=start(world,library);
     if(kind==0)world.boxes.push_back({{-10000,-10000,170},{10000,10000,176}});
     if(kind==1)world.boxes[0].high.y=8;
-    bool completed=false,changed=false,aborted=false;
+    bool completed=false,changed=false,held=false;
     for(int i=0;i<600&&t.active();++i) {
-        if(kind==2&&t.state==State::mantle&&t.progress()>.35f) {
+        if(kind==2&&!changed&&t.state==State::mantle&&t.progress()>.35f) {
             const Vec next=t.topPathPoint(std::min(1.f,t.progress()+.04f));
             world.boxes.push_back({next+Vec{-200,-200,45},next+Vec{200,200,55}});changed=true;
         }
-        const auto before=t.position;const auto r=t.update(world,{0,1,false,true},1.f/60,1000);completed|=r.completed;
-        if(changed&&r.released){aborted=true;require((t.position-before).length()<.001f,"new obstruction blocks movement before committing its segment");}
+        const auto before=t.position;const auto phase=t.progress();
+        const auto r=t.update(world,{0,1,false,true},1.f/60,1000);completed|=r.completed;
+        require(!r.released,"blocked fitted routes retain attachment while real collision prevents movement");
+        if(changed&&t.geometryHolding()) {
+            held=true;require(t.state==State::mantle&&(t.position-before).length()<.001f&&t.progress()==phase,
+                "new obstruction holds movement before committing its segment or clock");
+        }
     }
     require(!completed,"clearance fitting never bypasses real ceilings, insufficient platforms or new live obstacles");
-    if(kind==2)require(changed&&aborted,"active fitted mantle still performs live collision checks");
+    if(kind==2) {
+        require(changed&&held&&t.active(),"active fitted mantle performs live collision checks while retaining the action");
+        world.boxes.resize(1);
+        for(int frame=0;frame<180&&t.active();++frame) {
+            const auto r=t.update(world,{0,1,false,true},1.f/60,1000);completed|=r.completed;
+            require(!r.released||r.completed,"restored fitted mantle never forces an incomplete release");
+        }
+        require(completed&&!t.active(),"removing the obstacle resumes and completes the fitted mantle");
+    }
 }
 static void capture(const Library& library) {
     fc_test::CornerWorld world;world.boxes={{{-10000,0,-10000},{10000,10000,120}}};

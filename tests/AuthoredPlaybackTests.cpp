@@ -70,9 +70,19 @@ static void blocked(const Library& library) {
     AuthoredLedge world;auto t=attach(world,library);t.update(world,{0,1,false,true},1.f/60,100);
     require(t.state==State::mantle,"live obstruction fixture starts on a checked authored path");
     while(t.progress()<.65f&&t.active())t.update(world,{0,1,false,true},1.f/60,100);
-    world.barrier=t.position.y+t.cfg.radius+.1f;const auto before=t.position;
-    const auto result=t.update(world,{0,1,false,true},1.f/60,100);
-    require(result.released&&!result.completed&&(t.position-before).length()<.001f,"a new live solid obstruction prevents committing the authored movement segment");
+    world.barrier=t.position.y+t.cfg.radius+.1f;const auto before=t.position;const auto phase=t.progress();
+    for(int frame=0;frame<60;++frame) {
+        const auto result=t.update(world,{0,1,false,true},1.f/60,100);
+        require(t.active()&&t.state==State::mantle&&t.geometryHolding()&&!result.released&&!result.completed&&
+            (t.position-before).length()<.001f&&t.progress()==phase,
+            "a new live solid obstruction holds the authored movement segment without committing position or phase");
+    }
+    world.barrier=1e9f;bool completed=false;
+    for(int frame=0;frame<180&&t.active();++frame) {
+        const auto result=t.update(world,{0,1,false,true},1.f/60,100);completed|=result.completed;
+        require(!result.released||result.completed,"restored authored mantle never forces an incomplete release");
+    }
+    require(completed&&!t.active(),"removing the live barrier resumes and completes the original authored mantle");
     auto impossible=library;auto& trajectory=impossible.clips[int(Motion::contextMantle)-1].trajectory;
     trajectory.knots[1].displacement={0,40,0};trajectory.knots[2].displacement={0,66,20};
     AuthoredLedge blockedWorld;auto candidate=attach(blockedWorld,impossible);

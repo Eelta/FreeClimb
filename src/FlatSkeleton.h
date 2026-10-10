@@ -66,23 +66,53 @@ struct ExistingSceneLookup {
     RE::NiAVObject* node{};
     std::size_t scanned{},edges{};
     bool ambiguous{},incomplete{};
+    RE::NiAVObject* conflict{};
+    RE::NiAVObject* stoppedAt{};
+    std::size_t nonNullEdges{},matches{};
+    int maxDepth{};
+    const char* limit{};
+    RE::NiAVObject* selected()const{return ambiguous||incomplete?nullptr:node;}
+    const char* reason()const{return ambiguous?"ambiguous":incomplete?limit:node?"unique":"not-found";}
 };
-inline void findExistingSceneNodes(RE::NiAVObject* root,std::string_view name,int depth,ExistingSceneLookup& result) {
+inline void findExistingSceneNodes(RE::NiAVObject* root,std::string_view name,int depth,ExistingSceneLookup& result,bool stopAtMatch=false) {
     if(!root||result.ambiguous||result.incomplete)return;
-    if(depth>128||++result.scanned>4096){result.incomplete=true;return;}
+    result.maxDepth=std::max(result.maxDepth,depth);
+    if(depth>128){result.incomplete=true;result.limit="depth-limit";result.stoppedAt=root;return;}
+    if(++result.scanned>4096){result.incomplete=true;result.limit="node-limit";result.stoppedAt=root;return;}
     if(root->name.c_str()&&sameSceneBoneName(name,root->name.c_str())) {
-        if(result.node&&result.node!=root){result.ambiguous=true;return;}
+        ++result.matches;
+        if(result.node&&result.node!=root){result.ambiguous=true;result.conflict=root;return;}
         result.node=root;
+        if(stopAtMatch)return;
     }
     if(auto node=root->AsNode())for(auto& child:node->GetChildren()) {
-        if(++result.edges>8192){result.incomplete=true;return;}
-        findExistingSceneNodes(child.get(),name,depth+1,result);
+        if(++result.edges>8192){result.incomplete=true;result.limit="child-slot-limit";result.stoppedAt=root;return;}
+        auto* next=child.get();result.nonNullEdges+=next!=nullptr;
+        findExistingSceneNodes(next,name,depth+1,result,stopAtMatch);
         if(result.ambiguous||result.incomplete)return;
     }
 }
-inline RE::NiAVObject* existingNode(RE::NiAVObject* root,std::string_view name,int depth=0) {
+inline ExistingSceneLookup lookupExistingNode(RE::NiAVObject* root,std::string_view name,int depth=0) {
     ExistingSceneLookup result;findExistingSceneNodes(root,name,depth,result);
-    return result.ambiguous||result.incomplete?nullptr:result.node;
+    return result;
+}
+inline RE::NiAVObject* existingNode(RE::NiAVObject* root,std::string_view name,int depth=0) {
+    return lookupExistingNode(root,name,depth).selected();
+}
+inline ExistingSceneLookup lookupSkeletonRoot(RE::NiAVObject* actorRoot,std::string_view name) {
+    ExistingSceneLookup result;findExistingSceneNodes(actorRoot,name,0,result,true);
+    if(!result.selected())return result;
+    if(result.node->AsNode()) {
+        auto* ancestor=result.node;
+        for(int depth=0;ancestor&&depth<=128;++depth) {
+            if(ancestor==actorRoot)return result;
+            if(!runtime::readable(reinterpret_cast<std::uintptr_t>(ancestor),sizeof(RE::NiAVObject)))break;
+            ancestor=ancestor->parent;
+        }
+        result.limit="root-outside-actor";
+    }else result.limit="invalid-root-node";
+    result.incomplete=true;result.stoppedAt=result.node;
+    return result;
 }
 struct FlatMapSlot {
     const char* name{};
@@ -310,6 +340,44 @@ inline std::string sceneDiagnosticClass(RE::NiAVObject* object) {
     const auto* rtti=object->GetRTTI();
     if(!runtime::readable(reinterpret_cast<std::uintptr_t>(rtti),sizeof(RE::NiRTTI)))return "<invalid-rtti>";
     return sceneDiagnosticText(rtti->GetName());
+}
+inline std::string describeExistingSceneLookup(RE::NiAVObject* actorRoot,const ExistingSceneLookup& lookup) {
+    const auto describe=[](RE::NiAVObject* node) {
+        if(!node)return std::string("<null>");
+        std::string result="address="+std::to_string(reinterpret_cast<std::uintptr_t>(node));
+        if(!runtime::readable(reinterpret_cast<std::uintptr_t>(node),sizeof(RE::NiAVObject)))return result+" <unreadable>";
+        return result+" name='"+sceneDiagnosticName(node->name)+"' class='"+sceneDiagnosticClass(node)+"'";
+    };
+    const auto path=[&](RE::NiAVObject* node) {
+        std::string result;std::array<RE::NiAVObject*,8> visited{};std::size_t count=0;
+        while(node&&count<visited.size()) {
+            if(!result.empty())result+=" <- ";
+            if(std::find(visited.begin(),visited.begin()+count,node)!=visited.begin()+count){result+="<cycle>";return result;}
+            visited[count++]=node;result+=describe(node);
+            if(!runtime::readable(reinterpret_cast<std::uintptr_t>(node),sizeof(RE::NiAVObject)))return result;
+            node=node->parent;
+        }
+        if(node)result+=" <- <parent-limit>";
+        return result.empty()?std::string("<null>"):result;
+    };
+    std::string result="reason="+std::string(lookup.reason())+" scanned="+std::to_string(lookup.scanned)+
+        " childSlots="+std::to_string(lookup.edges)+" nonNullChildren="+std::to_string(lookup.nonNullEdges)+
+        " matches="+std::to_string(lookup.matches)+" maxDepth="+std::to_string(lookup.maxDepth)+
+        " first=["+path(lookup.node)+"] conflict=["+path(lookup.conflict)+"] stoppedAt=["+path(lookup.stoppedAt)+
+        "] actor=["+describe(actorRoot)+"] topChildren=[";
+    if(!runtime::readable(reinterpret_cast<std::uintptr_t>(actorRoot),sizeof(RE::NiAVObject)))return result+"<unreadable>]";
+    std::uintptr_t table{};std::memcpy(&table,actorRoot,sizeof(table));
+    if(!runtime::hookSite(table,3))return result+"<invalid-vtable>]";
+    auto* node=actorRoot->AsNode();
+    if(!node)return result+"<not-node>]";
+    if(!runtime::readable(reinterpret_cast<std::uintptr_t>(node),sizeof(RE::NiNode)))return result+"<unreadable-node>]";
+    const auto& children=node->GetChildren();const auto count=std::min<std::size_t>(children.capacity(),8);
+    if(count&&!runtime::readable(reinterpret_cast<std::uintptr_t>(children.begin()),count*sizeof(*children.begin())))return result+"<unreadable-children>]";
+    for(std::size_t i=0;i<count;++i) {
+        if(i)result+="; ";
+        result+=std::to_string(i)+":"+describe(children.begin()[i].get());
+    }
+    return result+"] childrenCapacity="+std::to_string(children.capacity());
 }
 inline std::string sceneDiagnosticRawName(std::string_view name) {
     constexpr char digits[]="0123456789ABCDEF";

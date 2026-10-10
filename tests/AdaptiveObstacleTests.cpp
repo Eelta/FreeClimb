@@ -132,7 +132,15 @@ void dynamic() {
         {
             auto t=planned.traversal,witness=t;auto changed=world;changed.boxes[0].high.z=210;
             const auto out=t.update(changed,planned.input,1.f/fps,1000);
-            check(out.released&&(t.position-witness.position).length()<.001f,"removed upper grip stops before committing stale travel");
+            check(!out.released&&t.active()&&t.geometryHolding()&&(t.position-witness.position).length()<.001f&&
+                t.progress()==witness.progress()&&out.staminaCost==0,"removed upper grip holds before committing stale travel");
+            for(int i=0;i<fps;++i) {
+                const auto held=t.update(changed,planned.input,1.f/fps,1000);
+                check(!held.released&&t.geometryHolding()&&(t.position-witness.position).length()<.001f&&
+                    t.progress()==witness.progress(),"missing upper grip cannot advance during retries");
+            }
+            for(int i=0;i<fps*3&&t.state==State::action;++i)check(!t.update(world,planned.input,1.f/fps,1000).released,"restored adaptive target resumes without dropping");
+            check(t.active()&&!t.geometryHolding()&&t.state==State::wall,"restored adaptive target completes the checked catch");
         }
         {
             auto t=planned.traversal;
@@ -141,7 +149,16 @@ void dynamic() {
             const auto p=world.local(previous);changed.boxes.push_back({{p.x-200,p.y-180,p.z+140},{p.x+200,p.y+180,p.z+145},false});
             bool released=false;
             for(int i=0;i<fps&&t.state==State::action;++i){auto out=t.update(changed,planned.input,1.f/fps,1000);released|=out.released;check(changed.clearance(t.position,t.cfg)+.04f>=t.cfg.radius,"late blocker stops before occupied body volume");}
-            check(released,"new overhead solid cancels actual path");
+            check(!released&&t.active()&&t.geometryHolding(),"new overhead solid pauses the actual path");
+            const auto heldPosition=t.position;const float heldPhase=t.progress();
+            for(int i=0;i<fps;++i) {
+                const auto held=t.update(changed,planned.input,1.f/fps,1000);
+                check(!held.released&&(t.position-heldPosition).length()==0&&t.progress()==heldPhase,
+                    "blocked adaptive route retains its exact root and phase");
+            }
+            Input release;release.release=true;auto out=t.update(changed,release,1.f/fps,1000);
+            for(int i=0;i<fps&&!out.released;++i)out=t.update(changed,{},1.f/fps,1000);
+            check(out.released&&!t.active(),"blocked adaptive route permits deliberate release");
         }
         if(run) {
             auto t=planned.traversal;auto climb=planned.input;climb.run=false;

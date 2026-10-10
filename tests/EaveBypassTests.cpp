@@ -58,7 +58,7 @@ struct EaveWorld final:World {
         return false;
     }
 };
-struct Outcome {bool planned{},caught{},released{},safe=true,complete{};float gain{},side{};unsigned peak{};float maxAngle{};};
+struct Outcome {bool planned{},caught{},released{},safe=true,complete{},held{};float gain{},side{};unsigned peak{};float maxAngle{};};
 Outcome run(EaveWorld& w,int fps,bool sprint=false,bool obstacle=false,bool removeTarget=false,bool recoveryEnabled=false) {
     Traversal t;t.cfg.radius=31;t.cfg.gap=37;t.cfg.height=138;t.cfg.approachSeconds=0;t.cfg.wallRunObstacleJumps=recoveryEnabled;
     check(t.attach(w,w.global({0,-37,-130}),w.rotate({0,1,0},w.yaw),1000),"attach real source wall");
@@ -68,10 +68,14 @@ Outcome run(EaveWorld& w,int fps,bool sprint=false,bool obstacle=false,bool remo
             if(obstacle)w.shapes.push_back({box({-220,-180,142},{220,350,147})});
             if(removeTarget)w.roofMissing=true;changed=true;
         }
+        const auto before=t.position;const float phase=t.progress();
         w.casts=0;const auto result=t.update(w,{0,1,false,false,false,false,sprint},1.f/fps,1000);
+        if(t.geometryHolding())check(t.active()&&!result.released&&result.staminaCost==0&&
+            (t.position-before).length()==0&&t.progress()==phase,"changed eave geometry freezes the last checked root and phase");
+        out.held|=t.geometryHolding();
         out.peak=std::max(out.peak,w.casts);
         if(runtimeLibrary&&t.active()) {
-            const auto pose=animator.update(*runtimeLibrary,w,t,result.motion,1.f/fps,1);
+            const auto pose=animator.update(*runtimeLibrary,w,t,result.motion,t.geometryHolding()?0.f:1.f/fps,1);
             check(pose.size()==99,"actual pose supplies the full Skyrim skeleton");
             for(const auto& bone:pose)check(bone.t.finite()&&std::isfinite(bone.q.dot(bone.q))&&std::abs(bone.q.dot(bone.q)-1)<.002f,"finite normalized eave poses");
             for(int hand=0;hand<2;++hand)check(runtimeLibrary->armBendValid(pose,hand),"eave transfer does not reverse elbow bends");
@@ -95,7 +99,13 @@ Outcome run(EaveWorld& w,int fps,bool sprint=false,bool obstacle=false,bool remo
 
         out.safe&=!w.bodyInside(t.position);
     }
-    const auto delta=w.local(t.position)-w.local(start);out.gain=delta.z;out.side=delta.x;return out;
+    const auto delta=w.local(t.position)-w.local(start);out.gain=delta.z;out.side=delta.x;
+    if(changed&&out.held) {
+        Input release;release.release=true;auto result=t.update(w,release,1.f/fps,1000);
+        for(int frame=0;frame<fps&&!result.released;++frame)result=t.update(w,{},1.f/fps,1000);
+        check(result.released&&!t.active(),"held eave transfer remains manually releasable");
+    }
+    return out;
 }
 void recoveredOuterCorner(int fps,bool distant) {
     EaveWorld world;world.shapes.clear();world.shapes.push_back({box({-300,0,-300},{0,300,500})});
@@ -155,8 +165,8 @@ int main(int argc,char** argv){try {
         check(!r.planned&&!r.released,"excess depth and invalid surfaces are not bypassed");
     }
     {EaveWorld w;const auto r=run(w,60,true);check(!r.planned,"wall-run controls never launch eave hops");}
-    {EaveWorld w;const auto r=run(w,60,false,true);check(r.planned&&r.released&&r.safe,"new path blocker aborts before crossing");}
-    {EaveWorld w;const auto r=run(w,60,false,false,true);check(r.planned&&r.released&&!r.caught,"removed target does not create an air catch");}
+    {EaveWorld w;const auto r=run(w,60,false,true);check(r.planned&&r.held&&!r.released&&r.safe,"new path blocker holds before crossing");}
+    {EaveWorld w;const auto r=run(w,60,false,false,true);check(r.planned&&r.held&&!r.released&&!r.caught,"removed target holds without creating an air catch");}
     for(int fps:{30,60,120})for(bool distant:{false,true})recoveredOuterCorner(fps,distant);
     std::cout<<positive<<" eave scenarios plus six scheduled fallbacks, negative geometry and live changes passed\n";
     return 0;

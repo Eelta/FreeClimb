@@ -19,14 +19,15 @@ static Measurements run(int fps,bool sprint,float recess,bool distant,int mode=0
     if(mode==3)w.boxes.push_back({{-220,-180,450},{220,350,458}});
     if(mode==6)w.boxes[1].climbable=false;
     const Input input{0,1,false,true,false,false,sprint};
-    Measurements found;float landedZ=0;
+    Measurements found;float landedZ=0;bool held=false;
     for(int frame=0;frame<fps*6&&t.active();++frame) {
         if(found.planned&&!found.changed&&t.actionProgress()>.25f&&(mode==4||mode==5)) {
             if(mode==4)w.boxes.erase(w.boxes.begin()+1);
             else w.boxes.push_back({{-220,-180,450},{220,350,458}});
             found.changed=true;
         }
-        w.rays=0;const auto before=t.position;const auto output=t.update(w,input,1.f/fps,mode==2?20.f:1000.f);
+        w.rays=0;const auto before=t.position;const auto phase=t.actionProgress();
+        const auto output=t.update(w,input,1.f/fps,mode==2?20.f:1000.f);
         found.peak=std::max(found.peak,w.rays);
         const bool planned=t.state==State::action&&std::string(t.blockedReason).find("checked recessed")!=std::string::npos;
         if(planned&&!found.planned) {
@@ -44,7 +45,10 @@ static Measurements run(int fps,bool sprint,float recess,bool distant,int mode=0
         check(!output.completed,"a narrow recessed wall strip is not a standing summit");
         check(w.clearance(t.position,t.cfg)+.05f>=t.cfg.radius,"independent body clearance holds along the full root route");
         found.released|=output.released;
-        if(found.changed&&output.released)check((t.position-before).length()<.001f,"changed support or route aborts before applying an unsafe root position");
+        if(found.changed&&t.geometryHolding()) {
+            held=true;check(t.state==State::action&&!output.released&&(t.position-before).length()<.001f&&t.actionProgress()==phase,
+                "changed support or route holds before applying an unsafe root position or phase");
+        }
         if(found.planned&&!output.released&&t.state==State::wall&&!found.landed) {
             found.landed=true;landedZ=w.local(t.position).z;
         }
@@ -63,7 +67,19 @@ static Measurements run(int fps,bool sprint,float recess,bool distant,int mode=0
         if((sprint&&(!found.planned||!found.landed))||!found.resumed||found.released)std::cerr<<"case fps="<<fps<<" run="<<sprint<<" recess="<<recess<<" planned="<<found.planned<<" landed="<<found.landed<<" resumed="<<found.resumed<<" released="<<found.released<<" root="<<w.local(t.position).y<<","<<w.local(t.position).z<<" reason="<<t.blockedReason<<'\n';
         check((!sprint||(found.planned&&found.landed))&&found.resumed&&!found.released,
             "ordinary wall entry reconnects through a checked jump or native climb and continues upward");
-    } else if(mode==4||mode==5)check(found.planned&&found.changed&&found.released&&!found.landed,"dynamic upper support or route loss invalidates transfer");
+    } else if(mode==4||mode==5) {
+        check(found.planned&&found.changed&&held&&t.active()&&!found.released&&!found.landed,
+            "dynamic upper support or route loss preserves the blocked transfer without landing or releasing");
+        w.boxes=world(recess,distant).boxes;
+        for(int frame=0;frame<fps*3&&t.active()&&!found.resumed;++frame) {
+            const auto output=t.update(w,input,1.f/fps,1000);
+            check(!output.released,"restored recessed transfer never forces a release");
+            check(w.clearance(t.position,t.cfg)+.05f>=t.cfg.radius,"resumed transfer retains independent full-body clearance");
+            if(t.state==State::wall&&!found.landed){found.landed=true;landedZ=w.local(t.position).z;}
+            if(found.landed){found.rise=w.local(t.position).z-landedZ;found.resumed=found.rise>90;}
+        }
+        check(found.landed&&found.resumed,"restored upper support and clearance resume the original recessed transfer");
+    }
     else check(!found.planned&&!found.landed,"disabled, unaffordable, blocked or unsupported route cannot commit a recessed transfer");
     return found;
 }

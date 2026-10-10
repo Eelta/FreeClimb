@@ -159,8 +159,18 @@ void verticalCore(bool convex,int fps,float direction) {
         "vertical reuse retains independent cylinder clearance");
     auto unsupported=actor;RecordedCorner absent=world;absent.geometry.boxes.clear();absent.calls.clear();
     const auto lost=unsupported.update(absent,{0,direction},1.f/fps,1000);
-    require(!unsupported.turningCorner()&&(!unsupported.active()||lost.released)&&!absent.calls.empty(),
-        "pure vertical reuse cannot preserve a route after its real support disappears");
+    require(!unsupported.turningCorner()&&unsupported.active()&&!lost.released&&unsupported.geometryHolding()&&
+        (unsupported.position-actor.position).length()==0&&!absent.calls.empty(),
+        "lost support cancels the stale corner route and holds the last checked root");
+    const float heldPhase=unsupported.progress();
+    for(int frame=0;frame<fps;++frame) {
+        const auto held=unsupported.update(absent,{0,direction},1.f/fps,1000);
+        require(!held.released&&held.staminaCost==0&&(unsupported.position-actor.position).length()==0&&unsupported.progress()==heldPhase,
+            "unsupported corner retries never move or advance the held root");
+    }
+    Input release;release.release=true;auto exit=unsupported.update(absent,release,1.f/fps,1000);
+    for(int frame=0;frame<fps&&!exit.released;++frame)exit=unsupported.update(absent,{},1.f/fps,1000);
+    require(exit.released&&!unsupported.active(),"unsupported corner remains manually releasable");
     const auto risen=actor.position;
     if(direction>0) {
         world.geometry.boxes.push_back({{-400,-400,risen.z+actor.cfg.height+.5f},

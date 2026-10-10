@@ -512,6 +512,7 @@ RE::NiRTTI diagnosticFlatType{"BSFlattenedBoneTree",&diagnosticNodeType};
 const RE::NiRTTI* diagnosticNodeRTTI(const RE::NiObject*) {return &diagnosticNodeType;}
 const RE::NiRTTI* diagnosticFlatRTTI(const RE::NiObject*) {return &diagnosticFlatType;}
 RE::NiNode* diagnosticAsNode(RE::NiObject* object) {return reinterpret_cast<RE::NiNode*>(object);}
+RE::NiNode* diagnosticNotNode(RE::NiObject*) {return nullptr;}
 using SceneStorage=Storage<RE::NiNode,0x200>;
 void diagnosticChildren(SceneStorage& storage,std::span<RE::NiAVObject*> children) {
     const auto offset=address(&storage.object()->GetChildren())-storage.address();
@@ -526,6 +527,289 @@ struct BinderName {
     }
 };
 static_assert(offsetof(BinderName,text)==sizeof(RE::BSStringPool::Entry));
+fc::ExistingSceneLookup checkedExistingSceneLookup(std::span<SceneStorage> nodes,RE::NiAVObject* root,std::string_view name,
+    RE::NiAVObject* expected,std::string_view reason,int depth=0) {
+    std::vector<std::array<std::byte,0x200>> before;before.reserve(nodes.size());
+    for(const auto& node:nodes)before.push_back(node.bytes);
+    const auto result=fc::lookupExistingNode(root,name,depth);
+    require(result.selected()==expected&&result.reason()==reason,"production root lookup reports the unchanged selection and reason");
+    require(fc::existingNode(root,name,depth)==expected,"legacy root lookup wrapper retains the production selection");
+    for(std::size_t i=0;i<nodes.size();++i)require(nodes[i].bytes==before[i],"production root lookup preserves node data and reference counts");
+    return result;
+}
+std::string checkedExistingSceneDescription(std::span<SceneStorage> nodes,RE::NiAVObject* actor,const fc::ExistingSceneLookup& lookup) {
+    std::vector<std::array<std::byte,0x200>> before;before.reserve(nodes.size());
+    for(const auto& node:nodes)before.push_back(node.bytes);
+    auto result=fc::describeExistingSceneLookup(actor,lookup);
+    require(result.size()<8192&&result.find_first_of("\r\n\t")==std::string::npos,"root diagnostic text remains bounded and cannot inject log lines");
+    for(std::size_t i=0;i<nodes.size();++i)require(nodes[i].bytes==before[i],"root diagnostic formatting preserves nodes and reference counts");
+    return result;
+}
+void existingSceneLookupDiagnostics(REL::Version version) {
+    const auto runtime=version.minor()==5?REL::Module::Runtime::SE:REL::Module::Runtime::AE;
+    require(REL::Module::mock(version,runtime,L"SkyrimSE.exe",0x140000000),"root lookup fixture mock runtime");
+    std::array<std::uintptr_t,4> nodeTable{};nodeTable[2]=address(&diagnosticNodeRTTI);nodeTable[3]=address(&diagnosticAsNode);
+    BinderName actorName,rootName,branchName,lowerName,prefixName,spaceName;
+    actorName.assign("skeleton.nif");rootName.assign("NPC Root [Root]");branchName.assign("branch");
+    lowerName.assign("npc root [root]");prefixName.assign("x_NPC Root [Root]");spaceName.assign("NPC Root [Root] ");
+    const auto initialize=[&](SceneStorage& storage,BinderName& name) {
+        storage.put(0,nodeTable.data());storage.object()->_refCount=1;
+        const char* text=name.text.data();std::memcpy(&storage.object()->name,&text,sizeof(text));
+        require(std::string_view(storage.object()->name.c_str())==name.text.data(),"root lookup uses actual BSFixedString pooled names");
+    };
+    std::array<SceneStorage,4> nodes;auto& actor=nodes[0];auto& root=nodes[1];auto& duplicate=nodes[2];auto& branch=nodes[3];
+    initialize(actor,actorName);initialize(root,rootName);initialize(duplicate,rootName);initialize(branch,branchName);
+    root.object()->parent=actor.object();duplicate.object()->parent=actor.object();branch.object()->parent=actor.object();
+    std::array<RE::NiAVObject*,2> children{root.object(),branch.object()};diagnosticChildren(actor,children);
+    const auto childrenBefore=children;
+    auto result=checkedExistingSceneLookup(nodes,actor.object(),rootName.text.data(),root.object(),"unique");
+    require(result.node==root.object()&&!result.conflict&&!result.stoppedAt&&!result.ambiguous&&!result.incomplete&&
+        result.scanned==3&&result.edges==2&&result.nonNullEdges==2&&result.matches==1&&result.maxDepth==1,
+        "unique root lookup reports the full completed search");
+    require(children==childrenBefore,"root lookup leaves child slots unchanged");
+    result=checkedExistingSceneLookup(nodes,actor.object(),"Missing Root",nullptr,"not-found");
+    require(!result.node&&!result.matches&&result.scanned==3&&result.edges==2&&!result.incomplete,"complete missing root remains missing");
+    result=checkedExistingSceneLookup(nodes,nullptr,rootName.text.data(),nullptr,"not-found");
+    require(!result.scanned&&!result.edges&&!result.matches&&!result.incomplete,"null root has a complete empty lookup");
+    initialize(root,lowerName);
+    result=checkedExistingSceneLookup(nodes,actor.object(),rootName.text.data(),root.object(),"unique");
+    require(result.matches==1&&!result.ambiguous,"case-only root alias retains native scene-name matching");
+    initialize(root,prefixName);checkedExistingSceneLookup(nodes,actor.object(),rootName.text.data(),nullptr,"not-found");
+    initialize(root,spaceName);checkedExistingSceneLookup(nodes,actor.object(),rootName.text.data(),nullptr,"not-found");
+    initialize(root,rootName);children[1]=duplicate.object();
+    result=checkedExistingSceneLookup(nodes,actor.object(),rootName.text.data(),nullptr,"ambiguous");
+    require(result.node==root.object()&&result.conflict==duplicate.object()&&result.matches==2&&result.ambiguous&&!result.incomplete&&
+        result.scanned==3&&result.edges==2,"distinct exact root matches remain ambiguous with both candidates retained");
+    initialize(duplicate,lowerName);
+    result=checkedExistingSceneLookup(nodes,actor.object(),rootName.text.data(),nullptr,"ambiguous");
+    require(result.node==root.object()&&result.conflict==duplicate.object()&&result.matches==2,"case-only duplicate roots remain ambiguous");
+    children[1]=root.object();
+    result=checkedExistingSceneLookup(nodes,actor.object(),rootName.text.data(),root.object(),"unique");
+    require(result.matches==2&&result.scanned==3&&result.edges==2&&!result.conflict,"repeated references to the same matching node remain unique");
+    std::array<RE::NiAVObject*,3> earlyConflict{root.object(),duplicate.object(),branch.object()};diagnosticChildren(actor,earlyConflict);
+    result=checkedExistingSceneLookup(nodes,actor.object(),rootName.text.data(),nullptr,"ambiguous");
+    require(result.scanned==3&&result.edges==2,"ambiguous root lookup stops before unrelated later children");
+    diagnosticChildren(root,std::span<RE::NiAVObject*>{});
+    result=checkedExistingSceneLookup(nodes,root.object(),rootName.text.data(),root.object(),"unique",128);
+    require(result.scanned==1&&result.maxDepth==128,"lookup accepts a matching leaf at the existing depth boundary");
+    result=checkedExistingSceneLookup(nodes,root.object(),rootName.text.data(),nullptr,"depth-limit",129);
+    require(!result.scanned&&!result.matches&&result.stoppedAt==root.object()&&result.maxDepth==129,
+        "initial excessive depth stops before scanning or selecting a matching node");
+    {
+        std::vector<SceneStorage> chain(130);std::vector<std::array<RE::NiAVObject*,1>> links(chain.size());
+        for(std::size_t i=0;i<chain.size();++i) {
+            initialize(chain[i],i?branchName:rootName);
+            if(i)chain[i].object()->parent=chain[i-1].object();
+            if(i+1<chain.size()){links[i][0]=chain[i+1].object();diagnosticChildren(chain[i],links[i]);}
+        }
+        const auto linksBefore=links;
+        result=checkedExistingSceneLookup(chain,chain.front().object(),rootName.text.data(),nullptr,"depth-limit");
+        require(result.node==chain.front().object()&&result.stoppedAt==chain.back().object()&&result.incomplete&&!result.ambiguous&&
+            result.scanned==129&&result.edges==129&&result.nonNullEdges==129&&result.matches==1&&result.maxDepth==129,
+            "an earlier root match is rejected when an unrelated branch exceeds the depth budget");
+        const auto text=checkedExistingSceneDescription(chain,chain.front().object(),result);
+        require(text.find("reason=depth-limit")!=std::string::npos&&
+            text.find("stoppedAt=[address="+std::to_string(chain.back().address()))!=std::string::npos,
+            "depth diagnostic retains the actual stopping node and failure reason");
+        require(links==linksBefore,"depth-limited root lookup leaves child storage unchanged");
+        diagnosticChildren(chain[128],std::span<RE::NiAVObject*>{});
+        result=checkedExistingSceneLookup(chain,chain.front().object(),rootName.text.data(),chain.front().object(),"unique");
+        require(result.scanned==129&&result.edges==128&&result.maxDepth==128,"lookup accepts a complete tree exactly at the depth limit");
+    }
+    {
+        std::vector<SceneStorage> wide(4097);std::vector<RE::NiAVObject*> leaves;leaves.reserve(wide.size()-1);
+        for(std::size_t i=0;i<wide.size();++i) {
+            initialize(wide[i],i?branchName:rootName);
+            if(i){wide[i].object()->parent=wide.front().object();leaves.push_back(wide[i].object());}
+        }
+        diagnosticChildren(wide.front(),leaves);const auto leavesBefore=leaves;
+        result=checkedExistingSceneLookup(wide,wide.front().object(),rootName.text.data(),nullptr,"node-limit");
+        require(result.node==wide.front().object()&&result.stoppedAt==wide.back().object()&&result.incomplete&&!result.ambiguous&&
+            result.scanned==4097&&result.edges==4096&&result.nonNullEdges==4096&&result.matches==1&&result.maxDepth==1,
+            "an earlier root match is rejected when unrelated nodes exceed the unchanged node budget");
+        const auto text=checkedExistingSceneDescription(wide,wide.front().object(),result);
+        require(text.find("reason=node-limit")!=std::string::npos&&
+            text.find("stoppedAt=[address="+std::to_string(wide.back().address()))!=std::string::npos,
+            "node-budget diagnostic retains the actual stopping node and failure reason");
+        require(leaves==leavesBefore,"node-limited root lookup leaves child storage unchanged");
+        diagnosticChildren(wide.front(),std::span<RE::NiAVObject*>(leaves.data(),4095));
+        result=checkedExistingSceneLookup(wide,wide.front().object(),rootName.text.data(),wide.front().object(),"unique");
+        require(result.scanned==4096&&result.edges==4095,"lookup accepts a complete tree exactly at the node limit");
+    }
+    {
+        std::vector<RE::NiAVObject*> slots(8193,nullptr);diagnosticChildren(root,slots);const auto slotsBefore=slots;
+        result=checkedExistingSceneLookup(nodes,root.object(),rootName.text.data(),nullptr,"child-slot-limit");
+        require(result.node==root.object()&&result.stoppedAt==root.object()&&result.incomplete&&!result.ambiguous&&
+            result.scanned==1&&result.edges==8193&&!result.nonNullEdges&&result.matches==1&&result.maxDepth==0,
+            "null child slots exhaust the unchanged edge budget and invalidate an earlier root match");
+        const auto text=checkedExistingSceneDescription(nodes,root.object(),result);
+        require(text.find("reason=child-slot-limit")!=std::string::npos&&
+            text.find("stoppedAt=[address="+std::to_string(root.address()))!=std::string::npos&&text.find("childrenCapacity=8193")!=std::string::npos,
+            "child-slot diagnostic identifies the slot owner and preserves its original capacity");
+        require(slots==slotsBefore,"slot-limited root lookup leaves null child storage unchanged");
+        diagnosticChildren(root,std::span<RE::NiAVObject*>(slots.data(),8192));
+        result=checkedExistingSceneLookup(nodes,root.object(),rootName.text.data(),root.object(),"unique");
+        require(result.scanned==1&&result.edges==8192&&!result.nonNullEdges,"exactly 8192 null slots complete successfully");
+        initialize(root,branchName);slots.back()=duplicate.object();diagnosticChildren(root,slots);
+        result=checkedExistingSceneLookup(nodes,root.object(),rootName.text.data(),nullptr,"child-slot-limit");
+        require(!result.node&&!result.matches&&result.scanned==1&&result.edges==8193&&!result.nonNullEdges,
+            "a matching child beyond the null-slot budget is never visited or selected");
+        slots[0]=duplicate.object();slots.back()=nullptr;
+        result=checkedExistingSceneLookup(nodes,root.object(),rootName.text.data(),nullptr,"child-slot-limit");
+        require(result.node==duplicate.object()&&result.matches==1&&result.scanned==2&&result.nonNullEdges==1,
+            "a matching first child remains rejected after later null slots exhaust the budget");
+        diagnosticChildren(root,std::span<RE::NiAVObject*>{});initialize(root,rootName);
+    }
+    std::array<RE::NiAVObject*,1> self{root.object()};diagnosticChildren(root,self);
+    result=checkedExistingSceneLookup(nodes,root.object(),rootName.text.data(),nullptr,"depth-limit");
+    require(result.node==root.object()&&!result.conflict&&result.matches==129&&result.scanned==129&&result.edges==129,
+        "a repeated same-node child cycle remains bounded by depth rather than becoming a false duplicate");
+    diagnosticChildren(root,std::span<RE::NiAVObject*>{});
+    children[0]=root.object();children[1]=duplicate.object();diagnosticChildren(actor,children);
+    result=checkedExistingSceneLookup(nodes,actor.object(),rootName.text.data(),nullptr,"ambiguous");
+    auto description=checkedExistingSceneDescription(nodes,actor.object(),result);
+    require(description.find("reason=ambiguous scanned=3 childSlots=2 nonNullChildren=2 matches=2 maxDepth=1")!=std::string::npos&&
+        description.find("first=[address="+std::to_string(root.address()))!=std::string::npos&&
+        description.find("conflict=[address="+std::to_string(duplicate.address()))!=std::string::npos&&
+        description.find("name='NPC Root [Root]' class='NiNode'")!=std::string::npos&&
+        description.find("name='npc root [root]' class='NiNode'")!=std::string::npos,
+        "root diagnostic formats the production counters and both actual conflicting node identities");
+    actor.object()->parent=root.object();root.object()->parent=actor.object();
+    description=checkedExistingSceneDescription(nodes,actor.object(),result);
+    require(description.find("<cycle>")!=std::string::npos,"root diagnostic stops cyclic candidate parent paths explicitly");
+    actor.object()->parent=nullptr;
+    {
+        std::vector<SceneStorage> parents(10);const std::string longName(200,'a');
+        for(std::size_t i=0;i<parents.size();++i) {
+            initialize(parents[i],branchName);parents[i].put(0x10,longName.c_str());
+            if(i+1<parents.size())parents[i].object()->parent=parents[i+1].object();
+        }
+        fc::ExistingSceneLookup report;report.node=report.conflict=report.stoppedAt=parents.front().object();
+        report.ambiguous=true;report.scanned=std::numeric_limits<std::size_t>::max();report.edges=report.scanned;
+        report.nonNullEdges=report.matches=report.scanned;report.maxDepth=std::numeric_limits<int>::max();
+        std::array<RE::NiAVObject*,9> samples{};
+        for(std::size_t i=0;i<samples.size();++i)samples[i]=parents[i+1].object();
+        samples[0]=nullptr;parents.back().put(0x10,"unsampled-ninth-child");diagnosticChildren(parents.front(),samples);
+        const auto samplesBefore=samples;
+        description=checkedExistingSceneDescription(parents,parents.front().object(),report);
+        require(description.find("<parent-limit>")!=std::string::npos&&description.find(std::string(80,'a')+"...")!=std::string::npos&&
+            description.find(std::string(81,'a'))==std::string::npos,"root diagnostic bounds each parent path and long name independently");
+        require(description.find("topChildren=[0:<null>; 1:")!=std::string::npos&&description.find("; 7:")!=std::string::npos&&
+            description.find("; 8:")==std::string::npos&&description.find("unsampled-ninth-child")==std::string::npos&&
+            description.find("childrenCapacity=9")!=std::string::npos,"root diagnostic samples only the first eight child slots including null slots");
+        require(samples==samplesBefore,"root diagnostic preserves sampled and unsampled child slots");
+    }
+    fc::ExistingSceneLookup report;report.node=root.object();
+    root.put(0x10,"NPC\nRoot\r[Root]\t");
+    description=checkedExistingSceneDescription(nodes,actor.object(),report);
+    require(description.find("name='NPC?Root?[Root]?'")!=std::string::npos,"root diagnostic sanitizes embedded name controls");
+    root.put(0x10,reinterpret_cast<const char*>(1));
+    description=checkedExistingSceneDescription(nodes,actor.object(),report);
+    require(description.find("name='<unreadable>'")!=std::string::npos,"root diagnostic does not dereference an unreadable raw name");
+    initialize(root,rootName);root.object()->parent=reinterpret_cast<RE::NiNode*>(1);
+    description=checkedExistingSceneDescription(nodes,actor.object(),report);
+    require(description.find("address=1 <unreadable>")!=std::string::npos,"root diagnostic stops unreadable candidate parents");
+    root.object()->parent=actor.object();
+    report.node=reinterpret_cast<RE::NiAVObject*>(1);
+    description=checkedExistingSceneDescription(nodes,nullptr,report);
+    require(description.find("first=[address=1 <unreadable>]")!=std::string::npos&&
+        description.find("actor=[<null>] topChildren=[<unreadable>]")!=std::string::npos,
+        "root diagnostic reports null actors and unreadable candidates without traversing them");
+    description=checkedExistingSceneDescription(nodes,reinterpret_cast<RE::NiAVObject*>(1),report);
+    require(description.find("actor=[address=1 <unreadable>]")!=std::string::npos,"root diagnostic safely reports an unreadable actor");
+    report.node=root.object();actor.put(0,reinterpret_cast<void*>(1));
+    description=checkedExistingSceneDescription(nodes,actor.object(),report);
+    require(description.find("<invalid-vtable>")!=std::string::npos,"root diagnostic never calls through an unreadable actor vtable");
+    actor.put(0,nodeTable.data());
+    const auto childOffset=address(&actor.object()->GetChildren())-actor.address();actor.put(childOffset+8,reinterpret_cast<void*>(1));
+    description=checkedExistingSceneDescription(nodes,actor.object(),report);
+    require(description.find("topChildren=[<unreadable-children>]")!=std::string::npos,"root diagnostic rejects an unreadable sampled children array");
+    diagnosticChildren(actor,children);
+    std::cout<<"PASS production root lookup diagnostics for mocked "<<version.string()<<": unchanged selection, duplicate identity and traversal limits\n";
+}
+fc::ExistingSceneLookup checkedSkeletonRootLookup(std::span<SceneStorage> nodes,RE::NiAVObject* actor,std::string_view name,
+    RE::NiAVObject* expected,std::string_view reason) {
+    std::vector<std::array<std::byte,0x200>> before;before.reserve(nodes.size());
+    for(const auto& node:nodes)before.push_back(node.bytes);
+    const auto result=fc::lookupSkeletonRoot(actor,name);
+    require(result.selected()==expected&&result.reason()==reason,"skeleton boundary selection and rejection reason");
+    for(std::size_t i=0;i<nodes.size();++i)require(nodes[i].bytes==before[i],"skeleton discovery preserves native nodes and reference counts");
+    return result;
+}
+void skeletonRootBoundaries(REL::Version version) {
+    const auto runtime=version.minor()==5?REL::Module::Runtime::SE:REL::Module::Runtime::AE;
+    require(REL::Module::mock(version,runtime,L"SkyrimSE.exe",0x140000000),"skeleton boundary fixture mock runtime");
+    std::array<std::uintptr_t,4> table{};table[2]=address(&diagnosticNodeRTTI);table[3]=address(&diagnosticAsNode);
+    BinderName rootName,lowerName,branchName;rootName.assign("NPC Root [Root]");lowerName.assign("npc root [root]");branchName.assign("decoration");
+    const auto initialize=[&](SceneStorage& storage,BinderName& name) {
+        storage.put(0,table.data());storage.object()->_refCount=1;
+        const char* text=name.text.data();std::memcpy(&storage.object()->name,&text,sizeof(text));
+    };
+    std::array<SceneStorage,5> nodes;for(auto& node:nodes)initialize(node,branchName);
+    auto& actor=nodes[0];auto& root=nodes[1];auto& nested=nodes[2];auto& wrapper=nodes[3];auto& foreign=nodes[4];
+    initialize(root,rootName);initialize(nested,lowerName);
+    root.object()->parent=actor.object();nested.object()->parent=root.object();wrapper.object()->parent=actor.object();
+    std::array<RE::NiAVObject*,2> actorChildren{root.object(),wrapper.object()};std::array<RE::NiAVObject*,1> rootChildren{nested.object()};
+    diagnosticChildren(actor,actorChildren);diagnosticChildren(root,rootChildren);
+    checkedExistingSceneLookup(nodes,actor.object(),rootName.text.data(),nullptr,"ambiguous");
+    auto result=checkedSkeletonRootLookup(nodes,actor.object(),rootName.text.data(),root.object(),"unique");
+    require(result.scanned==3&&result.edges==2&&result.matches==1&&!result.conflict,"matching root is a boundary rather than another search wrapper");
+    checkedSkeletonRootLookup(nodes,root.object(),rootName.text.data(),root.object(),"unique");
+    checkedSkeletonRootLookup(nodes,nullptr,rootName.text.data(),nullptr,"not-found");
+    checkedSkeletonRootLookup(nodes,actor.object(),"Missing Root",nullptr,"not-found");
+    checkedSkeletonRootLookup(nodes,actor.object(),"NPC Root [Root] ",nullptr,"not-found");
+    checkedSkeletonRootLookup(nodes,actor.object(),"x_NPC Root [Root]",nullptr,"not-found");
+    initialize(root,lowerName);checkedSkeletonRootLookup(nodes,actor.object(),rootName.text.data(),root.object(),"unique");initialize(root,rootName);
+    initialize(nested,rootName);checkedExistingSceneLookup(nodes,actor.object(),rootName.text.data(),nullptr,"ambiguous");
+    checkedSkeletonRootLookup(nodes,actor.object(),rootName.text.data(),root.object(),"unique");
+    actorChildren[1]=root.object();result=checkedSkeletonRootLookup(nodes,actor.object(),rootName.text.data(),root.object(),"unique");
+    require(!result.ambiguous&&!result.conflict,"duplicate references to one outer root do not invent a second skeleton");
+    actorChildren[1]=wrapper.object();initialize(wrapper,lowerName);
+    checkedSkeletonRootLookup(nodes,actor.object(),rootName.text.data(),nullptr,"ambiguous");
+    initialize(wrapper,branchName);diagnosticChildren(root,std::span<RE::NiAVObject*>{});diagnosticChildren(wrapper,rootChildren);nested.object()->parent=wrapper.object();
+    checkedSkeletonRootLookup(nodes,actor.object(),rootName.text.data(),nullptr,"ambiguous");
+    std::swap(actorChildren[0],actorChildren[1]);checkedSkeletonRootLookup(nodes,actor.object(),rootName.text.data(),nullptr,"ambiguous");
+    std::swap(actorChildren[0],actorChildren[1]);diagnosticChildren(wrapper,std::span<RE::NiAVObject*>{});
+    root.object()->parent=foreign.object();checkedSkeletonRootLookup(nodes,actor.object(),rootName.text.data(),nullptr,"root-outside-actor");
+    foreign.object()->parent=root.object();checkedSkeletonRootLookup(nodes,actor.object(),rootName.text.data(),nullptr,"root-outside-actor");
+    root.object()->parent=reinterpret_cast<RE::NiNode*>(1);checkedSkeletonRootLookup(nodes,actor.object(),rootName.text.data(),nullptr,"root-outside-actor");
+    root.object()->parent=actor.object();foreign.object()->parent=nullptr;
+    {
+        std::vector<SceneStorage> ancestors(128);for(auto& node:ancestors)initialize(node,branchName);
+        for(std::size_t i=0;i+1<ancestors.size();++i)ancestors[i].object()->parent=ancestors[i+1].object();
+        ancestors.back().object()->parent=actor.object();root.object()->parent=ancestors[0].object();
+        checkedSkeletonRootLookup(nodes,actor.object(),rootName.text.data(),nullptr,"root-outside-actor");
+        root.object()->parent=ancestors[1].object();checkedSkeletonRootLookup(nodes,actor.object(),rootName.text.data(),root.object(),"unique");
+        root.object()->parent=actor.object();
+    }
+    auto nonNodeTable=table;nonNodeTable[3]=address(&diagnosticNotNode);root.put(0,nonNodeTable.data());
+    checkedSkeletonRootLookup(nodes,actor.object(),rootName.text.data(),nullptr,"invalid-root-node");root.put(0,table.data());
+    std::array<RE::NiAVObject*,1> cycle{wrapper.object()};diagnosticChildren(wrapper,cycle);
+    checkedSkeletonRootLookup(nodes,actor.object(),rootName.text.data(),nullptr,"depth-limit");diagnosticChildren(wrapper,std::span<RE::NiAVObject*>{});
+    for(int mode=0;mode<3;++mode) {
+        std::vector<SceneStorage> decorated(mode==0?4099:mode==1?132:3);for(auto& node:decorated)initialize(node,branchName);
+        initialize(decorated[1],rootName);decorated[1].object()->parent=decorated[0].object();decorated[2].object()->parent=decorated[1].object();
+        std::array<RE::NiAVObject*,2> top{decorated[1].object(),decorated[2].object()};std::array<RE::NiAVObject*,1> inside{decorated[2].object()};
+        diagnosticChildren(decorated[0],std::span<RE::NiAVObject*>(top.data(),1));diagnosticChildren(decorated[1],inside);
+        std::vector<RE::NiAVObject*> slots;std::vector<std::array<RE::NiAVObject*,1>> links(decorated.size());
+        if(mode==0) {
+            for(std::size_t i=3;i<decorated.size();++i){decorated[i].object()->parent=decorated[2].object();slots.push_back(decorated[i].object());}
+            diagnosticChildren(decorated[2],slots);
+        } else if(mode==1) {
+            for(std::size_t i=2;i+1<decorated.size();++i) {
+                links[i][0]=decorated[i+1].object();decorated[i+1].object()->parent=decorated[i].object();diagnosticChildren(decorated[i],links[i]);
+            }
+        } else {slots.resize(8193,nullptr);diagnosticChildren(decorated[2],slots);}
+        const auto slotsBefore=slots;const auto linksBefore=links;const auto* reason=mode==0?"node-limit":mode==1?"depth-limit":"child-slot-limit";
+        checkedExistingSceneLookup(decorated,decorated[0].object(),rootName.text.data(),nullptr,reason);
+        result=checkedSkeletonRootLookup(decorated,decorated[0].object(),rootName.text.data(),decorated[1].object(),"unique");
+        require(result.scanned==2&&result.edges==1&&result.matches==1,"root discovery does not charge interior decoration against wrapper budgets");
+        diagnosticChildren(decorated[1],std::span<RE::NiAVObject*>{});decorated[2].object()->parent=decorated[0].object();diagnosticChildren(decorated[0],top);
+        checkedSkeletonRootLookup(decorated,decorated[0].object(),rootName.text.data(),nullptr,reason);
+        require(slots==slotsBefore&&links==linksBefore,"interior and exterior root discovery leave native child arrays unchanged");
+    }
+    std::cout<<"PASS outermost skeleton boundaries for mocked "<<version.string()<<": interior regression, exterior conflicts and budgets, actual ancestry\n";
+}
 void flattenedBindingStructures(REL::Version version) {
     const auto runtime=version.minor()==5?REL::Module::Runtime::SE:REL::Module::Runtime::AE;
     require(REL::Module::mock(version,runtime,L"SkyrimSE.exe",0x140000000),"binding fixture mock runtime");
@@ -570,6 +854,28 @@ void flattenedBindingStructures(REL::Version version) {
     BinderName lowerThigh,lowerRoot;lowerThigh.assign("npc l thigh [lthg]");lowerRoot.assign("npc root [root]");
     const auto assignName=[](RE::BSFixedString& name,const char* text){std::memcpy(&name,&text,sizeof(text));};
     {
+        const auto baseline=fc::bindRuntimeScene(root.object(),names,fc::canonicalBoneParents);
+        assignName(nested.object()->name,pooled[0].text.data());diagnosticChildren(pelvis,pelvisChildren);
+        require(!fc::lookupExistingNode(actor.object(),names[0]).selected(),"full actor scan reproduces the nested Root regression");
+        const auto selected=fc::lookupSkeletonRoot(actor.object(),names[0]);
+        require(selected.selected()==root.object(),"outermost discovery selects the complete original flat skeleton");
+        const auto accepted=fc::bindRuntimeScene(selected.selected(),names,fc::canonicalBoneParents);
+        require(bool(accepted)&&accepted.count==81&&accepted.virtualLeaves==3&&accepted.unownedTracks==15,
+            "boundary selection still passes the actual complete production scene binder");
+        for(std::size_t i=0;i<99;++i)require(accepted.nodes[i].node.get()==baseline.nodes[i].node.get()&&
+            accepted.nodes[i].flat==baseline.nodes[i].flat&&accepted.nodes[i].flatWorld==baseline.nodes[i].flatWorld&&
+            accepted.nodes[i].flatParentWorld==baseline.nodes[i].flatParentWorld,"root boundary recovery preserves every original bound storage address");
+        assignName(entries.object()[6].nodeName,nullptr);
+        const auto missing=fc::bindRuntimeScene(selected.selected(),names,fc::canonicalBoneParents);
+        require(!missing&&missing.missing==6&&missing.count==3&&!missing.nodes[6],"accepted outer root cannot borrow a missing thigh from outside its skeleton");
+        assignName(entries.object()[6].nodeName,pooled[6].text.data());assignName(entries.object()[7].nodeName,pooled[6].text.data());
+        require(!fc::bindRuntimeScene(selected.selected(),names,fc::canonicalBoneParents),"accepted outer root cannot bypass conflicting flat body names");
+        assignName(entries.object()[7].nodeName,pooled[7].text.data());assignName(nested.object()->name,cacheName.text.data());
+        diagnosticChildren(pelvis,std::span<RE::NiAVObject*>{});
+    }
+    refs();require(std::array{actor.bytes,root.bytes,com.bytes,pelvis.bytes,nested.bytes,outside.bytes}==baselineNodes&&entries.bytes==originalEntries,
+        "root boundary integration restores all native scene and flat storage");
+    {
         Storage<RE::BSFixedString,sizeof(RE::BSFixedString)> nativeName;nativeName.put(0,lowerThigh.text.data());
         require(*nativeName.object()==std::string_view(names[6])&&std::string_view(nativeName.object()->c_str())!=names[6],"real BSFixedString comparison matches case-only spelling that legacy exact comparison rejects");
         require(fc::sameSceneBoneName(names[6],lowerThigh.text.data())&&!fc::sameSceneBoneName(names[6],"NPC L Thigh [LThg] ")&&
@@ -599,6 +905,7 @@ void flattenedBindingStructures(REL::Version version) {
             actualDetail.flat.nearbyEntries.find("row=14 ")==std::string::npos&&!actualDetail.flat.relatedNames.empty(),"missing exact storage diagnostics include only bounded neighboring rows and related names");
         require(fc::sceneDiagnosticRawName(std::string(256,'x')).size()<300,"raw diagnostic names and hexadecimal bytes stay bounded");
         std::array<RE::NiAVObject*,2> two{actualCase.object(),actualDuplicate.object()};diagnosticChildren(pelvis,two);
+        require(fc::lookupSkeletonRoot(actor.object(),names[0]).selected()==root.object(),"root discovery remains separate from duplicate required-body validation");
         require(!fc::existingNode(root.object(),names[6])&&!fc::bindRuntimeScene(root.object(),names,fc::canonicalBoneParents),"different physical nodes with native-equivalent names never choose the first match");
         diagnosticChildren(pelvis,std::span<RE::NiAVObject*>{});assignName(entries.object()[6].nodeName,pooled[6].text.data());
         assignName(root.object()->name,lowerRoot.text.data());
@@ -856,7 +1163,9 @@ int main() {
         memoryGuards();
         animationSkeletonMemoryGuards();
         sceneLookupDiagnostics();
-        for(const auto version:{REL::Version(1,5,97,0),REL::Version(1,6,640,0),REL::Version(1,6,1170,0)})flattenedBindingStructures(version);
+        for(const auto version:{REL::Version(1,5,97,0),REL::Version(1,6,640,0),REL::Version(1,6,1170,0)}) {
+            existingSceneLookupDiagnostics(version);skeletonRootBoundaries(version);flattenedBindingStructures(version);
+        }
         virtualHookPublication();
         addressLibraryCases();
         REL::Module::reset();

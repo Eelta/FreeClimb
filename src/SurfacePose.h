@@ -6,11 +6,13 @@ class SurfacePose {
     std::array<Contact,4> contacts{};
     Pose previous,penultimate,transitionFrom,previousAuthored;
     PoseContinuation continuation;
+    ClimbGripPose gripPose;
     std::array<bool,2> transitionArmGuard{};
     float previousDt{};
     Motion lastMotion=Motion::none;
     Motion lastWallRunDirection=Motion::none,runSequenceDirection=Motion::none;
-    bool lastContextRecovery{};
+    bool lastContextRecovery{},lastSupportRecovery{};
+    Vec lastRecoveryStart{},lastRecoveryTarget{};
     float phase{},lastSamplePhase{},transition=1,transitionSeconds=.18f;
     Motion bridge=Motion::none;
     Motion bridgeDirection=Motion::none;
@@ -66,7 +68,10 @@ public:
         const auto wallRunDirection=traversal.poseDirection(motion);
         const bool contextRecovery=motion==Motion::contextHang&&traversal.holdsDestinationEdge(motion);
         const bool contextSequence=motion==Motion::contextHang&&lib.hasContextHopSequence(wallRunDirection);
-        const bool motionChanged=motion!=lastMotion||wallRunDirection!=lastWallRunDirection||contextRecovery!=lastContextRecovery;
+        const bool supportRecovery=traversal.recoveringSupport();
+        const bool recoveryChanged=supportRecovery!=lastSupportRecovery||(supportRecovery&&
+            ((traversal.edgeStart()-lastRecoveryStart).length()>.001f||(traversal.edgeTarget()-lastRecoveryTarget).length()>.001f));
+        const bool motionChanged=motion!=lastMotion||wallRunDirection!=lastWallRunDirection||contextRecovery!=lastContextRecovery||recoveryChanged;
         if(runMotion(wallRunDirection))runSequenceDirection=wallRunDirection;
         const auto& clip=lib.clip(motion,wallRunDirection,contextRecovery);
         const bool authoredPlayback=clip.authoredPlayback;
@@ -259,7 +264,7 @@ public:
         }
         if(started&&(motionChanged||wallTargets!=lastWallTargets||stopTargetChanged)) {
 
-            const bool continueBridge=!sourceTransition&&!edgeAction&&!stopTargetChanged&&bridge!=Motion::none&&transition<1&&wallTargets==lastWallTargets&&
+            const bool continueBridge=!sourceTransition&&!edgeAction&&!stopTargetChanged&&!recoveryChanged&&bridge!=Motion::none&&transition<1&&wallTargets==lastWallTargets&&
                 ((running&&runMotion(lastMotion))||(!running&&!runMotion(lastMotion)&&
                     (climbCycle(motion)||motion==Motion::hang)&&(climbCycle(lastMotion)||lastMotion==Motion::hang)));
             if(!continueBridge) {
@@ -852,6 +857,10 @@ public:
             }
         }
 
+        gripPose.update(lib,p,motion,{contacts[0].valid&&!contacts[0].retiring?contacts[0].weight:0.f,
+            contacts[1].valid&&!contacts[1].retiring?contacts[1].weight:0.f},dt,
+            !sourceTransition&&!sourceReturn&&bridge==Motion::none&&!edgeAction);
+
         if(!authoredPlayback&&started&&previous.size()==p.size()&&dt>0&&!(newMantle&&topPrepared&&traversal.topPreparation()<1.f)) {
             const Pose target=p;float amount=1;
             const float angularLimit=(parkour||running||backFlip?18.849556f:12.566371f)*dt;
@@ -1301,6 +1310,7 @@ public:
         }
         penultimate=previous;previous=p;previousDt=dt;
         lastPosition=pos;lastNormal=n;lastMotion=motion;lastWallRunDirection=wallRunDirection;lastContextRecovery=contextRecovery;lastWallTargets=wallTargets;started=true;
+        lastSupportRecovery=supportRecovery;lastRecoveryStart=traversal.edgeStart();lastRecoveryTarget=traversal.edgeTarget();
         return p;
     }
 };

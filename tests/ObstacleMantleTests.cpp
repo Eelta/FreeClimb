@@ -157,6 +157,7 @@ static void lostSupport(const Library& library,int fps,bool feetOnly=false) {
         if(result.motion==Motion::contextMantle){newTop=true;break;}
     }
     check(newTop,"dynamic support test starts real new mantle after obstacle");
+    const auto originalBoxes=world.geometry.boxes;
     if(feetOnly) {
         check(traversal.topPreparation()<1.f,"foot-only mutation happens while the real mantle still prepares its grasp");
         world.geometry.boxes.front().low.z=world.geometry.local(traversal.position).z+30.f;
@@ -167,9 +168,21 @@ static void lostSupport(const Library& library,int fps,bool feetOnly=false) {
         while(traversal.progress()<.4f)check(!traversal.update(world,{},1.f/fps,1000).released,"real top stays supported before mutation");
         world.geometry.boxes.clear();
     }
-    const auto position=traversal.position;
+    const auto position=traversal.position;const float phase=traversal.progress();
     const auto result=traversal.update(world,{},1.f/fps,1000);
-    check(result.released&&!result.completed&&!traversal.active()&&(traversal.position-position).length()==0,"removed top aborts new obstacle-mantle before committing stale motion");
+    check(!result.released&&!result.completed&&traversal.active()&&traversal.geometryHolding()&&
+        (traversal.position-position).length()==0&&traversal.progress()==phase,"removed top holds the last checked mantle pose");
+    for(int frame=0;frame<fps;++frame) {
+        const auto held=traversal.update(world,{},1.f/fps,1000);
+        check(!held.released&&held.staminaCost==0&&(traversal.position-position).length()==0&&traversal.progress()==phase,
+            "unavailable mantle support cannot advance or drain stamina during retries");
+    }
+    world.geometry.boxes=originalBoxes;bool completed=false;
+    for(int frame=0;frame<fps*4&&traversal.active();++frame) {
+        const auto resumed=traversal.update(world,{},1.f/fps,1000);completed|=resumed.completed;
+        check(!resumed.released||resumed.completed,"restored mantle support resumes only toward a checked completion");
+    }
+    check(completed&&!traversal.active(),"restored actual top finishes the paused mantle");
 }
 int main(int argc,char** argv){
 #ifdef _WIN32

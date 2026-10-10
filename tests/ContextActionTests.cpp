@@ -149,7 +149,10 @@ static void negativeAndLegacy() {
             require((t.position-supported).length()<.01f,"ordinary S never advances without measured support");
             released|=r.released;
         }
-        require(released&&!t.active(),"lost real support keeps the original bounded retry and physical release policy");
+        require(!released&&t.active()&&t.geometryHolding(),"lost real support holds without reviving removed actions");
+        missing=shelves();
+        for(int frame=0;frame<fps/2;++frame)require(!tick(missing,t,{0,-1},1.f/fps).released,"restored support permits checked descent");
+        require(!t.geometryHolding()&&t.position.z<supported.z,"held descent resumes after real geometry returns");
     }
 
     ContextWorld w;w.boxes={{{-500,0,-500},{500,100,500}}};
@@ -190,16 +193,32 @@ static void changedGeometryAndCaptures() {
         auto w=separatedHopShelves();auto t=attach(w);recordedTick(w,t,hop,1.f/60);
         require(t.state==State::action&&t.usesEdgeTargets(Motion::hopRight),"dynamic target test retains a real planned lateral hop");
         if(afterRelease)while(t.actionProgress()<.4f)recordedTick(w,t,{},1.f/60);
+        const auto target=w.boxes.back();const Vec before=t.position;const float phase=t.progress();
         w.boxes.pop_back();const auto r=tick(w,t,{},1.f/60);
-        if(afterRelease)require(r.released&&!r.completed&&!t.active(),"lost target after release produces physical fall");
+        if(afterRelease) {
+            require(!r.released&&!r.completed&&t.active()&&t.geometryHolding(),"lost target after release holds the checked flight pose");
+            for(int frame=0;frame<60;++frame) {
+                const auto held=tick(w,t,{},1.f/60);
+                require(!held.released&&held.staminaCost==0&&(t.position-before).length()==0&&t.progress()==phase,
+                    "absent contextual target freezes flight progress and position");
+            }
+            w.boxes.push_back(target);
+            for(int frame=0;frame<180&&t.state==State::action;++frame)require(!tick(w,t,{},1.f/60).released,"restored contextual target resumes the checked catch");
+            require(t.state==State::wall&&!t.geometryHolding(),"restored contextual target completes the original catch");
+        }
         else require(!r.released&&t.state==State::wall,"lost target before release preserves the existing source hang");
     }
     auto w=separatedHopShelves();auto t=attach(w);recordedTick(w,t,hop,1.f/60);unsigned frames=0;
     while(t.state==State::action&&frames<120){recordedTick(w,t,{},1.f/60);++frames;}
     require(frames>10&&t.state==State::wall,"same-version captures retain complete supported lateral flight and catch");
     w=separatedHopShelves();t=attach(w);recordedTick(w,t,hop,1.f/60);
+    const Vec sourcePosition=t.position;const float sourcePhase=t.progress();
     w.boxes.erase(w.boxes.begin()+2);const auto lostSource=tick(w,t,{},1.f/60);
-    require(lostSource.released&&!lostSource.completed&&!t.active(),"vanished loaded source releases instead of grasping air");
+    require(!lostSource.released&&!lostSource.completed&&t.active()&&t.geometryHolding()&&
+        (t.position-sourcePosition).length()==0&&t.progress()==sourcePhase,"vanished loaded source freezes before any unsupported travel");
+    Input release;release.release=true;auto exit=tick(w,t,release,1.f/60);
+    for(int frame=0;frame<60&&!exit.released;++frame)exit=tick(w,t,{},1.f/60);
+    require(exit.released&&!t.active(),"paused contextual action permits a deliberate release");
     w=separatedHopShelves();t=attach(w);recordedTick(w,t,hop,1.f/60);
     while(t.actionProgress()<.5f)recordedTick(w,t,{},1.f/60);
     w.boxes.erase(w.boxes.begin()+2);
